@@ -28,23 +28,28 @@ const (
 var ensured sync.Once
 
 // EnsurePipewireRunning starts the PipeWire units (pipewire, pipewire-pulse and
-// wireplumber) for the current user, enabling lingering first so that logind
-// brings up the user's systemd --user manager and keeps it running. Lingering is
-// never disabled again: the audio stack stays up across app starts and stops, so
-// only the first call of a process does any work.
+// wireplumber) for the current user. They need the user's systemd --user manager:
+// when it is not reachable, lingering is enabled so that logind brings it up and
+// keeps it running. Lingering is never disabled again: the audio stack stays up
+// across app starts and stops, so only the first call of a process does any work.
 func EnsurePipewireRunning(ctx context.Context) (err error) {
 	ensured.Do(func() { err = ensurePipewireRunning(ctx) })
 	return err
 }
 
 func ensurePipewireRunning(ctx context.Context) error {
+	// A user manager provided by a session or by a systemd dependency is enough
+	if err := runStartPipewireUnitsCommand(ctx); err == nil {
+		return nil
+	}
+
 	if err := enableLingering(ctx); err != nil {
 		return fmt.Errorf("failed to enable audio service linger: %w", err)
 	}
 
 	var lastErr error
 	for range userManagerDialAttempts {
-		if _, err := runStartPipewireUnitsCommand(ctx); err == nil {
+		if err := runStartPipewireUnitsCommand(ctx); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -59,7 +64,7 @@ func ensurePipewireRunning(ctx context.Context) error {
 	return fmt.Errorf("wait for user systemd manager: %w", lastErr)
 }
 
-func runStartPipewireUnitsCommand(ctx context.Context) (string, error) {
+func runStartPipewireUnitsCommand(ctx context.Context) error {
 	env := []string{fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", os.Getuid())}
 	cmd, err := paths.NewProcess(env,
 		"systemctl",
@@ -70,13 +75,11 @@ func runStartPipewireUnitsCommand(ctx context.Context) (string, error) {
 		"wireplumber.service",
 	)
 	if err != nil {
-		return "", fmt.Errorf("create process start pipewire: %w", err)
+		return fmt.Errorf("create process start pipewire: %w", err)
 	}
 
-	out, err := cmd.RunAndCaptureCombinedOutput(ctx)
-	if err != nil {
-		return string(out), fmt.Errorf("%s: %w: %s", strings.Join(cmd.GetArgs(), " "), err, strings.TrimSpace(string(out)))
+	if out, err := cmd.RunAndCaptureCombinedOutput(ctx); err != nil {
+		return fmt.Errorf("%s: %w: %s", strings.Join(cmd.GetArgs(), " "), err, strings.TrimSpace(string(out)))
 	}
-
-	return string(out), nil
+	return nil
 }
