@@ -184,7 +184,7 @@ func StartApp(
 	}
 
 	// We start PW for any platform or addon in order to be consistend with Network and SBC mode.
-	if err := pipewire.EnsurePipewireRunning(ctx, cfg); err != nil {
+	if err := pipewire.EnsurePipewireRunning(ctx); err != nil {
 		slog.Warn("failed to enable audio service linger", slog.String("error", err.Error()))
 	}
 
@@ -314,10 +314,6 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 
 	if err := restoreLedsState(platform); err != nil {
 		slog.Debug("unable to set status leds", slog.String("error", err.Error()))
-	}
-
-	if err := pipewire.StopIfNotNeeded(ctx, cfg); err != nil {
-		slog.Debug("unable to disable audio service linger", slog.String("error", err.Error()))
 	}
 
 	if _, ok := app.GetSketchPath(); ok {
