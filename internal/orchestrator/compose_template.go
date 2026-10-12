@@ -242,7 +242,9 @@ func generateComposeTemplate(
 	cgroupRules := append(cgroupRuleExprs(deviceDrivers), fastrpcRules)
 
 	mainAppCompose.Services = map[string]any{"main": service{
-		Image:             pythonImage,
+		Image: pythonImage,
+		// tini as PID 1: forwards SIGTERM to run.sh and reaps what the app leaves behind
+		Init:              new(true),
 		Volumes:           volumes,
 		Ports:             slices.Collect(maps.Keys(ports)),
 		Entrypoint:        "/run.sh",
