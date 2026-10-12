@@ -5,7 +5,7 @@
 
 // Package pipewire brings up the PipeWire audio stack for the current
 // process's own user. user@<uid>.service's own lifecycle is left entirely to
-// logind, driven by linger (see EnableLinger/DisableLinger in linger.go)
+// logind, driven by linger (see enableLingering in linger.go)
 
 package pipewire
 
@@ -14,11 +14,10 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/arduino/go-paths-helper"
-
-	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
 )
 
 const (
@@ -26,11 +25,20 @@ const (
 	userManagerDialInterval = 500 * time.Millisecond
 )
 
+var ensured sync.Once
+
 // EnsurePipewireRunning starts the PipeWire units (pipewire, pipewire-pulse and
 // wireplumber) for the current user, enabling lingering first so that logind
-// brings up the user's systemd --user manager and keeps it running.
-func EnsurePipewireRunning(ctx context.Context, cfg config.Configuration) error {
-	if err := enableLingering(ctx, cfg); err != nil {
+// brings up the user's systemd --user manager and keeps it running. Lingering is
+// never disabled again: the audio stack stays up across app starts and stops, so
+// only the first call of a process does any work.
+func EnsurePipewireRunning(ctx context.Context) (err error) {
+	ensured.Do(func() { err = ensurePipewireRunning(ctx) })
+	return err
+}
+
+func ensurePipewireRunning(ctx context.Context) error {
+	if err := enableLingering(ctx); err != nil {
 		return fmt.Errorf("failed to enable audio service linger: %w", err)
 	}
 
@@ -49,14 +57,6 @@ func EnsurePipewireRunning(ctx context.Context, cfg config.Configuration) error 
 		}
 	}
 	return fmt.Errorf("wait for user systemd manager: %w", lastErr)
-}
-
-// StopIfNotNeeded tears down the PipeWire units for the current user, but only
-// if EnsurePipewireRunning was the one that started them. It does so by
-// disabling lingering, letting logind shut down the user's systemd --user
-// manager and the PipeWire units running on it.
-func StopIfNotNeeded(ctx context.Context, cfg config.Configuration) error {
-	return stopLingering(ctx, cfg)
 }
 
 func runStartPipewireUnitsCommand(ctx context.Context) (string, error) {
