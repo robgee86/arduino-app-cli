@@ -250,6 +250,7 @@ func StartApp(
 		// What the template references, answered on this board. The app half is in
 		// the template already, frozen, when the app comes from a release.
 		env := hostEnvironment(ctx, appToStart.FullPath, cfg).Merge(appEnv)
+		before, _ := appToStart.AppComposeFilePath().ReadFile()
 		prj, err := provisioner.Render(ctx, &appToStart, env, appToStart.Secrets(bricksIndex))
 		if err != nil {
 			return err
@@ -264,6 +265,23 @@ func StartApp(
 		}
 
 		cb(StreamMessage{data: "python downloading"})
+
+		// Containers created by a previous start of the same configuration are started
+		// as they are: compose is only needed to create or recreate them.
+		if after, _ := appToStart.AppComposeFilePath().ReadFile(); bytes.Equal(before, after) {
+			containers, err := getAppContainers(ctx, docker.Client(), prj.Name)
+			if err != nil {
+				return err
+			}
+			if containers.HasMain() {
+				slog.Debug("starting the existing app containers", slog.String("project", prj.Name))
+				if err := startAppContainers(ctx, docker.Client(), containers, cb); err != nil {
+					return err
+				}
+				cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
+				return nil
+			}
+		}
 
 		if err := dockerhelper.PullImages(ctx, docker.Client(), dockerhelper.ComposeImages(prj),
 			func(line string) { cb(StreamMessage{data: line}) },
@@ -345,7 +363,10 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 		case "down":
 			err = dockerhelper.ComposeDown(ctx, docker, projectName, line)
 		default:
-			err = dockerhelper.ComposeStop(ctx, docker, projectName, line)
+			var containers appContainers
+			if containers, err = getAppContainers(ctx, docker.Client(), projectName); err == nil {
+				err = stopAppContainers(ctx, docker.Client(), containers, DefaultDockerStopTimeoutSeconds, cb)
+			}
 		}
 		if err != nil {
 			return err
