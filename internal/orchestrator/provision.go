@@ -44,6 +44,7 @@ type logging struct {
 // A field holding an expression is a string here: what it renders to is a list.
 type service struct {
 	Image             string                        `yaml:"image"`
+	Init              *bool                         `yaml:"init,omitempty"`
 	DependsOn         map[string]dependsOnCondition `yaml:"depends_on,omitempty"`
 	Volumes           []any                         `yaml:"volumes"`
 	Ports             []string                      `yaml:"ports"`
