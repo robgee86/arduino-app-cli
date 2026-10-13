@@ -7,7 +7,6 @@ package orchestrator
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -15,6 +14,7 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/flags"
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/image"
 	dockerClient "github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -122,10 +122,26 @@ func TestWriteIngressFiles(t *testing.T) {
 
 const testIngressID = "ingress-id"
 
-// fakeDocker answers the container lists with the containers of each label.
+// fakeDocker answers the container lists with the containers of each label, and records the calls
+// on the ingress. A started container runs, the images are present. Any other call goes to an
+// engine that does not exist, so that a compose up fails.
 type fakeDocker struct {
 	dockerClient.APIClient
 	byLabel map[string]container.Summary
+	calls   []string
+}
+
+func newFakeDocker(t *testing.T, ingressState container.ContainerState) *fakeDocker {
+	fake := newEmptyFakeDocker(t)
+	fake.byLabel = map[string]container.Summary{DockerIngressLabel: {ID: testIngressID, State: ingressState}}
+	return fake
+}
+
+func newEmptyFakeDocker(t *testing.T) *fakeDocker {
+	t.Helper()
+	unreachable, err := dockerClient.New(dockerClient.WithHost("unix:///nonexistent/docker.sock"))
+	require.NoError(t, err)
+	return &fakeDocker{APIClient: unreachable}
 }
 
 func (f *fakeDocker) ContainerList(_ context.Context, options dockerClient.ContainerListOptions) (dockerClient.ContainerListResult, error) {
@@ -137,63 +153,125 @@ func (f *fakeDocker) ContainerList(_ context.Context, options dockerClient.Conta
 	return dockerClient.ContainerListResult{}, nil
 }
 
-// Ping reports the daemon as unreachable, so that the CLI does not negotiate with the fake.
-func (f *fakeDocker) Ping(context.Context, dockerClient.PingOptions) (dockerClient.PingResult, error) {
-	return dockerClient.PingResult{}, errors.New("docker daemon not reachable")
+func (f *fakeDocker) ContainerStart(_ context.Context, id string, _ dockerClient.ContainerStartOptions) (dockerClient.ContainerStartResult, error) {
+	f.calls = append(f.calls, "start "+id)
+	return dockerClient.ContainerStartResult{}, nil
 }
 
-// fakeDockerCli is a docker CLI on the fake.
-func fakeDockerCli(t *testing.T, fake *fakeDocker) command.Cli {
+func (f *fakeDocker) ContainerStop(_ context.Context, id string, _ dockerClient.ContainerStopOptions) (dockerClient.ContainerStopResult, error) {
+	f.calls = append(f.calls, "stop "+id)
+	return dockerClient.ContainerStopResult{}, nil
+}
+
+func (f *fakeDocker) ContainerInspect(context.Context, string, dockerClient.ContainerInspectOptions) (dockerClient.ContainerInspectResult, error) {
+	return dockerClient.ContainerInspectResult{Container: container.InspectResponse{State: &container.State{Running: true}}}, nil
+}
+
+func (f *fakeDocker) ImageList(context.Context, dockerClient.ImageListOptions) (dockerClient.ImageListResult, error) {
+	return dockerClient.ImageListResult{Items: []image.Summary{{RepoTags: []string{IngressImage}}}}, nil
+}
+
+// cli is a docker CLI on the fake.
+func (f *fakeDocker) cli(t *testing.T) command.Cli {
 	t.Helper()
-	cli, err := command.NewDockerCli(command.WithAPIClient(fake), command.WithBaseContext(t.Context()))
+	cli, err := command.NewDockerCli(command.WithAPIClient(f), command.WithBaseContext(t.Context()))
 	require.NoError(t, err)
 	require.NoError(t, cli.Initialize(&flags.ClientOptions{}))
 	return cli
 }
 
-func TestApplyIngress(t *testing.T) {
+func TestOpenAppPorts(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
+	noop := func(StreamMessage) {}
+	_, err := writeIngressFiles(cfg, []int{7000})
+	require.NoError(t, err)
 
-	t.Run("a stopped ingress publishes nothing: closing writes the files only", func(t *testing.T) {
-		_, err := writeIngressFiles(cfg, []int{7000})
-		require.NoError(t, err)
-		stopped := &fakeDocker{byLabel: map[string]container.Summary{DockerIngressLabel: {ID: testIngressID, State: container.StateExited}}}
-		require.NoError(t, closeAppPorts(t.Context(), fakeDockerCli(t, stopped), cfg))
-		assertIngressConf(t, cfg, nil)
+	t.Run("the same ports start the stopped ingress", func(t *testing.T) {
+		docker := newFakeDocker(t, container.StateExited)
+		require.NoError(t, openAppPorts(t.Context(), docker.cli(t), cfg, []int{7000}, noop))
+		assert.Equal(t, []string{"start " + testIngressID}, docker.calls)
 	})
 
-	t.Run("a running ingress with the same ports is left as is", func(t *testing.T) {
-		_, err := writeIngressFiles(cfg, []int{7000})
-		require.NoError(t, err)
-		running := &fakeDocker{byLabel: map[string]container.Summary{DockerIngressLabel: {ID: testIngressID, State: container.StateRunning}}}
-		require.NoError(t, applyIngress(t.Context(), fakeDockerCli(t, running), cfg, []int{7000}, false))
+	t.Run("the same ports leave the running ingress as is", func(t *testing.T) {
+		docker := newFakeDocker(t, container.StateRunning)
+		require.NoError(t, openAppPorts(t.Context(), docker.cli(t), cfg, []int{7000}, noop))
+		assert.Empty(t, docker.calls)
 	})
+
+	t.Run("other ports recreate it with compose", func(t *testing.T) {
+		docker := newFakeDocker(t, container.StateExited)
+		require.ErrorContains(t, openAppPorts(t.Context(), docker.cli(t), cfg, []int{7000, 8080}, noop), "failed to start the ingress")
+		assert.Empty(t, docker.calls)
+		assertIngressConf(t, cfg, []int{7000, 8080})
+	})
+
+	t.Run("no ingress yet creates it with compose", func(t *testing.T) {
+		docker := newEmptyFakeDocker(t)
+		require.ErrorContains(t, openAppPorts(t.Context(), docker.cli(t), cfg, []int{7000, 8080}, noop), "failed to start the ingress")
+		assert.Empty(t, docker.calls)
+	})
+
+	t.Run("no ports stop it, its file keeps the last ports", func(t *testing.T) {
+		docker := newFakeDocker(t, container.StateRunning)
+		require.NoError(t, openAppPorts(t.Context(), docker.cli(t), cfg, nil, noop))
+		assert.Equal(t, []string{"stop " + testIngressID}, docker.calls)
+		assertIngressConf(t, cfg, []int{7000, 8080})
+	})
+}
+
+func TestCloseAppPorts(t *testing.T) {
+	for _, tc := range []struct {
+		state     container.ContainerState
+		wantCalls []string
+	}{
+		{state: container.StateRunning, wantCalls: []string{"stop " + testIngressID}},
+		// A restart loop binds the ports at each attempt
+		{state: container.StateRestarting, wantCalls: []string{"stop " + testIngressID}},
+		{state: container.StateExited},
+	} {
+		t.Run(string(tc.state), func(t *testing.T) {
+			docker := newFakeDocker(t, tc.state)
+			require.NoError(t, closeAppPorts(t.Context(), docker))
+			assert.Equal(t, tc.wantCalls, docker.calls)
+		})
+	}
+
+	t.Run("no ingress", func(t *testing.T) {
+		docker := newEmptyFakeDocker(t)
+		require.NoError(t, closeAppPorts(t.Context(), docker))
+		assert.Empty(t, docker.calls)
+	})
+}
+
+func TestPullIngressImage(t *testing.T) {
+	present := newEmptyFakeDocker(t)
+	require.NoError(t, pullIngressImage(t.Context(), present, func(StreamMessage) {}))
+	assert.Empty(t, present.calls, "an image the board has is not pulled")
 }
 
 func TestStopAppProcessesClosesThePortsOfItsApp(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
 	require.NoError(t, cfg.RuntimeDir().MkdirAll())
-	// The launcher is unreachable: it runs nothing, the ingress is stopped
-	docker := fakeDockerCli(t, &fakeDocker{byLabel: map[string]container.Summary{DockerIngressLabel: {ID: testIngressID, State: container.StateExited}}})
+	_, err := writeIngressFiles(cfg, []int{7000})
+	require.NoError(t, err)
+	// The launcher is unreachable: it runs nothing
 	stopped := newTestApp(t, cfg, "stopped")
 	stopped.MainPythonFile = stopped.FullPath.Join("python", "main.py")
 
 	t.Run("another app keeps its ports", func(t *testing.T) {
-		_, err := writeIngressFiles(cfg, []int{7000})
-		require.NoError(t, err)
+		docker := newFakeDocker(t, container.StateRunning)
 		require.NoError(t, setLauncherWantedApp(cfg, cfg.AppsDir().Join("other")))
 		require.NoError(t, stopAppProcesses(t.Context(), docker, stopped, cfg, nil))
-		assertIngressConf(t, cfg, []int{7000})
+		assert.Empty(t, docker.calls)
 	})
 
 	t.Run("its own ports close", func(t *testing.T) {
+		docker := newFakeDocker(t, container.StateRunning)
 		require.NoError(t, setLauncherWantedApp(cfg, stopped.FullPath))
 		require.NoError(t, stopAppProcesses(t.Context(), docker, stopped, cfg, nil))
-		assertIngressConf(t, cfg, nil)
+		assert.Equal(t, []string{"stop " + testIngressID}, docker.calls)
 		assert.Nil(t, readLauncherWantedApp(cfg))
-		data, err := ingressComposeFile(cfg).ReadFile()
-		require.NoError(t, err)
-		assert.NotContains(t, string(data), "ports:")
+		assertIngressConf(t, cfg, []int{7000})
 	})
 }
 

@@ -50,7 +50,7 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 
 			// start the default app in the background
 			go func() {
-				// The ingress forwards nothing until the default app starts
+				// It also pulls the ingress image, so that no start has to, and closes the ports until the default app starts
 				elapsed, err := orchestrator.EnsureLauncher(
 					cmd.Context(),
 					servicelocator.GetDockerClient(),
@@ -60,10 +60,10 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 				)
 				if err != nil {
 					// The default app would fail on the same error
-					slog.Error("App launcher or ingress unavailable, the default app is not started", slog.String("error", err.Error()))
+					slog.Error("App launcher unavailable, the default app is not started", slog.String("error", err.Error()))
 					return
 				}
-				slog.Info("App launcher and ingress ready", slog.Duration("elapsed", elapsed))
+				slog.Info("App launcher ready", slog.Duration("elapsed", elapsed))
 
 				slog.Info("Starting default app")
 				err = orchestrator.StartDefaultApp(

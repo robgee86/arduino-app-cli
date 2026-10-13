@@ -42,10 +42,11 @@ func newLauncherCmd(cfg config.Configuration) *cobra.Command {
 	})
 	cmd.AddCommand(&cobra.Command{
 		Use:   "up",
-		Short: "Create or update the app launcher and ingress and wait until the launcher answers",
-		Long: "Create or update the app launcher and ingress and wait until the launcher answers.\n\n" +
-			"For development and support: it creates or refreshes the launcher and the ingress ahead of the first app start. It always runs compose up, " +
-			"which recreates them when their image changed, e.g. after a new image was pulled under the same tag.",
+		Short: "Create or update the app launcher, pull the ingress image and wait until the launcher answers",
+		Long: "Create or update the app launcher, pull the ingress image and wait until the launcher answers.\n\n" +
+			"For development and support: it creates or refreshes the launcher ahead of the first app start. It always runs compose up, " +
+			"which recreates the launcher when its image changed, e.g. after a new image was pulled under the same tag. " +
+			"The ingress, which publishes the app ports, runs only while an app with ports runs.",
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
@@ -115,7 +116,7 @@ type launcherUpResult struct {
 }
 
 func (r launcherUpResult) String() string {
-	return fmt.Sprintf("✓ App launcher and ingress ready in %s", r.Elapsed.Round(time.Millisecond))
+	return fmt.Sprintf("✓ App launcher ready in %s", r.Elapsed.Round(time.Millisecond))
 }
 
 func (r launcherUpResult) Data() any {
