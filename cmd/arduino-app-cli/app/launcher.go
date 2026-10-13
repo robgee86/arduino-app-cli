@@ -7,6 +7,8 @@ package app
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -41,7 +43,8 @@ func newLauncherCmd(cfg config.Configuration) *cobra.Command {
 		Use:   "up",
 		Short: "Create or update the app launcher and wait until it answers",
 		Long: "Create or update the app launcher and wait until it answers.\n\n" +
-			"For development and support: it creates or refreshes the launcher ahead of the first app start, e.g. after an image update.",
+			"For development and support: it creates or refreshes the launcher ahead of the first app start. It always runs compose up, " +
+			"which recreates the launcher when its image changed, e.g. after a new image was pulled under the same tag.",
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
@@ -57,7 +60,7 @@ func newLauncherCmd(cfg config.Configuration) *cobra.Command {
 		Use:   "down",
 		Short: "Remove the app launcher, stopping every app",
 		Long: "Remove the app launcher, stopping every app.\n\n" +
-			"For development and support: it removes the launcher and the shared network, which also stops every app and frees port 7000.",
+			"For development and support: it removes the launcher and the shared network, which also stops every app and frees the forwarded ports.",
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
@@ -85,9 +88,21 @@ func (r launcherStatusResult) String() string {
 		b.WriteString("No app running")
 	}
 	for _, c := range r.Children {
-		fmt.Fprintf(&b, "%s: %s, pid %d, port %d, warm %t, since %s\n", c.App, c.State, c.PID, c.HTTPPort, c.Warm, c.StartedAt.Local().Format(time.DateTime))
+		fmt.Fprintf(&b, "%s: %s, pid %d, ports %s, warm %t, since %s\n", c.App, c.State, c.PID, formatPorts(c.Ports), c.Warm, c.StartedAt.Local().Format(time.DateTime))
 	}
 	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// formatPorts lists the port mapping as public->internal pairs in public port order, "none" when empty.
+func formatPorts(ports map[int]int) string {
+	if len(ports) == 0 {
+		return "none"
+	}
+	pairs := make([]string, 0, len(ports))
+	for _, public := range slices.Sorted(maps.Keys(ports)) {
+		pairs = append(pairs, fmt.Sprintf("%d->%d", public, ports[public]))
+	}
+	return strings.Join(pairs, ", ")
 }
 
 func (r launcherStatusResult) Data() any {

@@ -26,17 +26,17 @@ import (
 
 const testPythonImage = "app-bricks:python-apps-base:dev-latest"
 
-// setTestBricks writes a bricks index with a UI brick, a brick with a sidecar publishing 1337, and a plain brick.
+// setTestBricks writes a bricks index with two UI bricks, a brick with a sidecar publishing 1337, and a plain brick.
 func setTestBricks(t *testing.T, cfg config.Configuration) (*bricksindex.BricksIndex, *servicesindex.ServicesIndex) {
 	t.Helper()
 	require.NoError(t, cfg.AssetDir().Join("bricks-list.yaml").WriteFile([]byte(`
 bricks:
 - id: arduino:web_ui
   name: Web UI
-  ports: ["7000"]
+  ports: ["7100"]
 - id: arduino:custom_ui
   name: Custom UI
-  ports: ["8000"]
+  ports: ["8000", "7100"]
 - id: arduino:object_detection
   name: Object Detection
   variables:
@@ -171,12 +171,12 @@ func TestGenerateLauncherComposeFile(t *testing.T) {
 	for _, p := range svc.Ports {
 		published = append(published, p.Target)
 	}
-	assert.Equal(t, []uint32{7000, 8000}, published)
+	assert.Equal(t, []uint32{7100, 8000}, published)
 
 	assert.Equal(t, types.MappingWithEquals{
 		"BOARD_NAME":          new("unoq"),
 		"HOST_IP":             new("10.0.0.2"),
-		"APP_LAUNCHER_PORTS":  new("7000,8000"),
+		"APP_LAUNCHER_PORTS":  new("7100,8000"),
 		"APP_LAUNCHER_SOCKET": new("/run/arduino-app-cli/app-launcher.sock"),
 		// The CLI waits for a start as long as the launcher may prepare it
 		"APP_LAUNCHER_PREPARE_TIMEOUT_S": new("600"),
@@ -212,14 +212,60 @@ func TestUncoveredAppPort(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
 	bricksIndex, _ := setTestBricks(t, cfg)
 
-	assert.Equal(t, []int{7000, 8000}, launcherPorts(bricksIndex))
+	assert.Equal(t, []int{7100, 8000}, launcherPorts(bricksIndex), "the sorted union of the brick ports")
 
-	_, uncovered := uncoveredAppPort(app.ArduinoApp{Descriptor: app.AppDescriptor{Ports: []int{7000, 8000}}}, bricksIndex)
+	_, uncovered := uncoveredAppPort(app.ArduinoApp{Descriptor: app.AppDescriptor{Ports: []int{7100, 8000}}}, bricksIndex)
 	assert.False(t, uncovered)
 
-	port, uncovered := uncoveredAppPort(app.ArduinoApp{Descriptor: app.AppDescriptor{Ports: []int{7000, 8080}}}, bricksIndex)
+	port, uncovered := uncoveredAppPort(app.ArduinoApp{Descriptor: app.AppDescriptor{Ports: []int{7100, 7000}}}, bricksIndex)
 	assert.True(t, uncovered)
-	assert.Equal(t, 8080, port)
+	assert.Equal(t, 7000, port)
+}
+
+func TestLauncherWithoutBrickPorts(t *testing.T) {
+	cfg := setTestOrchestratorConfig(t)
+	require.NoError(t, cfg.AssetDir().Join("bricks-list.yaml").WriteFile([]byte(`
+bricks:
+- id: arduino:plain
+  name: Plain
+`)))
+	bricksIndex, err := bricksindex.Load(platform.GetPlatform(nil), cfg.AssetDir())
+	require.NoError(t, err)
+	require.NoError(t, cfg.AppsDir().MkdirAll())
+	require.NoError(t, cfg.RuntimeDir().MkdirAll())
+
+	assert.Empty(t, launcherPorts(bricksIndex))
+	port, uncovered := uncoveredAppPort(app.ArduinoApp{Descriptor: app.AppDescriptor{Ports: []int{7000}}}, bricksIndex)
+	assert.True(t, uncovered)
+	assert.Equal(t, 7000, port)
+
+	_, err = generateLauncherComposeFile(bricksIndex, testPythonImage, cfg, nil, platform.Platform{})
+	require.NoError(t, err)
+	data, err := launcherComposeFile(cfg).ReadFile()
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "ports:", "no ingress")
+	svc := loadCompose(t, launcherComposeFile(cfg)).Services[launcherServiceName]
+	assert.Empty(t, svc.Ports)
+	assert.Equal(t, "", *svc.Environment["APP_LAUNCHER_PORTS"])
+}
+
+func TestLauncherUpReason(t *testing.T) {
+	for _, tc := range []struct {
+		name                      string
+		forceUp, changed, running bool
+		wantUp                    bool
+	}{
+		{name: "boot or up, to follow the image", forceUp: true, running: true, wantUp: true},
+		{name: "compose file changed", changed: true, running: true, wantUp: true},
+		{name: "container not running", wantUp: true},
+		{name: "start with nothing changed", running: true, wantUp: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, up := launcherUpReason(tc.forceUp, tc.changed, tc.running)
+			assert.Equal(t, tc.wantUp, up)
+			assert.Equal(t, tc.wantUp, reason != "")
+		})
+	}
 }
 
 func TestPrepareLauncherRejectsWhatItCannotRun(t *testing.T) {

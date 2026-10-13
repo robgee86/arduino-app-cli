@@ -42,7 +42,6 @@ const (
 	// launcherNetwork is shared by the launcher and the app sidecars, which reach each other by service name.
 	launcherNetwork      = "arduino-apps"
 	launcherSocketDir    = "/run/arduino-app-cli"
-	defaultLauncherPort  = 7000
 	launcherReadyTimeout = 90 * time.Second
 
 	launcherRequestTimeout = 2 * time.Second
@@ -67,9 +66,9 @@ func newLauncherClient(cfg config.Configuration) *launcher.Client {
 	return launcher.New(cfg.RuntimeDir().Join(launcher.SocketName).String(), launcherRequestTimeout)
 }
 
-// launcherPorts are the public ports the launcher forwards to the running app: the brick ports.
+// launcherPorts are the public ports the launcher forwards to the running app: the sorted union of the brick ports.
 func launcherPorts(bricksIndex *bricksindex.BricksIndex) []int {
-	ports := []int{defaultLauncherPort}
+	var ports []int
 	for _, brick := range bricksIndex.ListBricks() {
 		for _, p := range brick.Ports {
 			port, err := strconv.Atoi(p)
@@ -101,7 +100,7 @@ func prepareLauncher(
 	if roots := launcherAppRoots(cfg); !isInsideLauncherRoots(appToStart.FullPath, cfg) {
 		return fmt.Errorf("the app launcher runs only the apps inside %s", strings.Join(roots.AsStrings(), " or "))
 	}
-	elapsed, err := ensureLauncher(ctx, docker, bricksIndex, cfg, platform, cb)
+	elapsed, err := ensureLauncher(ctx, docker, bricksIndex, cfg, platform, false, cb)
 	if err != nil {
 		return fmt.Errorf("the app launcher is unavailable: %w", err)
 	}
@@ -225,13 +224,16 @@ func boardEnvironment(ctx context.Context, plat platform.Platform, cfg config.Co
 	return envs
 }
 
-// ensureLauncher brings the launcher up to date and running, and waits until it answers.
+// ensureLauncher brings the launcher up to date and running, and waits until it answers. forceUp
+// runs compose up even when nothing changed here, so that a new image under the same tag is picked
+// up: compose recreates the container only when its configuration or image differ.
 func ensureLauncher(
 	ctx context.Context,
 	docker command.Cli,
 	bricksIndex *bricksindex.BricksIndex,
 	cfg config.Configuration,
 	platform platform.Platform,
+	forceUp bool,
 	cb func(StreamMessage),
 ) (time.Duration, error) {
 	started := time.Now()
@@ -247,21 +249,30 @@ func ensureLauncher(
 	if err != nil {
 		return 0, err
 	}
-	if changed || current == nil || current.State != container.StateRunning {
-		slog.Debug("bringing the app launcher up", slog.Bool("changed", changed), slog.Bool("exists", current != nil))
+	running := current != nil && current.State == container.StateRunning
+	recreated := false
+	if reason, up := launcherUpReason(forceUp, changed, running); up {
+		slog.Debug("running compose up for the app launcher", slog.String("reason", reason))
 		cb(StreamMessage{data: "Starting the app launcher"})
 		if err := composeUpFile(ctx, docker, launcherComposeFile(cfg), cb); err != nil {
 			return 0, fmt.Errorf("failed to start the app launcher: %w", err)
 		}
-		// A new or restarted launcher runs no app
-		if err := clearLauncherWantedApp(cfg, nil); err != nil {
-			return 0, err
-		}
+		previous := current
 		if current, err = getLauncherContainer(ctx, docker.Client()); err != nil {
 			return 0, err
 		}
 		if current == nil {
 			return 0, errors.New("the app launcher container was not created")
+		}
+		recreated = previous == nil || previous.ID != current.ID || !running
+		slog.Debug("app launcher compose up done", slog.Bool("recreated", recreated))
+	} else {
+		slog.Debug("app launcher up to date and running, compose up skipped")
+	}
+	// A new or restarted launcher runs no app
+	if recreated {
+		if err := clearLauncherWantedApp(cfg, nil); err != nil {
+			return 0, err
 		}
 	}
 
@@ -269,8 +280,22 @@ func ensureLauncher(
 		return 0, err
 	}
 	elapsed := time.Since(started)
-	slog.Info("app launcher ready", slog.Duration("elapsed", elapsed), slog.Bool("recreated", changed))
+	slog.Info("app launcher ready", slog.Duration("elapsed", elapsed), slog.Bool("recreated", recreated))
 	return elapsed, nil
+}
+
+// launcherUpReason tells whether compose up has to run for the launcher, and why.
+func launcherUpReason(forceUp, changed, running bool) (string, bool) {
+	switch {
+	case changed:
+		return "compose file changed", true
+	case !running:
+		return "container not running", true
+	case forceUp:
+		return "forced, to follow the image", true
+	default:
+		return "", false
+	}
 }
 
 // waitLauncherReady polls ping until the preload is over. It fails early when the container stops
@@ -378,7 +403,8 @@ func clearLauncherWantedApp(cfg config.Configuration, appPath *paths.Path) error
 	return nil
 }
 
-// EnsureLauncher brings the launcher up and stops what it runs, as the daemon does at boot.
+// EnsureLauncher brings the launcher up, recreating it on a new image, and stops what it runs when
+// stopApps, as the daemon does at boot.
 func EnsureLauncher(
 	ctx context.Context,
 	docker command.Cli,
@@ -390,7 +416,7 @@ func EnsureLauncher(
 	var elapsed time.Duration
 	err := withAppsLock(ctx, cfg, func() error {
 		var err error
-		if elapsed, err = ensureLauncher(ctx, docker, bricksIndex, cfg, platform, func(StreamMessage) {}); err != nil {
+		if elapsed, err = ensureLauncher(ctx, docker, bricksIndex, cfg, platform, true, func(StreamMessage) {}); err != nil {
 			return err
 		}
 		if !stopApps {
