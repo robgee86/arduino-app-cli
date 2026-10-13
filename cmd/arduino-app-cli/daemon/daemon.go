@@ -34,7 +34,7 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 		Run: func(cmd *cobra.Command, args []string) {
 			daemonPort, _ := cmd.Flags().GetString("port")
 
-			// The launcher survives the cleanup: it carries no app label and stops its apps below
+			// The launcher survives the cleanup: it carries no app label and stops its app below
 			err := orchestrator.StopAllAppContainers(cmd.Context(), servicelocator.GetDockerClient().Client())
 			if err != nil {
 				slog.Warn("Failed to stop containers", slog.String("error", err.Error()))
@@ -59,10 +59,11 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 					true,
 				)
 				if err != nil {
-					slog.Warn("App launcher unavailable, apps run in their own containers", slog.String("error", err.Error()))
-				} else {
-					slog.Info("App launcher ready", slog.Duration("elapsed", elapsed))
+					// The default app would fail on the same error
+					slog.Error("App launcher unavailable, the default app is not started", slog.String("error", err.Error()))
+					return
 				}
+				slog.Info("App launcher ready", slog.Duration("elapsed", elapsed))
 
 				slog.Info("Starting default app")
 				err = orchestrator.StartDefaultApp(

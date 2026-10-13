@@ -6,28 +6,26 @@
 package orchestrator
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/arduino/go-paths-helper"
 	"github.com/moby/moby/api/types/container"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/launcher"
 )
 
-const (
-	appA = "/apps/a"
-	appB = "/apps/b"
-)
-
 func TestMergeAppStatus(t *testing.T) {
+	root := t.TempDir()
+	// a and b were provisioned, fresh was not
+	appA, appB, fresh := filepath.Join(root, "a"), filepath.Join(root, "b"), filepath.Join(root, "fresh")
+	require.NoError(t, paths.New(appA, ".cache").MkdirAll())
+	require.NoError(t, paths.New(appB, ".cache").MkdirAll())
+
 	sidecar := func(appPath string, state container.ContainerState, status string) container.Summary {
 		return container.Summary{State: state, Status: status, Labels: map[string]string{DockerAppLabel: "true", DockerAppPathLabel: appPath}}
-	}
-	main := func(appPath string, state container.ContainerState, status string) container.Summary {
-		c := sidecar(appPath, state, status)
-		c.Labels[DockerAppMainLabel] = "true"
-		return c
 	}
 	child := func(appPath, state string) launcher.Child {
 		return launcher.Child{App: appPath, State: state}
@@ -84,14 +82,14 @@ func TestMergeAppStatus(t *testing.T) {
 			want:       map[string]Status{appA: StatusStopped},
 		},
 		{
-			name: "a wanted app without child failed",
-			view: launcherView{wanted: paths.New(appA)},
-			want: map[string]Status{appA: StatusFailed},
+			name:       "an idle app without cache is uninitialized",
+			containers: []container.Summary{sidecar(fresh, container.StateExited, "Exited (0) 5 seconds ago")},
+			want:       map[string]Status{fresh: StatusUninitialized},
 		},
 		{
-			name:       "an app with a main container keeps the container status",
-			containers: []container.Summary{main(appA, container.StateRunning, "Up"), sidecar(appA, container.StateRunning, "Up")},
-			want:       map[string]Status{appA: StatusRunning},
+			name: "a wanted app without child failed",
+			view: launcherView{wanted: paths.New(fresh)},
+			want: map[string]Status{fresh: StatusFailed},
 		},
 		{
 			name:       "a replaced app stops while the new one runs",
@@ -112,14 +110,20 @@ func TestMergeAppStatus(t *testing.T) {
 }
 
 func TestStatusChanges(t *testing.T) {
-	last := map[string]Status{appA: StatusRunning, appB: StatusStopped, "/apps/c": StatusRunning}
-	current := map[string]Status{appA: StatusStopped, appB: StatusStopped, "/apps/d": StatusRunning}
+	provisioned := filepath.Join(t.TempDir(), "provisioned")
+	require.NoError(t, paths.New(provisioned, ".cache").MkdirAll())
+	const appA, appB, gone, added = "/apps/a", "/apps/b", "/apps/c", "/apps/d"
+
+	last := map[string]Status{appA: StatusRunning, appB: StatusStopped, gone: StatusRunning, provisioned: StatusRunning}
+	current := map[string]Status{appA: StatusStopped, appB: StatusStopped, added: StatusRunning}
 
 	changes := statusChanges(last, current)
 	got := make([]string, 0, len(changes))
 	for _, c := range changes {
 		got = append(got, c.AppPath.String()+"="+string(c.Status))
 	}
-	assert.Equal(t, []string{"/apps/a=stopped", "/apps/c=uninitialized", "/apps/d=running"}, got)
+	// A gone app is stopped when it has a cache, uninitialized otherwise
+	assert.ElementsMatch(t, []string{"/apps/a=stopped", "/apps/c=uninitialized", "/apps/d=running", provisioned + "=stopped"}, got)
 	assert.Empty(t, statusChanges(current, current))
+	assert.Empty(t, statusChanges(map[string]Status{provisioned: StatusStopped}, map[string]Status{}), "a stopped app that is gone stays stopped")
 }

@@ -72,16 +72,6 @@ type composeNetwork struct {
 	External bool   `yaml:"external,omitempty"`
 }
 
-// runMode tells what runs the app Python code.
-type runMode int
-
-const (
-	// launcherMode forks the app in the shared launcher container: the app project holds only the sidecars.
-	launcherMode runMode = iota
-	// classicMode runs the app in a main container of its own compose project.
-	classicMode
-)
-
 type Provision struct {
 	docker      command.Cli
 	pythonImage string

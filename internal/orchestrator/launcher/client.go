@@ -29,6 +29,8 @@ const (
 	CodeUnsupported = "unsupported"
 	CodeBusy        = "busy"
 	CodeInternal    = "internal"
+	// CodePrepareFailed is a start whose dependencies failed to install: the message ends with the install output.
+	CodePrepareFailed = "prepare_failed"
 )
 
 // Error is a request the launcher refused or failed.
@@ -42,8 +44,9 @@ func (e *Error) Error() string {
 }
 
 type Timings struct {
-	StopMs float64 `json:"stop_ms"`
-	ForkMs float64 `json:"fork_ms"`
+	StopMs    float64 `json:"stop_ms"`
+	PrepareMs float64 `json:"prepare_ms"`
+	ForkMs    float64 `json:"fork_ms"`
 }
 
 type StartResponse struct {
@@ -51,7 +54,9 @@ type StartResponse struct {
 	StartedAt time.Time `json:"started_at"`
 	Warm      bool      `json:"warm"`
 	Runner    string    `json:"runner"`
-	Timings   Timings   `json:"timings"`
+	// Prepared tells the launcher installed the app dependencies before the start.
+	Prepared bool    `json:"prepared"`
+	Timings  Timings `json:"timings"`
 }
 
 type StoppedChild struct {
@@ -127,7 +132,7 @@ func (c *Client) Ping(ctx context.Context) error {
 	return c.do(ctx, request{Cmd: cmdPing}, nil)
 }
 
-// Start runs the app in place of every other running app.
+// Start runs the app in place of every other running app, installing its dependencies first when they changed.
 func (c *Client) Start(ctx context.Context, app string, env map[string]string) (StartResponse, error) {
 	var resp StartResponse
 	err := c.do(ctx, request{Cmd: cmdStart, App: app, Env: env, Mode: "replace"}, &resp)

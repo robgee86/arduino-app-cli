@@ -43,12 +43,15 @@ const (
 	launcherNetwork      = "arduino-apps"
 	launcherSocketDir    = "/run/arduino-app-cli"
 	defaultLauncherPort  = 7000
-	launcherDisableEnv   = "ARDUINO_APP_LAUNCHER"
 	launcherReadyTimeout = 90 * time.Second
 
 	launcherRequestTimeout = 2 * time.Second
-	// A start stops the running app first, with a 5 s grace before SIGKILL.
-	launcherStartTimeout = 60 * time.Second
+	// A stop waits a 5 s grace before SIGKILL.
+	launcherStopTimeout = 60 * time.Second
+	// launcherPrepareTimeout bounds the install of the app dependencies, the launcher is given it.
+	launcherPrepareTimeout = 600 * time.Second
+	// A start stops the running app, prepares the new one and forks it.
+	launcherStartTimeout = launcherStopTimeout + launcherPrepareTimeout
 )
 
 func launcherComposeFile(cfg config.Configuration) *paths.Path {
@@ -62,11 +65,6 @@ func launcherWantedAppFile(cfg config.Configuration) *paths.Path {
 
 func newLauncherClient(cfg config.Configuration) *launcher.Client {
 	return launcher.New(cfg.RuntimeDir().Join(launcher.SocketName).String(), launcherRequestTimeout)
-}
-
-// launcherDisabled is the switch back to one main container per app.
-func launcherDisabled() bool {
-	return os.Getenv(launcherDisableEnv) == "off"
 }
 
 // launcherPorts are the public ports the launcher forwards to the running app: the brick ports.
@@ -86,9 +84,9 @@ func launcherPorts(bricksIndex *bricksindex.BricksIndex) []int {
 	return slices.Compact(ports)
 }
 
-// selectRunMode is the one place that decides how an app runs. The launcher runs it unless it is
-// disabled, cannot serve the app ports, or does not come up; it then runs in a main container.
-func selectRunMode(
+// prepareLauncher checks that the launcher can run the app, then brings it up. bricksIndex holds
+// the installed bricks only: their ports are the ones the launcher forwards.
+func prepareLauncher(
 	ctx context.Context,
 	docker command.Cli,
 	bricksIndex *bricksindex.BricksIndex,
@@ -96,48 +94,22 @@ func selectRunMode(
 	cfg config.Configuration,
 	platform platform.Platform,
 	cb func(StreamMessage),
-) runMode {
-	fallback := func(reason string) runMode {
-		slog.Info("running the app in its own container", slog.String("reason", reason))
-		// The launcher would hold the app ports, and the sidecars of its app their own
-		if err := stopLauncherContainer(ctx, docker.Client()); err != nil {
-			slog.Warn("failed to stop the app launcher", slog.String("error", err.Error()))
-		}
-		if wanted := readLauncherWantedApp(cfg); wanted != nil {
-			if err := stopReplacedApps(ctx, docker, paths.PathList{wanted}, cb); err != nil {
-				slog.Warn("failed to stop the sidecars of the launcher app", slog.String("error", err.Error()))
-			}
-		}
-		if err := clearLauncherWantedApp(cfg, nil); err != nil {
-			slog.Warn("failed to clear the launcher state", slog.String("error", err.Error()))
-		}
-		return classicMode
-	}
-
-	if launcherDisabled() {
-		return fallback(launcherDisableEnv + "=off")
-	}
+) error {
 	if port, ok := uncoveredAppPort(appToStart, bricksIndex); ok {
-		return fallback(fmt.Sprintf("the launcher does not forward port %d", port))
+		return fmt.Errorf("the app launcher does not forward port %d declared in app.yaml: only the ports of the installed bricks are forwarded", port)
 	}
-	if !isInsideLauncherRoots(appToStart.FullPath, cfg) {
-		return fallback("the launcher does not mount the app folder")
-	}
-
-	// A main container started before holds the ports the launcher publishes
-	if err := stopMainContainers(ctx, docker.Client()); err != nil {
-		slog.Warn("failed to stop the app main containers", slog.String("error", err.Error()))
+	if roots := launcherAppRoots(cfg); !isInsideLauncherRoots(appToStart.FullPath, cfg) {
+		return fmt.Errorf("the app launcher runs only the apps inside %s", strings.Join(roots.AsStrings(), " or "))
 	}
 	elapsed, err := ensureLauncher(ctx, docker, bricksIndex, cfg, platform, cb)
 	if err != nil {
-		slog.Warn("app launcher unavailable", slog.String("error", err.Error()))
-		return fallback("the launcher is unavailable")
+		return fmt.Errorf("the app launcher is unavailable: %w", err)
 	}
 	cb(StreamMessage{data: fmt.Sprintf("App launcher ready in %s", elapsed.Round(time.Millisecond))})
-	return launcherMode
+	return nil
 }
 
-// uncoveredAppPort returns an app.yaml port the launcher does not publish: the app binds it itself.
+// uncoveredAppPort returns an app.yaml port the launcher does not publish.
 func uncoveredAppPort(a app.ArduinoApp, bricksIndex *bricksindex.BricksIndex) (int, bool) {
 	ports := launcherPorts(bricksIndex)
 	for _, p := range a.Descriptor.Ports {
@@ -182,6 +154,7 @@ func generateLauncherComposeFile(
 	envs := boardEnvs.Clone()
 	envs["APP_LAUNCHER_PORTS"] = strings.Join(forwarded, ",")
 	envs["APP_LAUNCHER_SOCKET"] = launcherSocketDir + "/" + launcher.SocketName
+	envs["APP_LAUNCHER_PREPARE_TIMEOUT_S"] = strconv.Itoa(int(launcherPrepareTimeout.Seconds()))
 
 	// The launcher is given host paths
 	volumes := []any{volume{Type: "bind", Source: cfg.RuntimeDir().String(), Target: launcherSocketDir}}
@@ -358,22 +331,6 @@ func stopLauncherContainer(ctx context.Context, docker dockerClient.APIClient) e
 	return nil
 }
 
-// stopMainContainers stops the running main containers of the apps started in classic mode.
-func stopMainContainers(ctx context.Context, docker dockerClient.APIClient) error {
-	containers, err := docker.ContainerList(ctx, dockerClient.ContainerListOptions{
-		Filters: make(dockerClient.Filters).Add("label", DockerAppMainLabel+"=true"),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to list the app main containers: %w", err)
-	}
-	timeout := DefaultDockerStopTimeoutSeconds
-	return forEachContainer(containers.Items, func(c container.Summary) error {
-		slog.Debug("stopping a main container", slog.String("container", containerName(c)))
-		_, err := docker.ContainerStop(ctx, c.ID, dockerClient.ContainerStopOptions{Timeout: &timeout})
-		return err
-	})
-}
-
 // StopAllAppContainers stops every running app container, sidecars included, leaving the launcher up.
 func StopAllAppContainers(ctx context.Context, docker dockerClient.APIClient) error {
 	containers, err := docker.ContainerList(ctx, dockerClient.ContainerListOptions{
@@ -432,9 +389,6 @@ func EnsureLauncher(
 ) (time.Duration, error) {
 	var elapsed time.Duration
 	err := withAppsLock(ctx, cfg, func() error {
-		if launcherDisabled() {
-			return fmt.Errorf("the app launcher is disabled by %s=off", launcherDisableEnv)
-		}
 		var err error
 		if elapsed, err = ensureLauncher(ctx, docker, bricksIndex, cfg, platform, func(StreamMessage) {}); err != nil {
 			return err

@@ -568,6 +568,22 @@ func TestListApp(t *testing.T) {
 		require.NoError(t, err)
 		require.Empty(t, res.BrokenApps)
 	})
+
+	t.Run("an app with a cache and nothing running is stopped", func(t *testing.T) {
+		provisioned := cfg.AppsDir().Join("app1")
+		cache := provisioned.Join(".cache")
+		require.NoError(t, cache.MkdirAll())
+		t.Cleanup(func() { _ = cache.RemoveAll() })
+
+		res, err := ListApps(t.Context(), dockerCli, ListAppRequest{ShowApps: true}, idProvider, nil, cfg, unoQPlatform)
+		require.NoError(t, err)
+		statuses := make(map[string]Status, len(res.Apps))
+		for _, a := range res.Apps {
+			statuses[a.Name] = a.Status
+		}
+		assert.Equal(t, StatusStopped, statuses[provisioned.Base()])
+		assert.Equal(t, StatusUninitialized, statuses["app2"])
+	})
 }
 
 func TestListAppsFiltersByBricksIndex(t *testing.T) {
@@ -718,33 +734,15 @@ func TestListActiveApps(t *testing.T) {
 	app2ID := createApp(t, "app2", false, idProvider, cfg)
 	exampleID := createApp(t, "example1", true, idProvider, cfg)
 
-	newDockerCli := func(containers []container.Summary) command.Cli {
-		cli, err := command.NewDockerCli(
-			command.WithAPIClient(&fakeContainerClient{containers: containers}),
-			command.WithBaseContext(t.Context()),
-		)
-		require.NoError(t, err)
-		require.NoError(t, cli.Initialize(&flags.ClientOptions{}))
-		return cli
-	}
-
-	containerFor := func(appPath *paths.Path, state container.ContainerState, status string) container.Summary {
-		return container.Summary{
-			// Main containers: the apps ran in classic mode
-			Labels: map[string]string{DockerAppPathLabel: appPath.String(), DockerAppMainLabel: "true"},
-			State:  state,
-			Status: status,
-		}
+	statusFor := func(appPath *paths.Path, status Status) AppStatusInfo {
+		return AppStatusInfo{AppPath: appPath, Status: status}
 	}
 
 	t.Run("running and stopped apps are returned with their status, sorted by path", func(t *testing.T) {
-		cli := newDockerCli([]container.Summary{
-			containerFor(app2ID.ToPath(), container.StateExited, "Exited (137)"),
-			containerFor(app1ID.ToPath(), container.StateRunning, "Up 5 minutes"),
-		})
-
-		apps, err := ListActiveApps(t.Context(), cli, idProvider, cfg)
-		require.NoError(t, err)
+		apps := describeActiveApps([]AppStatusInfo{
+			statusFor(app2ID.ToPath(), StatusStopped),
+			statusFor(app1ID.ToPath(), StatusRunning),
+		}, idProvider)
 		assert.Empty(t, gCmp.Diff([]AppInfo{
 			{
 				ID:          app1ID,
@@ -768,12 +766,9 @@ func TestListActiveApps(t *testing.T) {
 	})
 
 	t.Run("example apps are returned with the example id", func(t *testing.T) {
-		cli := newDockerCli([]container.Summary{
-			containerFor(exampleID.ToPath(), container.StateRunning, "Up 5 minutes"),
-		})
-
-		apps, err := ListActiveApps(t.Context(), cli, idProvider, cfg)
-		require.NoError(t, err)
+		apps := describeActiveApps([]AppStatusInfo{
+			statusFor(exampleID.ToPath(), StatusRunning),
+		}, idProvider)
 		require.Len(t, apps, 1)
 		assert.Empty(t, gCmp.Diff(AppInfo{
 			ID:          exampleID,
@@ -793,12 +788,9 @@ func TestListActiveApps(t *testing.T) {
 		require.NoError(t, unknownAppPath.Join("python").MkdirAll())
 		require.NoError(t, unknownAppPath.Join("python", "main.py").WriteFile([]byte("print('running')\n")))
 
-		cli := newDockerCli([]container.Summary{
-			containerFor(unknownAppPath, container.StateRunning, "Up 5 minutes"),
-		})
-
-		apps, err := ListActiveApps(t.Context(), cli, idProvider, cfg)
-		require.NoError(t, err)
+		apps := describeActiveApps([]AppStatusInfo{
+			statusFor(unknownAppPath, StatusRunning),
+		}, idProvider)
 		require.Len(t, apps, 1)
 		assert.Empty(t, gCmp.Diff(AppInfo{
 			ID:          f.Must(idProvider.IDFromPath(unknownAppPath)),
@@ -817,12 +809,9 @@ func TestListActiveApps(t *testing.T) {
 		require.NoError(t, brokenAppPath.Join("app.yaml").WriteFile([]byte("not: [valid: yaml\n")))
 		t.Cleanup(func() { _ = brokenAppPath.RemoveAll() })
 
-		cli := newDockerCli([]container.Summary{
-			containerFor(brokenAppPath, container.StateRunning, "Up 5 minutes"),
-		})
-
-		apps, err := ListActiveApps(t.Context(), cli, idProvider, cfg)
-		require.NoError(t, err)
+		apps := describeActiveApps([]AppStatusInfo{
+			statusFor(brokenAppPath, StatusRunning),
+		}, idProvider)
 		require.Len(t, apps, 1)
 		assert.Empty(t, gCmp.Diff(AppInfo{
 			ID:          f.Must(idProvider.ParseID("user:broken-app")),
@@ -838,12 +827,9 @@ func TestListActiveApps(t *testing.T) {
 	t.Run("apps whose directory is missing are still shown with the id and the path name", func(t *testing.T) {
 		goneAppPath := cfg.AppsDir().Join("gone-app")
 
-		cli := newDockerCli([]container.Summary{
-			containerFor(goneAppPath, container.StateRunning, "Up 5 minutes"),
-		})
-
-		apps, err := ListActiveApps(t.Context(), cli, idProvider, cfg)
-		require.NoError(t, err)
+		apps := describeActiveApps([]AppStatusInfo{
+			statusFor(goneAppPath, StatusRunning),
+		}, idProvider)
 		require.Len(t, apps, 1)
 		// The app directory does not exist: the ID is computed from the Docker label
 		// path and only the path name is available as fallback for the name.

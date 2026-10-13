@@ -27,7 +27,7 @@ import (
 const launcherPollInterval = time.Second
 
 // AppStatusEvents yields an app each time its status changes. Container events refresh the
-// sidecars and the main containers, a ticker refreshes the launcher children.
+// sidecars, a ticker refreshes the launcher children.
 func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker command.Cli, idProvider *appid.Provider) iter.Seq2[AppInfo, error] {
 	chanMsg, chanError := dockerhelper.ContainerEvents(ctx, docker.Client(), DockerAppLabel+"=true",
 		"create", "start", "stop", "die", "restart", "destroy", "delete")
@@ -40,12 +40,8 @@ func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker comma
 		}
 		last := statusByPath(mergeAppStatus(containers, readLauncherView(ctx, cfg)))
 
-		var tick <-chan time.Time
-		if !launcherDisabled() {
-			ticker := time.NewTicker(launcherPollInterval)
-			defer ticker.Stop()
-			tick = ticker.C
-		}
+		ticker := time.NewTicker(launcherPollInterval)
+		defer ticker.Stop()
 
 		for {
 			select {
@@ -66,7 +62,7 @@ func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker comma
 					}
 					continue
 				}
-			case <-tick:
+			case <-ticker.C:
 			}
 
 			current := statusByPath(mergeAppStatus(containers, readLauncherView(ctx, cfg)))
@@ -93,7 +89,7 @@ func statusByPath(statuses []AppStatusInfo) map[string]Status {
 	return result
 }
 
-// statusChanges lists the apps whose status differs, sorted by path. An app that is gone is uninitialized.
+// statusChanges lists the apps whose status differs, sorted by path. An app that is gone is idle.
 func statusChanges(last, current map[string]Status) []AppStatusInfo {
 	var changes []AppStatusInfo
 	for appPath, status := range current {
@@ -103,7 +99,10 @@ func statusChanges(last, current map[string]Status) []AppStatusInfo {
 	}
 	for appPath := range last {
 		if _, ok := current[appPath]; !ok {
-			changes = append(changes, AppStatusInfo{AppPath: paths.New(appPath), Status: StatusUninitialized})
+			p := paths.New(appPath)
+			if status := idleAppStatus(p); status != last[appPath] {
+				changes = append(changes, AppStatusInfo{AppPath: p, Status: status})
+			}
 		}
 	}
 	slices.SortFunc(changes, func(a, b AppStatusInfo) int { return strings.Compare(a.AppPath.String(), b.AppPath.String()) })
