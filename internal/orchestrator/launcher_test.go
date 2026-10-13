@@ -97,14 +97,6 @@ services:
 	return bricksIndex, servicesIndex
 }
 
-// writeTestApp writes an app the launcher can run in dir.
-func writeTestApp(t *testing.T, dir *paths.Path, descriptor string) {
-	t.Helper()
-	require.NoError(t, dir.Join("python").MkdirAll())
-	require.NoError(t, dir.Join("python", "main.py").WriteFile([]byte("print('hi')\n")))
-	require.NoError(t, dir.Join("app.yaml").WriteFile([]byte(descriptor)))
-}
-
 func newTestApp(t *testing.T, cfg config.Configuration, name string, bricks ...string) app.ArduinoApp {
 	t.Helper()
 	a := app.ArduinoApp{Name: name, FullPath: cfg.AppsDir().Join(name)}
@@ -290,7 +282,7 @@ func TestGenerateLauncherComposeFile(t *testing.T) {
 	require.NoError(t, cfg.RuntimeDir().MkdirAll())
 	boardEnvs := types.Mapping{"BOARD_NAME": "unoq", "HOST_IP": "10.0.0.2"}
 
-	changed, err := generateLauncherComposeFile([]int{7100, 8000}, testPythonImage, cfg, boardEnvs, platform.Platform{})
+	changed, err := generateLauncherComposeFile(testPythonImage, cfg, boardEnvs, platform.Platform{})
 	require.NoError(t, err)
 	assert.True(t, changed)
 
@@ -312,16 +304,11 @@ func TestGenerateLauncherComposeFile(t *testing.T) {
 	assert.Equal(t, types.Duration(60*time.Second), *svc.HealthCheck.StartPeriod)
 	assert.Equal(t, types.Duration(500*time.Millisecond), *svc.HealthCheck.StartInterval)
 
-	published := make([]uint32, 0, len(svc.Ports))
-	for _, p := range svc.Ports {
-		published = append(published, p.Target)
-	}
-	assert.Equal(t, []uint32{7100, 8000}, published)
+	assert.Empty(t, svc.Ports, "the ingress publishes the app ports")
 
 	assert.Equal(t, types.MappingWithEquals{
 		"BOARD_NAME":          new("unoq"),
 		"HOST_IP":             new("10.0.0.2"),
-		"APP_LAUNCHER_PORTS":  new("7100,8000"),
 		"APP_LAUNCHER_SOCKET": new("/run/arduino-app-cli/app-launcher.sock"),
 		// The CLI waits for a start as long as the launcher may prepare it
 		"APP_LAUNCHER_PREPARE_TIMEOUT_S": new("600"),
@@ -341,36 +328,22 @@ func TestGenerateLauncherComposeFile(t *testing.T) {
 	assert.False(t, bool(network.External))
 
 	t.Run("a second generation changes nothing", func(t *testing.T) {
-		changed, err := generateLauncherComposeFile([]int{7100, 8000}, testPythonImage, cfg, boardEnvs, platform.Platform{})
+		changed, err := generateLauncherComposeFile(testPythonImage, cfg, boardEnvs, platform.Platform{})
 		require.NoError(t, err)
 		assert.False(t, changed)
 	})
 
 	t.Run("another board environment changes it", func(t *testing.T) {
-		changed, err := generateLauncherComposeFile([]int{7100, 8000}, testPythonImage, cfg, types.Mapping{"HOST_IP": "10.0.0.3"}, platform.Platform{})
+		changed, err := generateLauncherComposeFile(testPythonImage, cfg, types.Mapping{"HOST_IP": "10.0.0.3"}, platform.Platform{})
 		require.NoError(t, err)
 		assert.True(t, changed)
 	})
 
-	t.Run("a new app port changes it", func(t *testing.T) {
-		changed, err := generateLauncherComposeFile([]int{7100, 8000, 9000}, testPythonImage, cfg, types.Mapping{"HOST_IP": "10.0.0.3"}, platform.Platform{})
-		require.NoError(t, err)
-		assert.True(t, changed)
-		data, err := launcherComposeFile(cfg).ReadFile()
-		require.NoError(t, err)
-		assert.Equal(t, "7100,8000,9000", launcherForwardedPorts(data))
-	})
 }
 
-func TestLauncherPorts(t *testing.T) {
+func TestLauncherAppPorts(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
 	bricksIndex, _ := setTestBricks(t, cfg)
-	writeTestApp(t, cfg.AppsDir().Join("with-web-ui"), "name: With Web UI\nbricks:\n- arduino:web_ui: {}\n")
-	writeTestApp(t, cfg.ExamplesBaseDir().Join("inspirational", "common", "custom-ui"), "name: Custom UI\nbricks:\n- arduino:custom_ui: {}\n")
-	writeTestApp(t, cfg.AppsDir().Join("own-port"), "name: Own Port\nports:\n- 9000\nbricks:\n- arduino:plain: {}\n")
-
-	// The union of the apps, never 9100 of the brick no app uses
-	assert.Equal(t, []int{7100, 8000, 9000}, launcherPorts(cfg, bricksIndex))
 
 	t.Run("brick defaults, then app.yaml", func(t *testing.T) {
 		a := app.ArduinoApp{Descriptor: app.AppDescriptor{Ports: []int{9000}, Bricks: []app.Brick{{ID: "arduino:custom_ui"}}}}
@@ -385,45 +358,14 @@ func TestLauncherPorts(t *testing.T) {
 		assert.Equal(t, []int{7200}, appPorts(a, bricksIndex))
 		assert.Empty(t, bricksIndex.AppBricks, "the shared index is left as is")
 	})
+
+	t.Run("no bricks with ports, no port", func(t *testing.T) {
+		a := app.ArduinoApp{Descriptor: app.AppDescriptor{Bricks: []app.Brick{{ID: "arduino:plain"}}}}
+		assert.Empty(t, appPorts(a, bricksIndex))
+	})
 }
 
-func TestUncoveredAppPort(t *testing.T) {
-	cfg := setTestOrchestratorConfig(t)
-	bricksIndex, _ := setTestBricks(t, cfg)
-	ui := app.ArduinoApp{Descriptor: app.AppDescriptor{Bricks: []app.Brick{{ID: "arduino:custom_ui"}}}}
-
-	_, uncovered := uncoveredAppPort(ui, bricksIndex, []int{7100, 8000})
-	assert.False(t, uncovered)
-
-	port, uncovered := uncoveredAppPort(ui, bricksIndex, []int{7100})
-	assert.True(t, uncovered)
-	assert.Equal(t, 8000, port)
-
-	ui.Descriptor.Ports = []int{7000}
-	port, uncovered = uncoveredAppPort(ui, bricksIndex, []int{7100, 8000})
-	assert.True(t, uncovered)
-	assert.Equal(t, 7000, port)
-}
-
-func TestLauncherWithoutPorts(t *testing.T) {
-	cfg := setTestOrchestratorConfig(t)
-	bricksIndex, _ := setTestBricks(t, cfg)
-	require.NoError(t, cfg.AppsDir().MkdirAll())
-	require.NoError(t, cfg.RuntimeDir().MkdirAll())
-
-	assert.Empty(t, launcherPorts(cfg, bricksIndex), "no app, no port")
-
-	_, err := generateLauncherComposeFile(nil, testPythonImage, cfg, nil, platform.Platform{})
-	require.NoError(t, err)
-	data, err := launcherComposeFile(cfg).ReadFile()
-	require.NoError(t, err)
-	assert.NotContains(t, string(data), "ports:", "no ingress")
-	svc := loadCompose(t, launcherComposeFile(cfg)).Services[launcherServiceName]
-	assert.Empty(t, svc.Ports)
-	assert.Equal(t, "", *svc.Environment["APP_LAUNCHER_PORTS"])
-}
-
-func TestLauncherUpReason(t *testing.T) {
+func TestComposeUpReason(t *testing.T) {
 	for _, tc := range []struct {
 		name                      string
 		forceUp, changed, running bool
@@ -435,7 +377,7 @@ func TestLauncherUpReason(t *testing.T) {
 		{name: "start with nothing changed", running: true, wantUp: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			reason, up := launcherUpReason(tc.forceUp, tc.changed, tc.running)
+			reason, up := composeUpReason(tc.forceUp, tc.changed, tc.running)
 			assert.Equal(t, tc.wantUp, up)
 			assert.Equal(t, tc.wantUp, reason != "")
 		})
@@ -444,20 +386,18 @@ func TestLauncherUpReason(t *testing.T) {
 
 func TestPrepareLauncherRejectsWhatItCannotRun(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
-	bricksIndex, _ := setTestBricks(t, cfg)
 	noop := func(StreamMessage) {}
 
-	// Changed after the launcher ports were collected: not on disk
-	changed := newTestApp(t, cfg, "changed")
-	changed.Descriptor.Ports = []int{8080}
-	err := prepareLauncher(t.Context(), nil, bricksIndex, changed, cfg, platform.Platform{}, noop)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "does not forward port 8080")
-
 	elsewhere := app.ArduinoApp{Name: "elsewhere", FullPath: paths.New(t.TempDir())}
-	err = prepareLauncher(t.Context(), nil, bricksIndex, elsewhere, cfg, platform.Platform{}, noop)
+	err := prepareLauncher(t.Context(), nil, elsewhere, nil, cfg, platform.Platform{}, noop)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), cfg.AppsDir().String())
+
+	// Its internal port would be above 65535
+	high := newTestApp(t, cfg, "high")
+	err = prepareLauncher(t.Context(), nil, high, []int{8000, 60000}, cfg, platform.Platform{}, noop)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot forward port 60000")
 }
 
 func TestLauncherStartError(t *testing.T) {

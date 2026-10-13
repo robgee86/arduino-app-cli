@@ -54,16 +54,21 @@ type service struct {
 	DependsOn         map[string]dependsOnCondition `yaml:"depends_on,omitempty"`
 	Volumes           []any                         `yaml:"volumes"`
 	Ports             []string                      `yaml:"ports,omitempty"`
-	User              string                        `yaml:"user"`
+	User              string                        `yaml:"user,omitempty"`
 	GroupAdd          []string                      `yaml:"group_add,omitempty"`
 	DeviceCgroupRules []string                      `yaml:"device_cgroup_rules,omitempty"`
-	Entrypoint        string                        `yaml:"entrypoint"`
+	Entrypoint        string                        `yaml:"entrypoint,omitempty"`
 	ExtraHosts        []string                      `yaml:"extra_hosts,omitempty"`
 	Labels            map[string]string             `yaml:"labels,omitempty"`
 	Environment       map[string]string             `yaml:"environment,omitempty"`
 	Logging           *logging                      `yaml:"logging,omitempty"`
 	Restart           string                        `yaml:"restart,omitempty"`
 	StopGracePeriod   string                        `yaml:"stop_grace_period,omitempty"`
+	StopSignal        string                        `yaml:"stop_signal,omitempty"`
+	ReadOnly          bool                          `yaml:"read_only,omitempty"`
+	Tmpfs             []string                      `yaml:"tmpfs,omitempty"`
+	CapDrop           []string                      `yaml:"cap_drop,omitempty"`
+	SecurityOpt       []string                      `yaml:"security_opt,omitempty"`
 	Healthcheck       *healthcheck                  `yaml:"healthcheck,omitempty"`
 }
 
