@@ -113,12 +113,6 @@ func StartApp(
 		if err := checkApp(ctx, docker, appToStart, appBricks, appModels, servicesIndex, platform, prepare, cb); err != nil {
 			return err
 		}
-		if appToStart.MainPythonFile != nil {
-			// The installed bricks only: their ports are the ones the launcher forwards
-			if err := prepareLauncher(ctx, docker, bricksIndex, appToStart, cfg, platform, cb); err != nil {
-				return err
-			}
-		}
 		return startApp(ctx, docker, provisioner, appModels, appBricks, servicesIndex, appToStart, cfg, platform, verbose, prepare, cb)
 	})
 }
@@ -169,9 +163,10 @@ func checkApp(
 	return nil
 }
 
-// startApp runs the app Python code in the launcher, which replaces the app it ran, and brings the
-// sidecars zone to the sidecars of the app. An app with only a sketch stops the zone. bricksIndex
-// and modelsIndex are the ones the app is wired with.
+// startApp runs the app Python code in the launcher, which replaces the app it ran, brings the
+// sidecars zone to the sidecars of the app and opens its public ports in the ingress. An app with
+// only a sketch stops the zone and closes the ports. bricksIndex and modelsIndex are the ones the
+// app is wired with.
 func startApp(
 	ctx context.Context,
 	docker command.Cli,
@@ -186,6 +181,14 @@ func startApp(
 	prepare bool,
 	cb func(StreamMessage),
 ) error {
+	var ports []int
+	if appToStart.MainPythonFile != nil {
+		ports = appPorts(appToStart, bricksIndex)
+		if err := prepareLauncher(ctx, docker, appToStart, ports, cfg, platform, cb); err != nil {
+			return err
+		}
+	}
+
 	cb(StreamMessage{data: fmt.Sprintf("Starting app %q", appToStart.Name)})
 
 	// An app installed from a release holds in .cache what a start generates: the
@@ -239,7 +242,7 @@ func startApp(
 	}
 
 	if appToStart.MainPythonFile == nil {
-		if err := errors.Join(stopLauncherApp(ctx, cfg, nil), stopSidecars(ctx, docker.Client(), cb)); err != nil {
+		if err := errors.Join(stopLauncherApp(ctx, cfg, nil), closeAppPorts(ctx, docker, cfg), stopSidecars(ctx, docker.Client(), cb)); err != nil {
 			return err
 		}
 		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
@@ -293,7 +296,7 @@ func startApp(
 	if err := pullAppImages(ctx, docker, prj, cb); err != nil {
 		return err
 	}
-	return startWithLauncher(ctx, docker, appToStart, cfg, launcherEnv, zone, cb)
+	return startWithLauncher(ctx, docker, appToStart, ports, cfg, launcherEnv, zone, cb)
 }
 
 // splitMainService takes the main service out of the project, leaving the sidecars, and returns
@@ -322,12 +325,14 @@ func pullAppImages(ctx context.Context, docker command.Cli, prj *types.Project, 
 }
 
 // startWithLauncher brings the sidecars zone to running, when Docker resolves their names, then has
-// the launcher start the app; the bricks retry until the sidecars accept connections. The previous
-// launcher app stops meanwhile.
+// the launcher start the app on the internal ports of its public ports, which the ingress then
+// forwards; the bricks retry until the sidecars accept connections. The previous launcher app stops
+// meanwhile.
 func startWithLauncher(
 	ctx context.Context,
 	docker command.Cli,
 	appToStart app.ArduinoApp,
+	ports []int,
 	cfg config.Configuration,
 	envs map[string]string,
 	zone sidecarsZone,
@@ -365,12 +370,17 @@ func startWithLauncher(
 	var started launcher.StartResponse
 	if err == nil {
 		cb(StreamMessage{data: "Starting the app in the launcher, preparing its dependencies when they changed"})
-		started, err = newLauncherClient(cfg).WithTimeout(launcherStartTimeout).Start(ctx, appToStart.FullPath.String(), envs)
+		started, err = newLauncherClient(cfg).WithTimeout(launcherStartTimeout).Start(ctx, appToStart.FullPath.String(), envs, ports)
 		err = launcherStartError(err)
+	}
+	if err == nil {
+		if err = applyIngress(ctx, docker, cfg, ports, false); err != nil {
+			err = fmt.Errorf("failed to open the app ports: %w", err)
+		}
 	}
 	if err != nil {
 		waitOrphans()
-		// Half an app is of no use: stop what started
+		// Half an app is of no use: stop what started, which closes the ports
 		if stopErr := stopAppProcesses(ctx, docker, appToStart, cfg, nil); stopErr != nil {
 			slog.Warn("failed to stop the app after a failed start", slog.String("error", stopErr.Error()))
 		}
@@ -455,8 +465,8 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 	return nil
 }
 
-// stopAppProcesses stops the app launcher child, then the sidecars zone unless it runs the
-// sidecars of another app. The zone stays: the next start of the same app is a plain start.
+// stopAppProcesses stops the app launcher child, then closes the app ports and stops the sidecars
+// zone unless they belong to another app. The zone stays: the next start of the same app is a plain start.
 func stopAppProcesses(ctx context.Context, docker command.Cli, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
 	if cb == nil {
 		cb = func(StreamMessage) {}
@@ -470,10 +480,10 @@ func stopAppProcesses(ctx context.Context, docker command.Cli, app app.ArduinoAp
 		return err
 	}
 	if wanted != nil && !wanted.EqualsTo(app.FullPath) {
-		slog.Debug("the sidecars zone runs another app, left running", slog.String("app", wanted.String()))
+		slog.Debug("the sidecars zone and the ports belong to another app, left open", slog.String("app", wanted.String()))
 		return nil
 	}
-	return stopSidecars(ctx, docker.Client(), cb)
+	return errors.Join(closeAppPorts(ctx, docker, cfg), stopSidecars(ctx, docker.Client(), cb))
 }
 
 // stopLauncherApp stops the app if the launcher runs it, every app when appPath is nil. An
@@ -569,11 +579,6 @@ func RestartApp(
 		appModels := appToStart.Models(modelsIndex, docker, cfg, platform)
 		if err := checkApp(ctx, docker, appToStart, appBricks, appModels, servicesIndex, platform, prepare, cb); err != nil {
 			return err
-		}
-		if appToStart.MainPythonFile != nil {
-			if err := prepareLauncher(ctx, docker, bricksIndex, appToStart, cfg, platform, cb); err != nil {
-				return err
-			}
 		}
 		// The launcher restarts the app in place, leaving its sidecars running
 		return startApp(ctx, docker, provisioner, appModels, appBricks, servicesIndex, appToStart, cfg, platform, verbose, prepare, cb)

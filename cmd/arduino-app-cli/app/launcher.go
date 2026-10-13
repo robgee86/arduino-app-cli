@@ -25,7 +25,7 @@ func newLauncherCmd(cfg config.Configuration) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:    "launcher",
 		Hidden: true, // support and debugging only: it names an implementation detail
-		Short:  "Inspect and manage the app launcher container",
+		Short:  "Inspect and manage the app launcher and ingress containers",
 	}
 	cmd.AddCommand(&cobra.Command{
 		Use:   "status",
@@ -42,14 +42,14 @@ func newLauncherCmd(cfg config.Configuration) *cobra.Command {
 	})
 	cmd.AddCommand(&cobra.Command{
 		Use:   "up",
-		Short: "Create or update the app launcher and wait until it answers",
-		Long: "Create or update the app launcher and wait until it answers.\n\n" +
-			"For development and support: it creates or refreshes the launcher ahead of the first app start. It always runs compose up, " +
-			"which recreates the launcher when its image changed, e.g. after a new image was pulled under the same tag.",
+		Short: "Create or update the app launcher and ingress and wait until the launcher answers",
+		Long: "Create or update the app launcher and ingress and wait until the launcher answers.\n\n" +
+			"For development and support: it creates or refreshes the launcher and the ingress ahead of the first app start. It always runs compose up, " +
+			"which recreates them when their image changed, e.g. after a new image was pulled under the same tag.",
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
-			elapsed, err := orchestrator.EnsureLauncher(cmd.Context(), servicelocator.GetDockerClient(), servicelocator.GetBricksIndex(), cfg, servicelocator.GetPlatform(), false)
+			elapsed, err := orchestrator.EnsureLauncher(cmd.Context(), servicelocator.GetDockerClient(), cfg, servicelocator.GetPlatform(), false)
 			if err != nil {
 				feedback.Fatal(err.Error(), feedback.ErrGeneric)
 				return
@@ -59,9 +59,9 @@ func newLauncherCmd(cfg config.Configuration) *cobra.Command {
 	})
 	cmd.AddCommand(&cobra.Command{
 		Use:   "down",
-		Short: "Remove the app launcher, stopping every app",
-		Long: "Remove the app launcher, stopping every app.\n\n" +
-			"For development and support: it removes the launcher and the shared network, which also stops every app and frees the forwarded ports.",
+		Short: "Remove the app launcher and ingress, stopping every app",
+		Long: "Remove the app launcher and ingress, stopping every app.\n\n" +
+			"For development and support: it removes the launcher, the shared network and the ingress, which also stops every app and frees the app ports.",
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
@@ -115,7 +115,7 @@ type launcherUpResult struct {
 }
 
 func (r launcherUpResult) String() string {
-	return fmt.Sprintf("✓ App launcher ready in %s", r.Elapsed.Round(time.Millisecond))
+	return fmt.Sprintf("✓ App launcher and ingress ready in %s", r.Elapsed.Round(time.Millisecond))
 }
 
 func (r launcherUpResult) Data() any {
@@ -127,7 +127,7 @@ type launcherDownResult struct {
 }
 
 func (r launcherDownResult) String() string {
-	return "✓ App launcher removed"
+	return "✓ App launcher and ingress removed"
 }
 
 func (r launcherDownResult) Data() any {
