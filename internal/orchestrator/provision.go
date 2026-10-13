@@ -41,6 +41,13 @@ type logging struct {
 	Options map[string]string `yaml:"options,omitempty"`
 }
 
+type healthcheck struct {
+	Test          []string `yaml:"test"`
+	Interval      string   `yaml:"interval,omitempty"`
+	StartPeriod   string   `yaml:"start_period,omitempty"`
+	StartInterval string   `yaml:"start_interval,omitempty"`
+}
+
 // A field holding an expression is a string here: what it renders to is a list.
 type service struct {
 	Image             string                        `yaml:"image"`
@@ -56,7 +63,25 @@ type service struct {
 	Labels            map[string]string             `yaml:"labels,omitempty"`
 	Environment       map[string]string             `yaml:"environment,omitempty"`
 	Logging           *logging                      `yaml:"logging,omitempty"`
+	Restart           string                        `yaml:"restart,omitempty"`
+	StopGracePeriod   string                        `yaml:"stop_grace_period,omitempty"`
+	Healthcheck       *healthcheck                  `yaml:"healthcheck,omitempty"`
 }
+
+type composeNetwork struct {
+	Name     string `yaml:"name"`
+	External bool   `yaml:"external,omitempty"`
+}
+
+// runMode tells what runs the app Python code.
+type runMode int
+
+const (
+	// launcherMode forks the app in the shared launcher container: the app project holds only the sidecars.
+	launcherMode runMode = iota
+	// classicMode runs the app in a main container of its own compose project.
+	classicMode
+)
 
 type Provision struct {
 	docker      command.Cli

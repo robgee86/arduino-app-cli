@@ -13,13 +13,11 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/docker/cli/cli/command"
 	"github.com/jub0bs/cors"
 	"github.com/spf13/cobra"
 
 	"github.com/arduino/arduino-app-cli/cmd/arduino-app-cli/internal/servicelocator"
 	"github.com/arduino/arduino-app-cli/internal/api"
-	"github.com/arduino/arduino-app-cli/internal/dockerhelper"
 	"github.com/arduino/arduino-app-cli/internal/httprecover"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
@@ -36,7 +34,8 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 		Run: func(cmd *cobra.Command, args []string) {
 			daemonPort, _ := cmd.Flags().GetString("port")
 
-			err := stopArduinoContainers(cmd.Context(), servicelocator.GetDockerClient())
+			// The launcher survives the cleanup: it carries no app label and stops its apps below
+			err := orchestrator.StopAllAppContainers(cmd.Context(), servicelocator.GetDockerClient().Client())
 			if err != nil {
 				slog.Warn("Failed to stop containers", slog.String("error", err.Error()))
 			}
@@ -51,8 +50,22 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 
 			// start the default app in the background
 			go func() {
+				elapsed, err := orchestrator.EnsureLauncher(
+					cmd.Context(),
+					servicelocator.GetDockerClient(),
+					servicelocator.GetBricksIndex(),
+					cfg,
+					servicelocator.GetPlatform(),
+					true,
+				)
+				if err != nil {
+					slog.Warn("App launcher unavailable, apps run in their own containers", slog.String("error", err.Error()))
+				} else {
+					slog.Info("App launcher ready", slog.Duration("elapsed", elapsed))
+				}
+
 				slog.Info("Starting default app")
-				err := orchestrator.StartDefaultApp(
+				err = orchestrator.StartDefaultApp(
 					cmd.Context(),
 					servicelocator.GetDockerClient(),
 					servicelocator.GetProvisioner(),
@@ -158,11 +171,4 @@ func httpHandler(ctx context.Context, cfg config.Configuration, daemonPort, vers
 	_ = httpSrv.Shutdown(shutdownCtx)
 	cancel()
 	slog.Info("HTTP server shut down", slog.String("address", address))
-}
-
-// stopArduinoContainers stops the Arduino containers that start running automatically when the board boots
-func stopArduinoContainers(ctx context.Context, docker command.Cli) error {
-	stopped, err := dockerhelper.StopContainers(ctx, docker.Client(), orchestrator.DockerAppLabel+"=true")
-	slog.Debug("stopped the containers of the apps", slog.Int("containers", stopped))
-	return err
 }

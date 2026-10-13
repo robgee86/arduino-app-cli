@@ -700,7 +700,8 @@ func TestListActiveApps(t *testing.T) {
 
 	containerFor := func(appPath *paths.Path, state container.ContainerState, status string) container.Summary {
 		return container.Summary{
-			Labels: map[string]string{DockerAppPathLabel: appPath.String()},
+			// Main containers: the apps ran in classic mode
+			Labels: map[string]string{DockerAppPathLabel: appPath.String(), DockerAppMainLabel: "true"},
 			State:  state,
 			Status: status,
 		}
@@ -712,7 +713,7 @@ func TestListActiveApps(t *testing.T) {
 			containerFor(app1ID.ToPath(), container.StateRunning, "Up 5 minutes"),
 		})
 
-		apps, err := ListActiveApps(t.Context(), cli, idProvider)
+		apps, err := ListActiveApps(t.Context(), cli, idProvider, cfg)
 		require.NoError(t, err)
 		assert.Empty(t, gCmp.Diff([]AppInfo{
 			{
@@ -741,7 +742,7 @@ func TestListActiveApps(t *testing.T) {
 			containerFor(exampleID.ToPath(), container.StateRunning, "Up 5 minutes"),
 		})
 
-		apps, err := ListActiveApps(t.Context(), cli, idProvider)
+		apps, err := ListActiveApps(t.Context(), cli, idProvider, cfg)
 		require.NoError(t, err)
 		require.Len(t, apps, 1)
 		assert.Empty(t, gCmp.Diff(AppInfo{
@@ -766,7 +767,7 @@ func TestListActiveApps(t *testing.T) {
 			containerFor(unknownAppPath, container.StateRunning, "Up 5 minutes"),
 		})
 
-		apps, err := ListActiveApps(t.Context(), cli, idProvider)
+		apps, err := ListActiveApps(t.Context(), cli, idProvider, cfg)
 		require.NoError(t, err)
 		require.Len(t, apps, 1)
 		assert.Empty(t, gCmp.Diff(AppInfo{
@@ -790,7 +791,7 @@ func TestListActiveApps(t *testing.T) {
 			containerFor(brokenAppPath, container.StateRunning, "Up 5 minutes"),
 		})
 
-		apps, err := ListActiveApps(t.Context(), cli, idProvider)
+		apps, err := ListActiveApps(t.Context(), cli, idProvider, cfg)
 		require.NoError(t, err)
 		require.Len(t, apps, 1)
 		assert.Empty(t, gCmp.Diff(AppInfo{
@@ -811,7 +812,7 @@ func TestListActiveApps(t *testing.T) {
 			containerFor(goneAppPath, container.StateRunning, "Up 5 minutes"),
 		})
 
-		apps, err := ListActiveApps(t.Context(), cli, idProvider)
+		apps, err := ListActiveApps(t.Context(), cli, idProvider, cfg)
 		require.NoError(t, err)
 		require.Len(t, apps, 1)
 		// The app directory does not exist: the ID is computed from the Docker label
@@ -831,7 +832,7 @@ func TestListActiveApps(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, cli.Initialize(&flags.ClientOptions{}))
 
-		_, err = ListActiveApps(t.Context(), cli, idProvider)
+		_, err = ListActiveApps(t.Context(), cli, idProvider, cfg)
 		require.ErrorContains(t, err, "failed to list apps status")
 	})
 }
