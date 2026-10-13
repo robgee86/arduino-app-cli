@@ -23,8 +23,9 @@ import (
 
 func newLauncherCmd(cfg config.Configuration) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "launcher",
-		Short: "Inspect and manage the app launcher container",
+		Use:    "launcher",
+		Hidden: true, // support and debugging only: it names an implementation detail
+		Short:  "Inspect and manage the app launcher container",
 	}
 	cmd.AddCommand(&cobra.Command{
 		Use:   "status",
