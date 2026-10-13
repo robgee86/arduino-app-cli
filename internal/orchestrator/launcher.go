@@ -424,33 +424,6 @@ func EnsureLauncher(
 	return time.Since(started), err
 }
 
-// LauncherDown removes the launcher container, the sidecars zone, the network and the ingress, stopping every app first.
-func LauncherDown(ctx context.Context, docker command.Cli, cfg config.Configuration, cb func(StreamMessage)) error {
-	return withAppsLock(ctx, cfg, func() error {
-		// The network cannot go while the sidecars are attached to it
-		if err := StopAllAppContainers(ctx, docker.Client()); err != nil {
-			return err
-		}
-		if err := removeSidecars(ctx, docker.Client(), cfg); err != nil {
-			return err
-		}
-		if err := clearLauncherWantedApp(cfg, nil); err != nil {
-			return err
-		}
-		line := func(line string) { cb(StreamMessage{data: line}) }
-		// The ingress is attached to the network too
-		if err := dockerhelper.ComposeDown(ctx, docker, ingressProject, line); err != nil {
-			return err
-		}
-		return dockerhelper.ComposeDown(ctx, docker, launcherProject, line)
-	})
-}
-
-// LauncherStatus is what the launcher runs, as it reports it.
-func LauncherStatus(ctx context.Context, cfg config.Configuration) (launcher.StatusResponse, error) {
-	return newLauncherClient(cfg).Status(ctx)
-}
-
 // composeUpFile creates, recreates or starts the containers of one of our compose files, as
 // compose up does, and returns once they are started.
 func composeUpFile(ctx context.Context, docker command.Cli, file *paths.Path, cb func(StreamMessage)) error {

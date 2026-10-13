@@ -38,7 +38,6 @@ func NewAppCmd(cfg config.Configuration) *cobra.Command {
 	appCmd.AddCommand(newBuildCmd(cfg))
 	appCmd.AddCommand(newInstallCmd(cfg))
 	appCmd.AddCommand(newBrickCmd(cfg))
-	appCmd.AddCommand(newLauncherCmd(cfg))
 
 	return appCmd
 }
