@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -42,17 +43,18 @@ func sidecarsComposeFile(cfg config.Configuration) *paths.Path {
 	return sidecarsDir(cfg).Join("compose.yaml")
 }
 
-// sidecarsFingerprintFile holds the fingerprint of the zone the containers were last brought to.
-func sidecarsFingerprintFile(cfg config.Configuration) *paths.Path {
-	return sidecarsDir(cfg).Join("fingerprint")
+// sidecarsRecordFile holds the fingerprint of each zone service as its container runs: the services
+// it lists are the sidecars of the wanted app. It describes the containers, not the zone files.
+func sidecarsRecordFile(cfg config.Configuration) *paths.Path {
+	return sidecarsDir(cfg).Join("fingerprints.json")
 }
 
 // sidecarsZone is a generated zone: the project of its services, none without sidecars, and the
-// fingerprint of the project.
+// fingerprint of each service as compose resolves it.
 type sidecarsZone struct {
-	project     *types.Project
-	services    []string
-	fingerprint string
+	project      *types.Project
+	services     []string
+	fingerprints map[string]string
 }
 
 // generateSidecarsZone turns the rendered app project, its main service split off, into the zone:
@@ -62,7 +64,7 @@ func generateSidecarsZone(prj *types.Project, cfg config.Configuration) (sidecar
 	slog.Debug("Generating the sidecars zone", slog.String("app", prj.Name))
 	if len(prj.Services) == 0 {
 		slog.Debug("No sidecars to run, removing the sidecars zone files")
-		return sidecarsZone{}, removeSidecarsZoneFiles(cfg)
+		return sidecarsZone{fingerprints: map[string]string{}}, removeSidecarsZoneFiles(cfg)
 	}
 	if err := sidecarsDir(cfg).MkdirAll(); err != nil {
 		return sidecarsZone{}, fmt.Errorf("failed to create the sidecars folder: %w", err)
@@ -98,32 +100,63 @@ func generateSidecarsZone(prj *types.Project, cfg config.Configuration) (sidecar
 	zone.ComposeFiles = []string{sidecarsComposeFile(cfg).String()}
 	zone.WorkingDir = sidecarsDir(cfg).String()
 
-	sum := sha256.Sum256(data)
-	return sidecarsZone{project: zone, services: zone.ServiceNames(), fingerprint: hex.EncodeToString(sum[:])}, nil
+	fingerprints, err := sidecarsFingerprints(zone)
+	if err != nil {
+		return sidecarsZone{}, err
+	}
+	return sidecarsZone{project: zone, services: zone.ServiceNames(), fingerprints: fingerprints}, nil
 }
 
-func readSidecarsFingerprint(cfg config.Configuration) string {
-	data, _ := sidecarsFingerprintFile(cfg).ReadFile()
-	return string(data)
+// sidecarsFingerprints hashes each zone service as compose resolves it, the way compose tells
+// whether a container is up to date: a sidecar mounting ${APP_HOME} tells two apps apart.
+func sidecarsFingerprints(zone *types.Project) (map[string]string, error) {
+	result := make(map[string]string, len(zone.Services))
+	for name, svc := range zone.Services {
+		data, err := json.Marshal(svc)
+		if err != nil {
+			return nil, err
+		}
+		sum := sha256.Sum256(data)
+		result[name] = hex.EncodeToString(sum[:])
+	}
+	return result, nil
 }
 
-// writeSidecarsFingerprint records the zone the containers run, or forgets it when empty.
-func writeSidecarsFingerprint(cfg config.Configuration, fingerprint string) error {
-	file := sidecarsFingerprintFile(cfg)
-	if fingerprint == "" {
+// readSidecarsRecord returns the recorded service fingerprints, nil without record.
+func readSidecarsRecord(cfg config.Configuration) map[string]string {
+	data, err := sidecarsRecordFile(cfg).ReadFile()
+	if err != nil {
+		return nil
+	}
+	var record map[string]string
+	if err := json.Unmarshal(data, &record); err != nil {
+		return nil
+	}
+	return record
+}
+
+// writeSidecarsRecord records the services the zone containers run, or forgets them when nil.
+func writeSidecarsRecord(cfg config.Configuration, fingerprints map[string]string) error {
+	file := sidecarsRecordFile(cfg)
+	if fingerprints == nil {
 		if err := file.Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("failed to remove the sidecars fingerprint: %w", err)
+			return fmt.Errorf("failed to remove the sidecars record: %w", err)
 		}
 		return nil
 	}
-	return fatomic.WriteFile(file.String(), []byte(fingerprint), 0o644)
+	if err := file.Parent().MkdirAll(); err != nil {
+		return fmt.Errorf("failed to create the sidecars folder: %w", err)
+	}
+	data, err := json.Marshal(fingerprints)
+	if err != nil {
+		return err
+	}
+	return fatomic.WriteFile(file.String(), data, 0o644)
 }
 
 func removeSidecarsZoneFiles(cfg config.Configuration) error {
-	for _, file := range []*paths.Path{sidecarsComposeFile(cfg), sidecarsFingerprintFile(cfg)} {
-		if err := file.Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("failed to remove %s: %w", file, err)
-		}
+	if err := sidecarsComposeFile(cfg).Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("failed to remove %s: %w", sidecarsComposeFile(cfg), err)
 	}
 	return nil
 }
@@ -141,50 +174,107 @@ func splitAppContainers(containers []container.Summary) (zone appContainers, leg
 	return zone, legacy
 }
 
-// reconcileSidecars brings the zone containers to the zone and returns once they run. An unchanged
-// zone whose containers exist is left running, or started through the SDK, faster than compose.
-func reconcileSidecars(ctx context.Context, docker command.Cli, cfg config.Configuration, zone sidecarsZone, cb func(StreamMessage)) error {
+// sidecarsPlan is what a start does to the zone containers.
+type sidecarsPlan int
+
+const (
+	// sidecarsKeep: every service runs as recorded, only the orphans go
+	sidecarsKeep sidecarsPlan = iota
+	// sidecarsStart: every service has its container as recorded, some are stopped
+	sidecarsStart
+	// sidecarsUp: a service has to be created or recreated
+	sidecarsUp
+)
+
+// planSidecars compares the zone with the recorded fingerprints and the containers.
+func planSidecars(zone sidecarsZone, recorded map[string]string, containers appContainers) sidecarsPlan {
+	if len(zone.services) > 0 && zone.fingerprints == nil {
+		return sidecarsUp
+	}
+	plan := sidecarsKeep
+	for _, service := range zone.services {
+		c, ok := containers[service]
+		if !ok || recorded[service] == "" || recorded[service] != zone.fingerprints[service] {
+			return sidecarsUp
+		}
+		if c.State != container.StateRunning {
+			plan = sidecarsStart
+		}
+	}
+	return plan
+}
+
+// only are the containers of the services.
+func (c appContainers) only(services []string) appContainers {
+	result := make(appContainers, len(services))
+	for _, service := range services {
+		if ctr, ok := c[service]; ok {
+			result[service] = ctr
+		}
+	}
+	return result
+}
+
+// orphans are the containers of the services the zone no longer has.
+func (c appContainers) orphans(services []string) []container.Summary {
+	var result []container.Summary
+	for service, ctr := range c {
+		if !slices.Contains(services, service) {
+			result = append(result, ctr)
+		}
+	}
+	return result
+}
+
+// reconcileSidecars brings the zone containers to the zone and returns once they run. When nothing
+// is created or recreated, it returns the removal of the orphans instead of running it: they hold
+// no port a zone service needs, so they can go while the app starts. A failed removal is retried
+// at the next start, since the orphans stay out of the record.
+func reconcileSidecars(ctx context.Context, docker command.Cli, cfg config.Configuration, zone sidecarsZone, cb func(StreamMessage)) (removeOrphans func() error, err error) {
 	all, err := listAppContainers(ctx, docker.Client())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	containers, legacy := splitAppContainers(all)
 	if len(legacy) > 0 {
 		slog.Info("removing the sidecars of the per-app projects", slog.Int("containers", len(legacy)))
 		if err := removeContainers(ctx, docker.Client(), legacy); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
-	if len(zone.services) == 0 {
-		return errors.Join(writeSidecarsFingerprint(cfg, ""), removeContainers(ctx, docker.Client(), slices.Collect(maps.Values(containers))))
+	plan := planSidecars(zone, readSidecarsRecord(cfg), containers)
+	slog.Debug("sidecars zone plan", slog.Int("plan", int(plan)), slog.Any("services", zone.services))
+	switch plan {
+	case sidecarsUp:
+		return nil, upSidecars(ctx, docker, cfg, zone, cb)
+	case sidecarsStart:
+		if err := startAppContainers(ctx, docker.Client(), containers.only(zone.services).notRunning(), cb); err != nil {
+			// e.g. the shared network was recreated with the launcher
+			slog.Warn("failed to start the existing sidecars, recreating them", slog.String("error", err.Error()))
+			if err := removeContainers(ctx, docker.Client(), slices.Collect(maps.Values(containers.only(zone.services)))); err != nil {
+				return nil, err
+			}
+			return nil, upSidecars(ctx, docker, cfg, zone, cb)
+		}
+	case sidecarsKeep:
 	}
-	if zone.fingerprint == "" || zone.fingerprint != readSidecarsFingerprint(cfg) || !containers.cover(zone.services) {
-		return upSidecars(ctx, docker, cfg, zone, cb)
+
+	if err := writeSidecarsRecord(cfg, zone.fingerprints); err != nil {
+		return nil, err
 	}
-	stopped := containers.notRunning()
-	if len(stopped) == 0 {
-		slog.Debug("sidecars zone unchanged and running")
-		return nil
+	orphans := containers.orphans(zone.services)
+	if len(orphans) == 0 {
+		return nil, nil
 	}
-	slog.Debug("starting the existing sidecar containers")
-	err = startAppContainers(ctx, docker.Client(), stopped, cb)
-	if err == nil {
-		return nil
-	}
-	// e.g. the shared network was recreated with the launcher
-	slog.Warn("failed to start the existing sidecars, recreating them", slog.String("error", err.Error()))
-	if err := removeContainers(ctx, docker.Client(), slices.Collect(maps.Values(containers))); err != nil {
-		return err
-	}
-	return upSidecars(ctx, docker, cfg, zone, cb)
+	return func() error { return removeContainers(ctx, docker.Client(), orphans) }, nil
 }
 
 // upSidecars runs compose up on the zone, which removes the orphans before it creates or recreates
 // a service, so that a new service can take the ports of a removed one. It returns once they run.
 func upSidecars(ctx context.Context, docker command.Cli, cfg config.Configuration, zone sidecarsZone, cb func(StreamMessage)) error {
 	// A failed up leaves the containers half way: the next start runs it again
-	if err := writeSidecarsFingerprint(cfg, ""); err != nil {
+	if err := writeSidecarsRecord(cfg, nil); err != nil {
 		return err
 	}
 	slog.Debug("starting the sidecars", slog.Any("services", zone.services))
@@ -199,7 +289,7 @@ func upSidecars(ctx context.Context, docker command.Cli, cfg config.Configuratio
 	if err := waitContainersRunning(ctx, docker.Client(), created); err != nil {
 		return err
 	}
-	return writeSidecarsFingerprint(cfg, zone.fingerprint)
+	return writeSidecarsRecord(cfg, zone.fingerprints)
 }
 
 // stopSidecars stops the zone containers, which stay for the next start.
@@ -217,5 +307,5 @@ func removeSidecars(ctx context.Context, docker dockerClient.APIClient, cfg conf
 	if err != nil {
 		return err
 	}
-	return errors.Join(writeSidecarsFingerprint(cfg, ""), removeContainers(ctx, docker, slices.Collect(maps.Values(containers))))
+	return errors.Join(writeSidecarsRecord(cfg, nil), removeContainers(ctx, docker, slices.Collect(maps.Values(containers))))
 }

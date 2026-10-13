@@ -293,11 +293,7 @@ func startApp(
 	if err := pullAppImages(ctx, docker, prj, cb); err != nil {
 		return err
 	}
-	if err := startWithLauncher(ctx, docker, appToStart, cfg, launcherEnv, zone, cb); err != nil {
-		return err
-	}
-	cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
-	return nil
+	return startWithLauncher(ctx, docker, appToStart, cfg, launcherEnv, zone, cb)
 }
 
 // splitMainService takes the main service out of the project, leaving the sidecars, and returns
@@ -347,10 +343,25 @@ func startWithLauncher(
 		previousStopErr = stopLauncherApp(ctx, cfg, nil)
 		stopped = time.Since(stopping)
 	})
-	sidecarsErr := reconcileSidecars(ctx, docker, cfg, zone, cb)
+	removeOrphans, sidecarsErr := reconcileSidecars(ctx, docker, cfg, zone, cb)
 	wg.Wait()
 
 	err := errors.Join(previousStopErr, sidecarsErr)
+	// Nothing was created: the orphans go while the app starts, the previous app is already stopped
+	var (
+		orphans    sync.WaitGroup
+		orphansErr error
+	)
+	if err == nil && removeOrphans != nil {
+		orphans.Go(func() { orphansErr = removeOrphans() })
+	}
+	waitOrphans := func() {
+		orphans.Wait()
+		if orphansErr != nil {
+			slog.Warn("failed to remove the sidecars the app does not use, retried at the next start", slog.String("error", orphansErr.Error()))
+		}
+	}
+
 	var started launcher.StartResponse
 	if err == nil {
 		cb(StreamMessage{data: "Starting the app in the launcher, preparing its dependencies when they changed"})
@@ -358,6 +369,7 @@ func startWithLauncher(
 		err = launcherStartError(err)
 	}
 	if err != nil {
+		waitOrphans()
 		// Half an app is of no use: stop what started
 		if stopErr := stopAppProcesses(ctx, docker, appToStart, cfg, nil); stopErr != nil {
 			slog.Warn("failed to stop the app after a failed start", slog.String("error", stopErr.Error()))
@@ -376,6 +388,9 @@ func startWithLauncher(
 	}
 	cb(StreamMessage{data: fmt.Sprintf("App started by the launcher: %s runner, warm %t, previous app stopped in %d ms, forked in %.0f ms",
 		started.Runner, started.Warm, stopped.Milliseconds(), started.Timings.ForkMs)})
+	// The app runs: the start is over for the caller, the lock is held until the orphans are gone
+	cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
+	waitOrphans()
 	return nil
 }
 

@@ -32,16 +32,19 @@ type AppStatusInfo struct {
 	Status  Status
 }
 
-// sidecarsStatus is the overall status of the sidecars zone containers, empty without containers
-// or when it cannot tell:
+// sidecarsStatus is the overall status of the zone containers of the services, all of them when
+// services is nil, empty without containers or when it cannot tell:
 //
 //	running: all running
 //	stopped: all stopped
 //	failed: at least one failed
 //	stopping: at least one stopping
 //	starting: at least one starting
-func sidecarsStatus(containers []container.Summary) Status {
+func sidecarsStatus(containers []container.Summary, services []string) Status {
 	zone, _ := splitAppContainers(containers)
+	if services != nil {
+		zone = zone.only(services)
+	}
 	s := make([]Status, 0, len(zone))
 	for _, c := range zone {
 		s = append(s, StatusFromDockerState(c.State, c.Status))
@@ -64,15 +67,20 @@ func sidecarsStatus(containers []container.Summary) Status {
 	}
 }
 
-// launcherView is what the launcher runs, and the app it should be running.
+// launcherView is what the launcher runs, the app it should be running, and the zone services
+// that are its sidecars: nil without record, then every zone container counts.
 type launcherView struct {
 	children []launcher.Child
 	wanted   *paths.Path
+	sidecars []string
 }
 
 // readLauncherView asks the launcher for its children. An unreachable launcher runs nothing.
 func readLauncherView(ctx context.Context, cfg config.Configuration) launcherView {
 	view := launcherView{wanted: readLauncherWantedApp(cfg)}
+	if record := readSidecarsRecord(cfg); record != nil {
+		view.sidecars = slices.Collect(maps.Keys(record))
+	}
 	status, err := newLauncherClient(cfg).Status(ctx)
 	if err != nil {
 		slog.Debug("app launcher status unavailable", slog.String("error", err.Error()))
@@ -86,7 +94,8 @@ func readLauncherView(ctx context.Context, cfg config.Configuration) launcherVie
 // of the wanted app. An app neither run nor wanted is idle: its sidecar exit codes come from the
 // stop, and a runner may exit 0 on SIGTERM.
 func mergeAppStatus(containers []container.Summary, view launcherView) []AppStatusInfo {
-	zone := sidecarsStatus(containers)
+	// The orphans being removed alongside a start are no sidecars of the app
+	zone := sidecarsStatus(containers, view.sidecars)
 	children := make(map[string]launcher.Child, len(view.children))
 	for _, c := range view.children {
 		children[filepath.Clean(c.App)] = c
