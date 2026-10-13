@@ -70,7 +70,7 @@ func TestClientRequests(t *testing.T) {
 	fake := newFakeLauncher(t, func(cmd string) string {
 		switch cmd {
 		case cmdStart:
-			return `{"ok":true,"pid":42,"started_at":"2026-10-13T10:00:00.5+00:00","warm":true,"runner":"python","timings":{"stop_ms":12.5,"fork_ms":3}}`
+			return `{"ok":true,"pid":42,"started_at":"2026-10-13T10:00:00.5+00:00","warm":true,"runner":"python","prepared":true,"timings":{"stop_ms":12.5,"prepare_ms":2500,"fork_ms":3}}`
 		case cmdStop:
 			return `{"ok":true,"stopped":[{"app":"/apps/a","pid":42,"exit_code":null,"signal":15}]}`
 		case cmdStatus:
@@ -94,7 +94,8 @@ func TestClientRequests(t *testing.T) {
 		assert.Equal(t, 42, resp.PID)
 		assert.True(t, resp.Warm)
 		assert.Equal(t, "python", resp.Runner)
-		assert.Equal(t, Timings{StopMs: 12.5, ForkMs: 3}, resp.Timings)
+		assert.True(t, resp.Prepared)
+		assert.Equal(t, Timings{StopMs: 12.5, PrepareMs: 2500, ForkMs: 3}, resp.Timings)
 		assert.Equal(t, time.Date(2026, 10, 13, 10, 0, 0, 5e8, time.UTC), resp.StartedAt.UTC())
 	})
 
@@ -137,6 +138,17 @@ func TestClientErrors(t *testing.T) {
 		assert.Equal(t, CodeUnsupported, launcherErr.Code)
 		assert.Equal(t, "use mode replace", launcherErr.Message)
 		assert.True(t, IsCode(err, CodeUnsupported))
+	})
+
+	t.Run("a failed dependency install", func(t *testing.T) {
+		fake := newFakeLauncher(t, func(string) string {
+			return `{"ok":false,"error":{"code":"prepare_failed","message":"pip failed\nERROR: no nump"}}`
+		})
+		_, err := New(fake.socket, time.Second).Start(context.Background(), testApp, nil)
+		var launcherErr *Error
+		require.ErrorAs(t, err, &launcherErr)
+		assert.Equal(t, CodePrepareFailed, launcherErr.Code)
+		assert.Equal(t, "pip failed\nERROR: no nump", launcherErr.Message)
 	})
 
 	t.Run("no socket", func(t *testing.T) {
