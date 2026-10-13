@@ -412,7 +412,7 @@ func startWithLauncher(
 		slog.Warn("failed to record the launcher app", slog.String("error", err.Error()))
 	}
 	slog.Info("app started by the launcher", slog.String("app", appToStart.FullPath.String()), slog.Int("pid", started.PID),
-		slog.Bool("warm", started.Warm), slog.Duration("previous_stop", stopped), slog.Bool("prepared", started.Prepared),
+		slog.Bool("warm", started.Warm), slog.Any("ports", started.Ports), slog.Duration("previous_stop", stopped), slog.Bool("prepared", started.Prepared),
 		slog.Float64("prepare_ms", started.Timings.PrepareMs), slog.Float64("fork_ms", started.Timings.ForkMs))
 	if started.Prepared {
 		cb(StreamMessage{data: fmt.Sprintf("Preparing dependencies took %d ms", int64(started.Timings.PrepareMs))})

@@ -53,7 +53,7 @@ type service struct {
 	Init              *bool                         `yaml:"init,omitempty"`
 	DependsOn         map[string]dependsOnCondition `yaml:"depends_on,omitempty"`
 	Volumes           []any                         `yaml:"volumes"`
-	Ports             []string                      `yaml:"ports"`
+	Ports             []string                      `yaml:"ports,omitempty"`
 	User              string                        `yaml:"user"`
 	GroupAdd          []string                      `yaml:"group_add,omitempty"`
 	DeviceCgroupRules []string                      `yaml:"device_cgroup_rules,omitempty"`
