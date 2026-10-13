@@ -106,10 +106,17 @@ func stopAppContainers(ctx context.Context, docker dockerClient.APIClient, conta
 	})
 }
 
-// removeContainers force-removes containers, running or not.
+// removeContainers stops and removes containers, running or not. The stop gives a sidecar the
+// grace a compose down gives it, a database flushes its writes.
 func removeContainers(ctx context.Context, docker dockerClient.APIClient, containers []container.Summary) error {
+	timeout := DefaultDockerStopTimeoutSeconds
 	return forEachContainer(containers, func(c container.Summary) error {
 		slog.Debug("removing container", slog.String("container", containerName(c)))
+		if c.State == container.StateRunning || c.State == container.StateRestarting {
+			if _, err := docker.ContainerStop(ctx, c.ID, dockerClient.ContainerStopOptions{Timeout: &timeout}); err != nil {
+				return fmt.Errorf("failed to stop %s: %w", containerName(c), err)
+			}
+		}
 		if _, err := docker.ContainerRemove(ctx, c.ID, dockerClient.ContainerRemoveOptions{Force: true}); err != nil {
 			return fmt.Errorf("failed to remove %s: %w", containerName(c), err)
 		}

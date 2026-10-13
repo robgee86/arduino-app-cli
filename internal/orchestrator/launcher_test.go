@@ -173,7 +173,7 @@ func TestGenerateSidecarsZone(t *testing.T) {
 	first := newTestApp(t, cfg, "first", "arduino:web_ui", "arduino:object_detection")
 	zone := zoneFor(first)
 	assert.Equal(t, []string{"ei-obj-detection-runner"}, zone.services)
-	assert.NotEmpty(t, zone.fingerprint)
+	assert.Equal(t, []string{"ei-obj-detection-runner"}, slices.Sorted(maps.Keys(zone.fingerprints)))
 
 	t.Run("sidecars only, on the shared network", func(t *testing.T) {
 		project := loadCompose(t, sidecarsComposeFile(cfg))
@@ -196,7 +196,7 @@ func TestGenerateSidecarsZone(t *testing.T) {
 		again := zoneFor(second)
 		assert.Equal(t, before, zoneFile())
 		assert.Equal(t, zone.services, again.services)
-		assert.Equal(t, zone.fingerprint, again.fingerprint)
+		assert.Equal(t, zone.fingerprints, again.fingerprints)
 	})
 
 	t.Run("a sidecar mounting the app folder tells two apps apart", func(t *testing.T) {
@@ -205,7 +205,7 @@ func TestGenerateSidecarsZone(t *testing.T) {
 
 		other := newTestApp(t, cfg, "other", "arduino:storage")
 		otherZone := zoneFor(other)
-		assert.NotEqual(t, oneZone.fingerprint, otherZone.fingerprint, "the resolved volumes differ")
+		assert.NotEqual(t, oneZone.fingerprints["storage-db"], otherZone.fingerprints["storage-db"], "the resolved volumes differ")
 		assert.Contains(t, zoneFile(), other.FullPath.Join("data", "db").String())
 		assert.True(t, other.FullPath.Join("data", "db").IsDir(), "the volume folder is pre-provisioned")
 	})
@@ -218,24 +218,54 @@ func TestGenerateSidecarsZone(t *testing.T) {
 	})
 
 	t.Run("no sidecars, no zone files", func(t *testing.T) {
-		require.NoError(t, writeSidecarsFingerprint(cfg, zone.fingerprint))
 		a := newTestApp(t, cfg, "ui-only", "arduino:web_ui")
 		empty := zoneFor(a)
 		assert.Empty(t, empty.services)
+		assert.Equal(t, map[string]string{}, empty.fingerprints, "an empty zone, not an unresolved one")
 		assert.True(t, sidecarsComposeFile(cfg).NotExist())
-		assert.Empty(t, readSidecarsFingerprint(cfg))
+		assert.Nil(t, readSidecarsRecord(cfg), "the record is left to the reconcile")
 	})
 }
 
-func TestSidecarsFingerprintFile(t *testing.T) {
+func TestSidecarsRecord(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
-	require.NoError(t, sidecarsDir(cfg).MkdirAll())
-	assert.Empty(t, readSidecarsFingerprint(cfg))
-	require.NoError(t, writeSidecarsFingerprint(cfg, "abc"))
-	assert.Equal(t, "abc", readSidecarsFingerprint(cfg))
-	require.NoError(t, writeSidecarsFingerprint(cfg, ""))
-	assert.Empty(t, readSidecarsFingerprint(cfg))
-	require.NoError(t, writeSidecarsFingerprint(cfg, ""), "forgetting twice is fine")
+	assert.Nil(t, readSidecarsRecord(cfg))
+	require.NoError(t, writeSidecarsRecord(cfg, map[string]string{"runner": "abc"}))
+	assert.Equal(t, map[string]string{"runner": "abc"}, readSidecarsRecord(cfg))
+	require.NoError(t, writeSidecarsRecord(cfg, map[string]string{}))
+	assert.Equal(t, map[string]string{}, readSidecarsRecord(cfg), "an empty zone is recorded")
+	require.NoError(t, writeSidecarsRecord(cfg, nil))
+	assert.Nil(t, readSidecarsRecord(cfg))
+	require.NoError(t, writeSidecarsRecord(cfg, nil), "forgetting twice is fine")
+}
+
+func TestPlanSidecars(t *testing.T) {
+	running := container.Summary{State: container.StateRunning}
+	exited := container.Summary{State: container.StateExited}
+	recorded := map[string]string{"runner": "r1", "db": "d1"}
+	both := appContainers{"runner": running, "db": running}
+
+	for _, tc := range []struct {
+		name       string
+		zone       sidecarsZone
+		recorded   map[string]string
+		containers appContainers
+		want       sidecarsPlan
+	}{
+		{name: "unchanged and running", zone: sidecarsZone{services: []string{"db", "runner"}, fingerprints: recorded}, recorded: recorded, containers: both, want: sidecarsKeep},
+		{name: "a subset of what runs", zone: sidecarsZone{services: []string{"runner"}, fingerprints: map[string]string{"runner": "r1"}}, recorded: recorded, containers: both, want: sidecarsKeep},
+		{name: "no sidecars", zone: sidecarsZone{fingerprints: map[string]string{}}, recorded: recorded, containers: both, want: sidecarsKeep},
+		{name: "unchanged and stopped", zone: sidecarsZone{services: []string{"runner"}, fingerprints: map[string]string{"runner": "r1"}}, recorded: recorded, containers: appContainers{"runner": exited}, want: sidecarsStart},
+		{name: "a changed service", zone: sidecarsZone{services: []string{"runner"}, fingerprints: map[string]string{"runner": "r2"}}, recorded: recorded, containers: both, want: sidecarsUp},
+		{name: "a new service", zone: sidecarsZone{services: []string{"runner", "web"}, fingerprints: map[string]string{"runner": "r1", "web": "w1"}}, recorded: recorded, containers: both, want: sidecarsUp},
+		{name: "a removed container", zone: sidecarsZone{services: []string{"db"}, fingerprints: map[string]string{"db": "d1"}}, recorded: recorded, containers: appContainers{"runner": running}, want: sidecarsUp},
+		{name: "no record", zone: sidecarsZone{services: []string{"runner"}, fingerprints: map[string]string{"runner": "r1"}}, containers: both, want: sidecarsUp},
+		{name: "an unresolved zone", zone: sidecarsZone{services: []string{"runner"}}, recorded: recorded, containers: both, want: sidecarsUp},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, planSidecars(tc.zone, tc.recorded, tc.containers))
+		})
+	}
 }
 
 func TestAppContainers(t *testing.T) {
@@ -249,6 +279,8 @@ func TestAppContainers(t *testing.T) {
 	assert.True(t, zone.cover([]string{"runner", "db"}))
 	assert.False(t, zone.cover([]string{"runner", "other"}))
 	assert.Equal(t, []string{"db"}, slices.Collect(maps.Keys(zone.notRunning())))
+	assert.Equal(t, []string{"runner"}, slices.Collect(maps.Keys(zone.only([]string{"runner", "other"}))))
+	assert.Equal(t, []container.Summary{zone["db"]}, zone.orphans([]string{"runner"}))
 }
 
 func TestGenerateLauncherComposeFile(t *testing.T) {
