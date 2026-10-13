@@ -80,7 +80,7 @@ func TestSidecarsStatus(t *testing.T) {
 					Status: tc.statusMessage[i],
 				})
 			}
-			require.Equal(t, tc.want, sidecarsStatus(input))
+			require.Equal(t, tc.want, sidecarsStatus(input, nil))
 		})
 	}
 }

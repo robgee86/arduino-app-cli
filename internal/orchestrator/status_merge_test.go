@@ -26,11 +26,14 @@ func TestMergeAppStatus(t *testing.T) {
 	require.NoError(t, paths.New(appB, ".cache").MkdirAll())
 
 	services := 0
+	named := func(project, service string, state container.ContainerState, status string) container.Summary {
+		return container.Summary{State: state, Status: status, Labels: map[string]string{
+			DockerAppLabel: "true", composeProjectLabel: project, composeServiceLabel: service,
+		}}
+	}
 	sidecar := func(project string, state container.ContainerState, status string) container.Summary {
 		services++
-		return container.Summary{State: state, Status: status, Labels: map[string]string{
-			DockerAppLabel: "true", composeProjectLabel: project, composeServiceLabel: fmt.Sprintf("runner-%d", services),
-		}}
+		return named(project, fmt.Sprintf("runner-%d", services), state, status)
 	}
 	zone := func(state container.ContainerState, status string) container.Summary {
 		return sidecar(sidecarsProject, state, status)
@@ -79,6 +82,12 @@ func TestMergeAppStatus(t *testing.T) {
 			containers: []container.Summary{zone(container.StateRunning, "Up"), zone(container.StateExited, "Exited (1) 3 seconds ago")},
 			view:       launcherView{children: []launcher.Child{child(appA, launcher.StateRunning), child(appB, launcher.StateRunning)}, wanted: paths.New(appB)},
 			want:       map[string]Status{appA: StatusRunning, appB: StatusFailed},
+		},
+		{
+			name:       "an orphan removed alongside the start is no sidecar of the app",
+			containers: []container.Summary{named(sidecarsProject, "kept", container.StateRestarting, "Restarting"), named(sidecarsProject, "orphan", container.StateExited, "Exited (0) 1 second ago")},
+			view:       launcherView{children: []launcher.Child{child(appA, launcher.StateRunning)}, wanted: paths.New(appA), sidecars: []string{"kept"}},
+			want:       map[string]Status{appA: StatusStarting},
 		},
 		{
 			name:       "the containers of the per-app projects are not sidecars",
