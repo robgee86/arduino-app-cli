@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,14 +19,12 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/compose/v5/pkg/compose"
-	"go.bug.st/f"
 
 	"github.com/arduino/go-paths-helper"
 
 	"github.com/arduino/arduino-app-cli/internal/helpers"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/app"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/bricksindex"
-	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/servicesindex"
 )
 
@@ -57,7 +56,6 @@ func AppLogs(
 	dockerCli command.Cli,
 	bricksIndex *bricksindex.BricksIndex,
 	servicesIndex *servicesindex.ServicesIndex,
-	cfg config.Configuration,
 ) (iter.Seq[LogMessage], error) {
 	if app.MainPythonFile == nil {
 		return helpers.EmptyIter[LogMessage](), nil
@@ -71,17 +69,11 @@ func AppLogs(
 		})
 	}
 	if req.ShowServicesLogs {
-		services, err := getAppServicesFromContainers(ctx, dockerCli.Client(), app)
+		source, err := sidecarLogs(ctx, app, req, dockerCli, app.Bricks(bricksIndex), servicesIndex)
 		if err != nil {
 			return nil, err
 		}
-		// A main container is left by an older CLI: the launcher writes the app logs
-		services = f.Filter(services, f.NotEquals(mainServiceName))
-		if len(services) > 0 {
-			source, err := sidecarLogs(app, req, services, dockerCli, bricksIndex, servicesIndex, cfg)
-			if err != nil {
-				return nil, err
-			}
+		if source != nil {
 			sources = append(sources, source)
 		}
 	}
@@ -126,21 +118,42 @@ func mergeLogSources(ctx context.Context, sources ...logSource) iter.Seq[LogMess
 	}
 }
 
-// sidecarLogs yields the logs of the app project services, the sidecars, attributing each to its brick.
+// sidecarLogs yields the logs of the zone services that are sidecars of the app, attributing each
+// to its brick when its index tells, nil when the zone runs none of them. The sidecars are the ones
+// the last start rendered: a release ships no brick compose file, only the copies it froze.
 func sidecarLogs(
+	ctx context.Context,
 	app app.ArduinoApp,
 	req AppLogsRequest,
-	services []string,
 	dockerCli command.Cli,
 	bricksIndex *bricksindex.BricksIndex,
 	servicesIndex *servicesindex.ServicesIndex,
-	cfg config.Configuration,
 ) (logSource, error) {
-	projectName := composeProjectName(app.FullPath, cfg.AppsDir())
-
 	serviceToBrickMapping, err := serviceBricks(app, bricksIndex, servicesIndex)
 	if err != nil {
 		return nil, err
+	}
+	if app.AppComposeFilePath().NotExist() {
+		return nil, nil
+	}
+	rendered, err := extractServicesFromComposeFile(app.AppComposeFilePath())
+	if err != nil {
+		return nil, err
+	}
+	containers, err := getAppContainers(ctx, dockerCli.Client(), sidecarsProject)
+	if err != nil {
+		return nil, err
+	}
+	var services []string
+	for _, service := range rendered {
+		if _, ok := containers[service.name]; ok && service.name != mainServiceName {
+			services = append(services, service.name)
+		}
+	}
+	slices.Sort(services)
+	// An empty service list makes compose show every container of the project
+	if len(services) == 0 {
+		return nil, nil
 	}
 
 	backend, err := compose.NewComposeService(dockerCli)
@@ -158,7 +171,7 @@ func sidecarLogs(
 		}
 		err := backend.Logs(
 			ctx,
-			projectName,
+			sidecarsProject,
 			NewDockerLogConsumer(ctx, yield, serviceToBrickMapping),
 			opts,
 		)

@@ -19,7 +19,6 @@ import (
 	"github.com/gosimple/slug"
 	"github.com/moby/moby/api/types/container"
 	dockerClient "github.com/moby/moby/client"
-	"go.bug.st/f"
 
 	"github.com/arduino/arduino-app-cli/internal/dockerhelper"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/app"
@@ -33,68 +32,36 @@ type AppStatusInfo struct {
 	Status  Status
 }
 
-// parseAppStatus takes all the containers that matches the DockerAppLabel,
-// and construct a map of the state of an app and all its dependencies state.
-// For app that have at least 1 dependency, we calculate the overall state
-// as follow:
+// sidecarsStatus is the overall status of the sidecars zone containers, empty without containers
+// or when it cannot tell:
 //
 //	running: all running
 //	stopped: all stopped
 //	failed: at least one failed
 //	stopping: at least one stopping
 //	starting: at least one starting
-func parseAppStatus(containers []container.Summary) []AppStatusInfo {
-	apps := make([]AppStatusInfo, 0, len(containers))
-	appsStatusMap := make(map[string][]Status)
-	for _, c := range containers {
-		appPath, ok := c.Labels[DockerAppPathLabel]
-		if !ok {
-			continue
-		}
-		appsStatusMap[appPath] = append(appsStatusMap[appPath], StatusFromDockerState(c.State, c.Status))
-
+func sidecarsStatus(containers []container.Summary) Status {
+	zone, _ := splitAppContainers(containers)
+	s := make([]Status, 0, len(zone))
+	for _, c := range zone {
+		s = append(s, StatusFromDockerState(c.State, c.Status))
 	}
-
-	appendResult := func(appPath *paths.Path, status Status) {
-		apps = append(apps, AppStatusInfo{
-			AppPath: appPath,
-			Status:  status,
-		})
+	switch {
+	case len(s) == 0:
+		return ""
+	case !slices.ContainsFunc(s, func(v Status) bool { return v != StatusRunning }):
+		return StatusRunning
+	case !slices.ContainsFunc(s, func(v Status) bool { return v != StatusStopped }):
+		return StatusStopped
+	case slices.Contains(s, StatusFailed):
+		return StatusFailed
+	case slices.Contains(s, StatusStopping):
+		return StatusStopping
+	case slices.Contains(s, StatusStarting):
+		return StatusStarting
+	default:
+		return ""
 	}
-
-	for appPath, s := range appsStatusMap {
-		f.Assert(len(s) != 0, "status slice is zero")
-
-		appPath := paths.New(appPath)
-
-		//	running: all running
-		if !slices.ContainsFunc(s, func(v Status) bool { return v != StatusRunning }) {
-			appendResult(appPath, StatusRunning)
-			continue
-		}
-		//	stopped: all stopped
-		if !slices.ContainsFunc(s, func(v Status) bool { return v != StatusStopped }) {
-			appendResult(appPath, StatusStopped)
-			continue
-		}
-
-		// ...else we have multiple different status we calculate the status
-		// among the possible left: {failed, stopping, starting}
-		if slices.ContainsFunc(s, func(v Status) bool { return v == StatusFailed }) {
-			appendResult(appPath, StatusFailed)
-			continue
-		}
-		if slices.ContainsFunc(s, func(v Status) bool { return v == StatusStopping }) {
-			appendResult(appPath, StatusStopping)
-			continue
-		}
-		if slices.ContainsFunc(s, func(v Status) bool { return v == StatusStarting }) {
-			appendResult(appPath, StatusStarting)
-			continue
-		}
-	}
-
-	return apps
 }
 
 // launcherView is what the launcher runs, and the app it should be running.
@@ -115,19 +82,17 @@ func readLauncherView(ctx context.Context, cfg config.Configuration) launcherVie
 	return view
 }
 
-// mergeAppStatus combines the app sidecars with the launcher children. An app neither run nor
-// wanted is idle: its sidecar exit codes come from the stop, and a runner may exit 0 on SIGTERM.
+// mergeAppStatus combines the sidecars zone with the launcher children: the zone runs the sidecars
+// of the wanted app. An app neither run nor wanted is idle: its sidecar exit codes come from the
+// stop, and a runner may exit 0 on SIGTERM.
 func mergeAppStatus(containers []container.Summary, view launcherView) []AppStatusInfo {
-	sidecars := make(map[string]Status)
-	for _, s := range parseAppStatus(containers) {
-		sidecars[s.AppPath.String()] = s.Status
-	}
+	zone := sidecarsStatus(containers)
 	children := make(map[string]launcher.Child, len(view.children))
 	for _, c := range view.children {
 		children[filepath.Clean(c.App)] = c
 	}
 
-	appPaths := slices.Concat(slices.Collect(maps.Keys(sidecars)), slices.Collect(maps.Keys(children)))
+	appPaths := slices.Collect(maps.Keys(children))
 	if view.wanted != nil {
 		appPaths = append(appPaths, view.wanted.String())
 	}
@@ -140,7 +105,11 @@ func mergeAppStatus(containers []container.Summary, view launcherView) []AppStat
 		wanted := view.wanted != nil && view.wanted.EqualsTo(p)
 		status := idleAppStatus(p)
 		if running || wanted {
-			status = launcherAppStatus(sidecars[appPath], child, running)
+			var sidecars Status
+			if wanted {
+				sidecars = zone
+			}
+			status = launcherAppStatus(sidecars, child, running)
 		}
 		result = append(result, AppStatusInfo{AppPath: p, Status: status})
 	}
@@ -171,8 +140,9 @@ func idleAppStatus(appPath *paths.Path) Status {
 	return StatusUninitialized
 }
 
-func listAppContainers(ctx context.Context, docker dockerClient.APIClient, filter string) ([]container.Summary, error) {
-	containers, err := dockerhelper.Containers(ctx, docker, filter)
+// listAppContainers lists the app containers, running or not: the sidecars zone and the per-app projects of the older versions.
+func listAppContainers(ctx context.Context, docker dockerClient.APIClient) ([]container.Summary, error) {
+	containers, err := dockerhelper.Containers(ctx, docker, DockerAppLabel+"=true")
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +154,7 @@ func getAppsStatus(
 	docker dockerClient.APIClient,
 	cfg config.Configuration,
 ) ([]AppStatusInfo, error) {
-	containers, err := listAppContainers(ctx, docker, DockerAppLabel+"=true")
+	containers, err := listAppContainers(ctx, docker)
 	if err != nil {
 		return nil, err
 	}
@@ -197,11 +167,11 @@ func getAppStatus(
 	app app.ArduinoApp,
 	cfg config.Configuration,
 ) (AppStatusInfo, error) {
-	containers, err := listAppContainers(ctx, docker, DockerAppPathLabel+"="+app.FullPath.String())
+	statuses, err := getAppsStatus(ctx, docker, cfg)
 	if err != nil {
 		return AppStatusInfo{}, err
 	}
-	for _, s := range mergeAppStatus(containers, readLauncherView(ctx, cfg)) {
+	for _, s := range statuses {
 		if s.AppPath.EqualsTo(app.FullPath) {
 			return s, nil
 		}
@@ -231,24 +201,6 @@ func getRunningApp(
 	return &app, nil
 }
 
-// getAppServicesFromContainers reads the services of an app from its containers. The
-// compose file is not a source: an update removes the brick files that it includes.
-func getAppServicesFromContainers(ctx context.Context, docker dockerClient.APIClient, app app.ArduinoApp) ([]string, error) {
-	containers, err := dockerhelper.Containers(ctx, docker, DockerAppPathLabel+"="+app.FullPath.String())
-	if err != nil {
-		return nil, err
-	}
-
-	const dockerComposeServiceLabel = "com.docker.compose.service"
-	services := make([]string, 0, len(containers))
-	for _, info := range containers {
-		if name := info.Labels[dockerComposeServiceLabel]; name != "" && !slices.Contains(services, name) {
-			services = append(services, name)
-		}
-	}
-	return services, nil
-}
-
 // composeProjectName is the docker project an app installed at appPath runs as. An app
 // of the board is named after the apps dir, anything else after the path it is at.
 func composeProjectName(appPath *paths.Path, appsDir *paths.Path) string {
@@ -257,7 +209,6 @@ func composeProjectName(appPath *paths.Path, appsDir *paths.Path) string {
 	}
 	return slug.Make(appPath.String())
 }
-
 func findAppPathByName(name string, cfg config.Configuration) (*paths.Path, bool) {
 	appFolderName := slug.Make(name)
 	basePath := cfg.AppsDir().Join(appFolderName)

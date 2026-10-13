@@ -33,7 +33,7 @@ func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker comma
 		"create", "start", "stop", "die", "restart", "destroy", "delete")
 
 	return func(yield func(AppInfo, error) bool) {
-		containers, err := listAppContainers(ctx, docker.Client(), DockerAppLabel+"=true")
+		containers, err := listAppContainers(ctx, docker.Client())
 		if err != nil {
 			_ = yield(AppInfo{}, err)
 			return
@@ -55,7 +55,7 @@ func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker comma
 					return
 				}
 			case <-chanMsg:
-				if containers, err = listAppContainers(ctx, docker.Client(), DockerAppLabel+"=true"); err != nil {
+				if containers, err = listAppContainers(ctx, docker.Client()); err != nil {
 					slog.Error("Unable to get apps status", slog.String("error", err.Error()))
 					if !yield(AppInfo{}, err) {
 						return

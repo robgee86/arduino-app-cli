@@ -6,13 +6,14 @@
 package orchestrator
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/moby/moby/api/types/container"
 	"github.com/stretchr/testify/require"
 )
 
-func TestParseAppStatus(t *testing.T) {
+func TestSidecarsStatus(t *testing.T) {
 	tests := []struct {
 		name           string
 		containerState []container.ContainerState
@@ -74,15 +75,12 @@ func TestParseAppStatus(t *testing.T) {
 			var input []container.Summary
 			for i, c := range tc.containerState {
 				input = append(input, container.Summary{
-					Labels: map[string]string{DockerAppPathLabel: "path1"},
+					Labels: map[string]string{composeProjectLabel: sidecarsProject, composeServiceLabel: fmt.Sprintf("svc%d", i)},
 					State:  c,
 					Status: tc.statusMessage[i],
 				})
 			}
-			res := parseAppStatus(input)
-			require.Len(t, res, 1)
-			require.Equal(t, tc.want, res[0].Status)
-			require.Equal(t, "path1", res[0].AppPath.String())
+			require.Equal(t, tc.want, sidecarsStatus(input))
 		})
 	}
 }

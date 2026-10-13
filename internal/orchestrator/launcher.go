@@ -66,10 +66,36 @@ func newLauncherClient(cfg config.Configuration) *launcher.Client {
 	return launcher.New(cfg.RuntimeDir().Join(launcher.SocketName).String(), launcherRequestTimeout)
 }
 
-// launcherPorts are the public ports the launcher forwards to the running app: the sorted union of the brick ports.
-func launcherPorts(bricksIndex *bricksindex.BricksIndex) []int {
+// launcherPorts are the public ports the launcher forwards: the sorted union of the ports of the
+// apps on the board, so that no app start has to recreate it.
+func launcherPorts(cfg config.Configuration, bricksIndex *bricksindex.BricksIndex) []int {
+	appPaths, err := app.FindAppsInFolders(launcherAppRoots(cfg))
+	if err != nil {
+		slog.Warn("some apps were not listed for the launcher ports", slog.String("error", err.Error()))
+	}
 	var ports []int
-	for _, brick := range bricksIndex.ListBricks() {
+	for _, appPath := range appPaths {
+		a, err := app.Load(appPath)
+		if err != nil {
+			slog.Debug("skipping the ports of an invalid app", slog.String("path", appPath.String()), slog.String("error", err.Error()))
+			continue
+		}
+		ports = append(ports, appPorts(a, bricksIndex)...)
+	}
+	slices.Sort(ports)
+	return slices.Compact(ports)
+}
+
+// appPorts are the public ports of an app: the defaults of its bricks, then the ports of app.yaml.
+func appPorts(a app.ArduinoApp, bricksIndex *bricksindex.BricksIndex) []int {
+	// A copy: WithAppBricks would change the index shared by the callers
+	index := &bricksindex.BricksIndex{BuiltInBricks: bricksIndex.BuiltInBricks, AppBricks: a.LocalBricks}
+	var ports []int
+	for _, b := range a.Descriptor.Bricks {
+		brick, found := index.FindBrickByID(b.ID)
+		if !found {
+			continue
+		}
 		for _, p := range brick.Ports {
 			port, err := strconv.Atoi(p)
 			if err != nil {
@@ -79,12 +105,12 @@ func launcherPorts(bricksIndex *bricksindex.BricksIndex) []int {
 			ports = append(ports, port)
 		}
 	}
+	ports = append(ports, a.Descriptor.Ports...)
 	slices.Sort(ports)
 	return slices.Compact(ports)
 }
 
-// prepareLauncher checks that the launcher can run the app, then brings it up. bricksIndex holds
-// the installed bricks only: their ports are the ones the launcher forwards.
+// prepareLauncher checks that the launcher can run the app, then brings it up.
 func prepareLauncher(
 	ctx context.Context,
 	docker command.Cli,
@@ -94,13 +120,15 @@ func prepareLauncher(
 	platform platform.Platform,
 	cb func(StreamMessage),
 ) error {
-	if port, ok := uncoveredAppPort(appToStart, bricksIndex); ok {
-		return fmt.Errorf("the app launcher does not forward port %d declared in app.yaml: only the ports of the installed bricks are forwarded", port)
-	}
 	if roots := launcherAppRoots(cfg); !isInsideLauncherRoots(appToStart.FullPath, cfg) {
 		return fmt.Errorf("the app launcher runs only the apps inside %s", strings.Join(roots.AsStrings(), " or "))
 	}
-	elapsed, err := ensureLauncher(ctx, docker, bricksIndex, cfg, platform, false, cb)
+	ports := launcherPorts(cfg, bricksIndex)
+	// Only an app changed since the ports were collected
+	if port, ok := uncoveredAppPort(appToStart, bricksIndex, ports); ok {
+		return fmt.Errorf("the app launcher does not forward port %d of the app: the app changed while starting, start it again", port)
+	}
+	elapsed, err := ensureLauncher(ctx, docker, ports, cfg, platform, false, cb)
 	if err != nil {
 		return fmt.Errorf("the app launcher is unavailable: %w", err)
 	}
@@ -108,11 +136,10 @@ func prepareLauncher(
 	return nil
 }
 
-// uncoveredAppPort returns an app.yaml port the launcher does not publish.
-func uncoveredAppPort(a app.ArduinoApp, bricksIndex *bricksindex.BricksIndex) (int, bool) {
-	ports := launcherPorts(bricksIndex)
-	for _, p := range a.Descriptor.Ports {
-		if !slices.Contains(ports, p) {
+// uncoveredAppPort returns a port of the app that the launcher ports do not include.
+func uncoveredAppPort(a app.ArduinoApp, bricksIndex *bricksindex.BricksIndex, launcherPorts []int) (int, bool) {
+	for _, p := range appPorts(a, bricksIndex) {
+		if !slices.Contains(launcherPorts, p) {
 			return p, true
 		}
 	}
@@ -136,13 +163,12 @@ func isInsideLauncherRoots(appPath *paths.Path, cfg config.Configuration) bool {
 // generateLauncherComposeFile writes the launcher compose project, rendered on this board, and
 // tells whether it changed.
 func generateLauncherComposeFile(
-	bricksIndex *bricksindex.BricksIndex,
+	ports []int,
 	pythonImage string,
 	cfg config.Configuration,
 	boardEnvs types.Mapping,
 	platform platform.Platform,
 ) (bool, error) {
-	ports := launcherPorts(bricksIndex)
 	published := make([]string, 0, len(ports))
 	forwarded := make([]string, 0, len(ports))
 	for _, p := range ports {
@@ -202,8 +228,12 @@ func generateLauncherComposeFile(
 	}
 
 	file := launcherComposeFile(cfg)
-	if before, err := file.ReadFile(); err == nil && bytes.Equal(before, data) {
+	before, err := file.ReadFile()
+	if err == nil && bytes.Equal(before, data) {
 		return false, nil
+	}
+	if previous := launcherForwardedPorts(before); err == nil && previous != envs["APP_LAUNCHER_PORTS"] {
+		slog.Info("the app launcher ports changed, the launcher is recreated", slog.String("before", previous), slog.String("after", envs["APP_LAUNCHER_PORTS"]))
 	}
 	if err := file.Parent().MkdirAll(); err != nil {
 		return false, fmt.Errorf("failed to create the launcher folder: %w", err)
@@ -212,6 +242,19 @@ func generateLauncherComposeFile(
 		return false, fmt.Errorf("failed to write the launcher compose file: %w", err)
 	}
 	return true, nil
+}
+
+// launcherForwardedPorts reads the ports a launcher compose file forwards.
+func launcherForwardedPorts(composeFile []byte) string {
+	var compose struct {
+		Services map[string]struct {
+			Environment map[string]string `yaml:"environment"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(composeFile, &compose); err != nil {
+		return ""
+	}
+	return compose.Services[launcherServiceName].Environment["APP_LAUNCHER_PORTS"]
 }
 
 // boardEnvironment is what the launcher container is given: the host facts that hold for every app.
@@ -230,7 +273,7 @@ func boardEnvironment(ctx context.Context, plat platform.Platform, cfg config.Co
 func ensureLauncher(
 	ctx context.Context,
 	docker command.Cli,
-	bricksIndex *bricksindex.BricksIndex,
+	ports []int,
 	cfg config.Configuration,
 	platform platform.Platform,
 	forceUp bool,
@@ -240,7 +283,7 @@ func ensureLauncher(
 	if err := cfg.RuntimeDir().MkdirAll(); err != nil {
 		return 0, fmt.Errorf("failed to create the runtime folder: %w", err)
 	}
-	changed, err := generateLauncherComposeFile(bricksIndex, cfg.PythonImage, cfg, boardEnvironment(ctx, platform, cfg), platform)
+	changed, err := generateLauncherComposeFile(ports, cfg.PythonImage, cfg, boardEnvironment(ctx, platform, cfg), platform)
 	if err != nil {
 		return 0, err
 	}
@@ -416,7 +459,7 @@ func EnsureLauncher(
 	var elapsed time.Duration
 	err := withAppsLock(ctx, cfg, func() error {
 		var err error
-		if elapsed, err = ensureLauncher(ctx, docker, bricksIndex, cfg, platform, true, func(StreamMessage) {}); err != nil {
+		if elapsed, err = ensureLauncher(ctx, docker, launcherPorts(cfg, bricksIndex), cfg, platform, true, func(StreamMessage) {}); err != nil {
 			return err
 		}
 		if !stopApps {
@@ -427,11 +470,14 @@ func EnsureLauncher(
 	return elapsed, err
 }
 
-// LauncherDown removes the launcher container and its network, stopping every app first.
+// LauncherDown removes the launcher container, the sidecars zone and the network, stopping every app first.
 func LauncherDown(ctx context.Context, docker command.Cli, cfg config.Configuration, cb func(StreamMessage)) error {
 	return withAppsLock(ctx, cfg, func() error {
 		// The network cannot go while the sidecars are attached to it
 		if err := StopAllAppContainers(ctx, docker.Client()); err != nil {
+			return err
+		}
+		if err := removeSidecars(ctx, docker.Client(), cfg); err != nil {
 			return err
 		}
 		if err := clearLauncherWantedApp(cfg, nil); err != nil {

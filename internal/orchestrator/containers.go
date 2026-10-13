@@ -47,6 +47,27 @@ func getAppContainers(ctx context.Context, docker dockerClient.APIClient, projec
 	return byService(containers.Items), nil
 }
 
+// cover tells whether every service has a container.
+func (c appContainers) cover(services []string) bool {
+	for _, s := range services {
+		if _, ok := c[s]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// notRunning are the containers that do not run.
+func (c appContainers) notRunning() appContainers {
+	result := make(appContainers)
+	for service, ctr := range c {
+		if ctr.State != container.StateRunning {
+			result[service] = ctr
+		}
+	}
+	return result
+}
+
 func byService(containers []container.Summary) appContainers {
 	result := make(appContainers, len(containers))
 	for _, c := range containers {
