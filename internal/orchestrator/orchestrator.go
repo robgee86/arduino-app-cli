@@ -25,6 +25,7 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/goccy/go-yaml"
 	"github.com/gosimple/slug"
+	dockerClient "github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
 	"go.bug.st/f"
 	semver "go.bug.st/relaxed-semver"
@@ -242,7 +243,7 @@ func startApp(
 	}
 
 	if appToStart.MainPythonFile == nil {
-		if err := errors.Join(stopLauncherApp(ctx, cfg, nil), closeAppPorts(ctx, docker, cfg), stopSidecars(ctx, docker.Client(), cb)); err != nil {
+		if err := errors.Join(stopLauncherApp(ctx, cfg, nil), closeAppPorts(ctx, docker.Client()), stopSidecars(ctx, docker.Client(), cb)); err != nil {
 			return err
 		}
 		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
@@ -374,14 +375,14 @@ func startWithLauncher(
 		err = launcherStartError(err)
 	}
 	if err == nil {
-		if err = applyIngress(ctx, docker, cfg, ports, false); err != nil {
+		if err = openAppPorts(ctx, docker, cfg, ports, cb); err != nil {
 			err = fmt.Errorf("failed to open the app ports: %w", err)
 		}
 	}
 	if err != nil {
 		waitOrphans()
 		// Half an app is of no use: stop what started, which closes the ports
-		if stopErr := stopAppProcesses(ctx, docker, appToStart, cfg, nil); stopErr != nil {
+		if stopErr := stopAppProcesses(ctx, docker.Client(), appToStart, cfg, nil); stopErr != nil {
 			slog.Warn("failed to stop the app after a failed start", slog.String("error", stopErr.Error()))
 		}
 		return err
@@ -458,7 +459,7 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 		}
 	}
 
-	if err := stopAppProcesses(ctx, docker, app, cfg, cb); err != nil {
+	if err := stopAppProcesses(ctx, docker.Client(), app, cfg, cb); err != nil {
 		return err
 	}
 	cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
@@ -467,7 +468,7 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 
 // stopAppProcesses stops the app launcher child, then closes the app ports and stops the sidecars
 // zone unless they belong to another app. The zone stays: the next start of the same app is a plain start.
-func stopAppProcesses(ctx context.Context, docker command.Cli, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
+func stopAppProcesses(ctx context.Context, docker dockerClient.APIClient, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
 	if cb == nil {
 		cb = func(StreamMessage) {}
 	}
@@ -483,7 +484,7 @@ func stopAppProcesses(ctx context.Context, docker command.Cli, app app.ArduinoAp
 		slog.Debug("the sidecars zone and the ports belong to another app, left open", slog.String("app", wanted.String()))
 		return nil
 	}
-	return errors.Join(closeAppPorts(ctx, docker, cfg), stopSidecars(ctx, docker.Client(), cb))
+	return errors.Join(closeAppPorts(ctx, docker), stopSidecars(ctx, docker, cb))
 }
 
 // stopLauncherApp stops the app if the launcher runs it, every app when appPath is nil. An

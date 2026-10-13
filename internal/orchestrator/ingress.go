@@ -12,19 +12,22 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/arduino/go-paths-helper"
 	"github.com/docker/cli/cli/command"
 	yaml "github.com/goccy/go-yaml"
 	"github.com/moby/moby/api/types/container"
+	dockerClient "github.com/moby/moby/client"
 
+	"github.com/arduino/arduino-app-cli/internal/dockerhelper"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/launcher"
 )
 
 // The ingress is the only container publishing app ports: an nginx on the network of the launcher
 // that publishes the public ports of the running app and forwards each to its internal port in the
-// launcher, and publishes nothing without app. Docker fixes the published ports at container
+// launcher. It runs only while an app with ports runs. Docker fixes the published ports at container
 // creation, so compose recreates the ingress when the ports change.
 const (
 	DockerIngressLabel = "cc.arduino.app.ingress"
@@ -76,7 +79,7 @@ func generateIngressComposeFile(cfg config.Configuration, ports []int) ([]byte, 
 		Init:  new(true),
 		User:  "nginx",
 		Ports: published,
-		// The ports are the configuration: the conf is never changed under a running ingress
+		// nginx reads the conf as it starts, which a change of the ports always is
 		Volumes:  []any{volume{Type: "bind", Source: ingressConfFile(cfg).Parent().String(), Target: ingressConfTarget, ReadOnly: true}},
 		ReadOnly: true,
 		// The only file nginx writes, its pid, goes there
@@ -119,10 +122,12 @@ func writeIngressFiles(cfg config.Configuration, ports []int) (bool, error) {
 	return changed, nil
 }
 
-// applyIngress makes the ingress publish exactly the ports, none when empty. compose up recreates
-// it only when the ports changed or it does not run; forceUp also follows a new image. A stopped
-// ingress publishes nothing, so it is left so when there is nothing to publish.
-func applyIngress(ctx context.Context, docker command.Cli, cfg config.Configuration, ports []int, forceUp bool) error {
+// openAppPorts makes the ingress publish exactly the ports of the app being started. The ingress
+// keeps the last ports while stopped: the same ports start it again, other ones recreate it.
+func openAppPorts(ctx context.Context, docker command.Cli, cfg config.Configuration, ports []int, cb func(StreamMessage)) error {
+	if len(ports) == 0 {
+		return closeAppPorts(ctx, docker.Client())
+	}
 	changed, err := writeIngressFiles(cfg, ports)
 	if err != nil {
 		return err
@@ -131,36 +136,51 @@ func applyIngress(ctx context.Context, docker command.Cli, cfg config.Configurat
 	if err != nil {
 		return err
 	}
-	running := current != nil && current.State == container.StateRunning
-	// A restart loop binds the ports at each attempt
-	publishing := running || (current != nil && current.State == container.StateRestarting)
-	if len(ports) == 0 && !publishing && !forceUp {
-		slog.Debug("ingress not running, no port to close")
-		return nil
-	}
-	reason, up := composeUpReason(forceUp, changed, running)
-	if !up {
+	switch {
+	case changed || current == nil:
+		if err := pullIngressImage(ctx, docker.Client(), cb); err != nil {
+			return err
+		}
+		if err := upIngress(ctx, docker, cfg); err != nil {
+			return err
+		}
+	case current.State == container.StateRunning:
 		slog.Debug("ingress publishes the ports already", slog.Any("ports", ports))
 		return nil
+	default:
+		slog.Debug("starting the stopped ingress on the same ports", slog.String("state", string(current.State)))
+		if _, err := docker.Client().ContainerStart(ctx, current.ID, dockerClient.ContainerStartOptions{}); err != nil {
+			return fmt.Errorf("failed to start the ingress: %w", err)
+		}
+		if err := waitIngressRunning(ctx, docker.Client(), *current); err != nil {
+			return err
+		}
 	}
-	if err := upIngress(ctx, docker, cfg, reason); err != nil {
-		return err
-	}
-	slog.Info("ingress publishes the app ports", slog.Any("ports", ports), slog.String("reason", reason))
+	slog.Info("ingress publishes the app ports", slog.Any("ports", ports), slog.Bool("recreated", changed || current == nil))
 	return nil
 }
 
-// ensureIngress brings the ingress up on the ports it publishes, none on a first run, following a new image.
-func ensureIngress(ctx context.Context, docker command.Cli, cfg config.Configuration) error {
-	if ingressComposeFile(cfg).NotExist() || ingressConfFile(cfg).NotExist() {
-		return applyIngress(ctx, docker, cfg, nil, true)
+// closeAppPorts stops the ingress, which closes the ports it publishes, a restart loop included.
+func closeAppPorts(ctx context.Context, docker dockerClient.APIClient) error {
+	if err := stopContainerWithLabel(ctx, docker, DockerIngressLabel); err != nil {
+		return fmt.Errorf("failed to close the app ports: %w", err)
 	}
-	return upIngress(ctx, docker, cfg, "forced, to follow the image")
+	return nil
 }
 
-// upIngress runs compose up on the ingress and returns once it runs.
-func upIngress(ctx context.Context, docker command.Cli, cfg config.Configuration, reason string) error {
-	slog.Debug("running compose up for the ingress", slog.String("reason", reason))
+// pullIngressImage pulls the ingress image when it is missing: system init and the daemon boot
+// pull it, so that a start does not have to.
+func pullIngressImage(ctx context.Context, docker dockerClient.APIClient, cb func(StreamMessage)) error {
+	started := time.Now()
+	if err := dockerhelper.PullImages(ctx, docker, []string{IngressImage}, func(line string) { cb(StreamMessage{data: line}) }, nil); err != nil {
+		return fmt.Errorf("failed to pull the ingress image: %w", err)
+	}
+	slog.Debug("ingress image available", slog.String("image", IngressImage), slog.Duration("elapsed", time.Since(started)))
+	return nil
+}
+
+// upIngress runs compose up on the ingress, which recreates it on new ports, and returns once it runs.
+func upIngress(ctx context.Context, docker command.Cli, cfg config.Configuration) error {
 	if err := composeUpFile(ctx, docker, ingressComposeFile(cfg), func(StreamMessage) {}); err != nil {
 		return fmt.Errorf("failed to start the ingress: %w", err)
 	}
@@ -171,16 +191,12 @@ func upIngress(ctx context.Context, docker command.Cli, cfg config.Configuration
 	if current == nil {
 		return errors.New("the ingress container was not created")
 	}
-	if err := waitContainerRunning(ctx, docker.Client(), current.ID); err != nil {
-		return fmt.Errorf("the ingress is not running, see `docker logs %s`: %w", containerName(*current), err)
-	}
-	return nil
+	return waitIngressRunning(ctx, docker.Client(), *current)
 }
 
-// closeAppPorts makes the ingress publish nothing.
-func closeAppPorts(ctx context.Context, docker command.Cli, cfg config.Configuration) error {
-	if err := applyIngress(ctx, docker, cfg, nil, false); err != nil {
-		return fmt.Errorf("failed to close the app ports: %w", err)
+func waitIngressRunning(ctx context.Context, docker dockerClient.APIClient, c container.Summary) error {
+	if err := waitContainerRunning(ctx, docker, c.ID); err != nil {
+		return fmt.Errorf("the ingress is not running, see `docker logs %s`: %w", containerName(c), err)
 	}
 	return nil
 }
