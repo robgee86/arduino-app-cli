@@ -246,7 +246,7 @@ func SystemCleanup(ctx context.Context, cfg config.Configuration, bricksindex *b
 	removeNetwork := ourNetworks(appContainers)
 
 	// Remove running app
-	runningApp, err := getRunningApp(ctx, docker.Client())
+	runningApp, err := getRunningApp(ctx, docker.Client(), cfg)
 	if err != nil {
 		feedback.Warnf("failed to get running app - %v", err)
 	}

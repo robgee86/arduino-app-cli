@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -21,9 +22,12 @@ import (
 	"github.com/arduino/arduino-cli/commands"
 	rpc "github.com/arduino/arduino-cli/rpc/cc/arduino/cli/commands/v1"
 	"github.com/arduino/go-paths-helper"
+	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/command"
 	"github.com/goccy/go-yaml"
 	"github.com/gosimple/slug"
+	"github.com/moby/moby/api/types/container"
+	dockerClient "github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
 	"go.bug.st/f"
 	semver "go.bug.st/relaxed-semver"
@@ -36,6 +40,7 @@ import (
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/appid"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/bricksindex"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
+	"github.com/arduino/arduino-app-cli/internal/orchestrator/launcher"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/modelsindex"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/peripherals"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/pipewire"
@@ -105,11 +110,30 @@ func StartApp(
 	if cb == nil {
 		cb = func(StreamMessage) {}
 	}
+	return withAppsLock(ctx, cfg, func() error {
+		appBricks := appToStart.Bricks(bricksIndex)
+		appModels := appToStart.Models(modelsIndex, docker, cfg, platform)
+		if err := checkApp(ctx, docker, appToStart, appBricks, appModels, servicesIndex, platform, prepare, cb); err != nil {
+			return err
+		}
+		mode := selectRunMode(ctx, docker, bricksIndex, appToStart, cfg, platform, cb)
+		return startApp(ctx, docker, provisioner, appModels, appBricks, servicesIndex, appToStart, cfg, platform, verbose, prepare, mode, cb)
+	})
+}
 
-	bricksIndex = appToStart.Bricks(bricksIndex)
-
-	modelsIndex = appToStart.Models(modelsIndex, docker, cfg, platform)
-
+// checkApp validates what the app needs before anything is started. With prepare, an editable
+// app downloads the models it is wired with first.
+func checkApp(
+	ctx context.Context,
+	docker command.Cli,
+	appToStart app.ArduinoApp,
+	bricksIndex *bricksindex.BricksIndex,
+	modelsIndex *modelsindex.ModelsIndex,
+	servicesIndex *servicesindex.ServicesIndex,
+	platform platform.Platform,
+	prepare bool,
+	cb func(StreamMessage),
+) error {
 	if prepare && !appToStart.IsRelease() {
 		if err := prepareModels(ctx, docker, appToStart.Descriptor.Bricks, bricksIndex, modelsIndex, platform, cb); err != nil {
 			return err
@@ -130,9 +154,8 @@ func StartApp(
 	}
 
 	// Detect the board peripherals only when the app needs them.
-	var devices peripherals.AvailableDevices
 	if len(requiredClasses) > 0 {
-		devices, err = peripherals.Detect(ctx, platform)
+		devices, err := peripherals.Detect(ctx, platform)
 		if err != nil {
 			return err
 		}
@@ -141,36 +164,36 @@ func StartApp(
 			return err
 		}
 	}
+	return nil
+}
 
-	appsStatus, err := getAppsStatus(ctx, docker.Client())
-	if err != nil {
-		return fmt.Errorf("failed to list apps status: %w", err)
-	}
-
-	// Reject if another app is running/starting; otherwise stop any *other*
-	// failed app so its sibling services release resources (ports, volumes)
-	// that could conflict with the app we're starting.
-	for _, s := range appsStatus {
-		switch s.Status {
-		case StatusRunning, StatusStarting:
-			runningApp, err := app.Load(s.AppPath)
-			if err != nil {
-				return fmt.Errorf("failed to load running app: %w", err)
-			}
-			return fmt.Errorf("app %q is running", runningApp.Name)
-		case StatusFailed:
-			if s.AppPath.EqualsTo(appToStart.FullPath) {
-				continue
-			}
-			failedApp, err := app.Load(s.AppPath)
-			if err != nil {
-				slog.Warn("skipping failed app: cannot load", slog.String("path", s.AppPath.String()), slog.String("error", err.Error()))
-				continue
-			}
-			slog.Debug("stopping failed app before starting a new one", slog.String("name", failedApp.Name))
-			if err := StopApp(ctx, docker, platform, failedApp, cfg, nil); err != nil {
-				slog.Warn("failed to stop failed app", slog.String("name", failedApp.Name), slog.String("error", err.Error()))
-			}
+// startApp starts an app checked by checkApp: bricksIndex and modelsIndex are the ones it is wired with.
+func startApp(
+	ctx context.Context,
+	docker command.Cli,
+	provisioner *Provision,
+	modelsIndex *modelsindex.ModelsIndex,
+	bricksIndex *bricksindex.BricksIndex,
+	servicesIndex *servicesindex.ServicesIndex,
+	appToStart app.ArduinoApp,
+	cfg config.Configuration,
+	platform platform.Platform,
+	verbose bool,
+	prepare bool,
+	mode runMode,
+	cb func(StreamMessage),
+) error {
+	// The launcher replaces the other apps; their sidecars are stopped along the way
+	var replaced paths.PathList
+	switch mode {
+	case launcherMode:
+		var err error
+		if replaced, err = otherAppsWithRunningContainers(ctx, docker.Client(), appToStart.FullPath); err != nil {
+			return err
+		}
+	case classicMode:
+		if err := stopOtherFailedApps(ctx, docker, appToStart, cfg, platform); err != nil {
+			return err
 		}
 	}
 
@@ -226,96 +249,311 @@ func StartApp(
 		cb(StreamMessage{progress: &Progress{Name: "sketch updated", Progress: 10.0}})
 	}
 
-	if appToStart.MainPythonFile != nil {
-		appEnv := appEnvironment(ctx, appToStart, bricksIndex, modelsIndex, platform)
-
-		cb(StreamMessage{data: "python provisioning"})
-		provisionStartProgress := float32(0.0)
-		if _, ok := appToStart.GetSketchPath(); ok {
-			provisionStartProgress = 10.0
-		}
-
-		cb(StreamMessage{progress: &Progress{Name: "python provisioning", Progress: provisionStartProgress}})
-
-		// The compose files of a release are the ones the build resolved for the
-		// target board: resolving them again here would replace them.
-		if !isRelease {
-			// An app is provisioned every time it is started: it is editable, so its
-			// bricks, model or ports may have changed since the last run.
-			if err := provisioner.Resolve(&appToStart, appToStart.ProvisioningStateDir(), bricksIndex, servicesIndex, cfg, appEnv, platform); err != nil {
+	if appToStart.MainPythonFile == nil {
+		if mode == launcherMode {
+			// Nothing to start in the launcher: what it runs is replaced all the same
+			if err := errors.Join(stopLauncherApp(ctx, cfg, nil), stopReplacedApps(ctx, docker, replaced, cb)); err != nil {
 				return err
 			}
 		}
+		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
+		return nil
+	}
 
-		// What the template references, answered on this board. The app half is in
-		// the template already, frozen, when the app comes from a release.
-		env := hostEnvironment(ctx, appToStart.FullPath, cfg).Merge(appEnv)
-		before, _ := appToStart.AppComposeFilePath().ReadFile()
-		prj, err := provisioner.Render(ctx, &appToStart, env, appToStart.Secrets(bricksIndex))
-		if err != nil {
-			return err
-		}
+	appEnv := appEnvironment(ctx, appToStart, bricksIndex, modelsIndex, platform)
 
-		// Without a prepare, a start never fetches a missing image: it fails and asks for
-		// one first.
-		if !prepare {
-			if err := checkImages(ctx, docker, prj); err != nil {
-				return err
-			}
-		}
+	cb(StreamMessage{data: "python provisioning"})
+	provisionStartProgress := float32(0.0)
+	if _, ok := appToStart.GetSketchPath(); ok {
+		provisionStartProgress = 10.0
+	}
 
-		cb(StreamMessage{data: "python downloading"})
+	cb(StreamMessage{progress: &Progress{Name: "python provisioning", Progress: provisionStartProgress}})
 
-		// Containers created by a previous start of the same configuration are started
-		// as they are: compose is only needed to create or recreate them.
-		if after, _ := appToStart.AppComposeFilePath().ReadFile(); bytes.Equal(before, after) {
-			containers, err := getAppContainers(ctx, docker.Client(), prj.Name)
-			if err != nil {
-				return err
-			}
-			if containers.HasMain() {
-				slog.Debug("starting the existing app containers", slog.String("project", prj.Name))
-				if err := startAppContainers(ctx, docker.Client(), containers, cb); err != nil {
-					return err
-				}
-				cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
-				return nil
-			}
-		}
-
-		if err := dockerhelper.PullImages(ctx, docker.Client(), dockerhelper.ComposeImages(prj),
-			func(line string) { cb(StreamMessage{data: line}) },
-			func(label string, curr, total int64) {
-				// Downloading the images is from 20% to 80% of the start of an app.
-				cb(StreamMessage{progress: &Progress{Name: label, Progress: 20 + float32(curr*60/total)}})
-			}); err != nil {
-			return err
-		}
-
-		slog.Debug("starting app", slog.String("project", prj.Name))
-		line := func(line string) { cb(StreamMessage{data: line}) }
-		err = dockerhelper.ComposeUp(ctx, docker, prj, line)
-		if errors.Is(err, dockerhelper.ErrNetwork) {
-			// The board is likely out of subnets: the apps give up the networks they
-			// keep, and this app is started once more.
-			cb(StreamMessage{data: "Could not create the network, freeing the ones the apps keep"})
-			appContainers, pruneErr := dockerhelper.Containers(ctx, docker.Client(), DockerAppLabel+"=true")
-			if pruneErr != nil {
-				slog.Warn("failed to list the app containers", slog.String("error", pruneErr.Error()))
-			}
-			freed, pruneErr := dockerhelper.PruneNetworks(ctx, docker.Client(), ourNetworks(appContainers))
-			if pruneErr != nil {
-				slog.Warn("failed to free the networks of the apps", slog.String("error", pruneErr.Error()))
-			}
-			slog.Debug("freed app networks", slog.Int("count", freed))
-			err = dockerhelper.ComposeUp(ctx, docker, prj, line)
-		}
-		if err != nil {
+	// The compose files of a release are the ones the build resolved for the
+	// target board: resolving them again here would replace them.
+	if !isRelease {
+		// An app is provisioned every time it is started: it is editable, so its
+		// bricks, model or ports may have changed since the last run.
+		if err := provisioner.Resolve(&appToStart, appToStart.ProvisioningStateDir(), bricksIndex, servicesIndex, cfg, appEnv, platform); err != nil {
 			return err
 		}
 	}
+
+	// What the template references, answered on this board. The app half is in
+	// the template already, frozen, when the app comes from a release.
+	env := hostEnvironment(ctx, appToStart.FullPath, cfg).Merge(appEnv)
+	before, _ := appToStart.AppComposeFilePath().ReadFile()
+	prj, err := provisioner.Render(ctx, &appToStart, env, appToStart.Secrets(bricksIndex))
+	if err != nil {
+		return err
+	}
+	after, _ := appToStart.AppComposeFilePath().ReadFile()
+	changed := !bytes.Equal(before, after)
+
+	var launcherEnv map[string]string
+	if mode == launcherMode {
+		launcherEnv = splitMainService(prj)
+	}
+
+	// Without a prepare, a start never fetches a missing image: it fails and asks for
+	// one first.
+	if !prepare {
+		if err := checkImages(ctx, docker, prj); err != nil {
+			return err
+		}
+	}
+
+	cb(StreamMessage{data: "python downloading"})
+
+	containers, err := getAppContainers(ctx, docker.Client(), prj.Name)
+	if err != nil {
+		return err
+	}
+
+	if mode == launcherMode {
+		if err := pullAppImages(ctx, docker, prj, cb); err != nil {
+			return err
+		}
+		if err := startWithLauncher(ctx, docker, appToStart, cfg, launcherEnv, prj, changed, containers, replaced, cb); err != nil {
+			return err
+		}
+		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
+		return nil
+	}
+
+	// Containers created by a previous start of the same configuration are started
+	// as they are: compose is only needed to create or recreate them.
+	if !changed && containers.HasMain() {
+		slog.Debug("starting the existing app containers", slog.String("project", prj.Name))
+		if err := startAppContainers(ctx, docker.Client(), containers, waitContainerReady, cb); err != nil {
+			return err
+		}
+		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
+		return nil
+	}
+
+	if err := pullAppImages(ctx, docker, prj, cb); err != nil {
+		return err
+	}
+	if err := composeUpApp(ctx, docker, prj, cb); err != nil {
+		return err
+	}
 	cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
 	return nil
+}
+
+// splitMainService takes the main service out of the project, leaving the sidecars on the network
+// shared with the launcher, and returns the environment the main service would run the app with.
+func splitMainService(prj *types.Project) map[string]string {
+	envs := make(map[string]string)
+	if main, ok := prj.Services[mainServiceName]; ok {
+		for k, v := range main.Environment {
+			if v != nil {
+				envs[k] = *v
+			}
+		}
+		delete(prj.Services, mainServiceName)
+	}
+	prj.Networks = types.Networks{"default": types.NetworkConfig{Name: launcherNetwork, External: true}}
+	return envs
+}
+
+// pullAppImages downloads the images of the project the board does not have.
+func pullAppImages(ctx context.Context, docker command.Cli, prj *types.Project, cb func(StreamMessage)) error {
+	return dockerhelper.PullImages(ctx, docker.Client(), dockerhelper.ComposeImages(prj),
+		func(line string) { cb(StreamMessage{data: line}) },
+		func(label string, curr, total int64) {
+			// Downloading the images is from 20% to 80% of the start of an app.
+			cb(StreamMessage{progress: &Progress{Name: label, Progress: 20 + float32(curr*60/total)}})
+		})
+}
+
+// composeUpApp creates or recreates the containers of the project and starts them.
+func composeUpApp(ctx context.Context, docker command.Cli, prj *types.Project, cb func(StreamMessage)) error {
+	slog.Debug("starting app", slog.String("project", prj.Name))
+	line := func(line string) { cb(StreamMessage{data: line}) }
+	err := dockerhelper.ComposeUp(ctx, docker, prj, line)
+	if errors.Is(err, dockerhelper.ErrNetwork) {
+		// The board is likely out of subnets: the apps give up the networks they
+		// keep, and this app is started once more.
+		cb(StreamMessage{data: "Could not create the network, freeing the ones the apps keep"})
+		appContainers, pruneErr := dockerhelper.Containers(ctx, docker.Client(), DockerAppLabel+"=true")
+		if pruneErr != nil {
+			slog.Warn("failed to list the app containers", slog.String("error", pruneErr.Error()))
+		}
+		freed, pruneErr := dockerhelper.PruneNetworks(ctx, docker.Client(), ourNetworks(appContainers))
+		if pruneErr != nil {
+			slog.Warn("failed to free the networks of the apps", slog.String("error", pruneErr.Error()))
+		}
+		slog.Debug("freed app networks", slog.Int("count", freed))
+		err = dockerhelper.ComposeUp(ctx, docker, prj, line)
+	}
+	return err
+}
+
+// startWithLauncher brings the sidecars to running, when Docker resolves their names, then has the
+// launcher start the app; the bricks retry until the sidecars accept connections. The previous
+// launcher app stops meanwhile, and the sidecars of the replaced apps go before the new ones come
+// up: apps often publish the same sidecar ports.
+func startWithLauncher(
+	ctx context.Context,
+	docker command.Cli,
+	appToStart app.ArduinoApp,
+	cfg config.Configuration,
+	envs map[string]string,
+	prj *types.Project,
+	changed bool,
+	containers appContainers,
+	replaced paths.PathList,
+	cb func(StreamMessage),
+) error {
+	var (
+		wg              sync.WaitGroup
+		previousStopErr error
+	)
+	stopping := time.Now()
+	var stopped time.Duration
+	wg.Go(func() {
+		previousStopErr = stopLauncherApp(ctx, cfg, nil)
+		stopped = time.Since(stopping)
+	})
+	sidecarsErr := stopReplacedApps(ctx, docker, replaced, cb)
+	if sidecarsErr == nil {
+		sidecarsErr = startSidecars(ctx, docker, prj, changed, containers, cb)
+	}
+	wg.Wait()
+
+	err := errors.Join(previousStopErr, sidecarsErr)
+	var started launcher.StartResponse
+	if err == nil {
+		started, err = newLauncherClient(cfg).WithTimeout(launcherStartTimeout).Start(ctx, appToStart.FullPath.String(), envs)
+	}
+	if err != nil {
+		// Half an app is of no use: stop what started
+		if stopErr := stopAppProcesses(ctx, docker, appToStart, cfg, "stop", nil); stopErr != nil {
+			slog.Warn("failed to stop the app after a failed start", slog.String("error", stopErr.Error()))
+		}
+		return err
+	}
+
+	if err := setLauncherWantedApp(cfg, appToStart.FullPath); err != nil {
+		slog.Warn("failed to record the launcher app", slog.String("error", err.Error()))
+	}
+	slog.Info("app started by the launcher", slog.String("app", appToStart.FullPath.String()), slog.Int("pid", started.PID),
+		slog.Bool("warm", started.Warm), slog.Duration("previous_stop", stopped), slog.Float64("fork_ms", started.Timings.ForkMs))
+	cb(StreamMessage{data: fmt.Sprintf("App started by the launcher: %s runner, warm %t, previous app stopped in %d ms, forked in %.0f ms",
+		started.Runner, started.Warm, stopped.Milliseconds(), started.Timings.ForkMs)})
+	return nil
+}
+
+// startSidecars runs the sidecars of the app project, reusing their containers when the project
+// is unchanged, and returns once they run.
+func startSidecars(
+	ctx context.Context,
+	docker command.Cli,
+	prj *types.Project,
+	changed bool,
+	containers appContainers,
+	cb func(StreamMessage),
+) error {
+	// A main container is left by a start in classic mode: its exit status would tell the app failed
+	if main, ok := containers[mainServiceName]; ok {
+		if err := removeContainers(ctx, docker.Client(), []container.Summary{main}); err != nil {
+			return err
+		}
+		delete(containers, mainServiceName)
+	}
+	// Without sidecars what is left are orphans
+	if len(prj.Services) == 0 {
+		return removeContainers(ctx, docker.Client(), slices.Collect(maps.Values(containers)))
+	}
+	if !changed && len(containers) > 0 {
+		slog.Debug("starting the existing sidecar containers")
+		err := startAppContainers(ctx, docker.Client(), containers, waitContainerRunning, cb)
+		if err == nil {
+			return nil
+		}
+		// e.g. the shared network was recreated with the launcher
+		slog.Warn("failed to start the existing sidecars, recreating them", slog.String("error", err.Error()))
+		if err := removeContainers(ctx, docker.Client(), slices.Collect(maps.Values(containers))); err != nil {
+			return err
+		}
+	}
+	if err := composeUpApp(ctx, docker, prj, cb); err != nil {
+		return err
+	}
+
+	// up returns once it started the containers: this catches one that exited right away
+	created, err := getAppContainers(ctx, docker.Client(), prj.Name)
+	if err != nil {
+		return err
+	}
+	return waitContainersRunning(ctx, docker.Client(), created)
+}
+
+// stopOtherFailedApps rejects the start if another app is running/starting; otherwise it stops
+// any *other* failed app so its sibling services release resources (ports, volumes) that could
+// conflict with the app we're starting.
+func stopOtherFailedApps(ctx context.Context, docker command.Cli, appToStart app.ArduinoApp, cfg config.Configuration, platform platform.Platform) error {
+	appsStatus, err := getAppsStatus(ctx, docker.Client(), cfg)
+	if err != nil {
+		return fmt.Errorf("failed to list apps status: %w", err)
+	}
+	for _, s := range appsStatus {
+		switch s.Status {
+		case StatusRunning, StatusStarting:
+			runningApp, err := app.Load(s.AppPath)
+			if err != nil {
+				return fmt.Errorf("failed to load running app: %w", err)
+			}
+			return fmt.Errorf("app %q is running", runningApp.Name)
+		case StatusFailed:
+			if s.AppPath.EqualsTo(appToStart.FullPath) {
+				continue
+			}
+			failedApp, err := app.Load(s.AppPath)
+			if err != nil {
+				slog.Warn("skipping failed app: cannot load", slog.String("path", s.AppPath.String()), slog.String("error", err.Error()))
+				continue
+			}
+			slog.Debug("stopping failed app before starting a new one", slog.String("name", failedApp.Name))
+			if err := stopAppWithCmd(ctx, docker, platform, failedApp, cfg, "stop", nil); err != nil {
+				slog.Warn("failed to stop failed app", slog.String("name", failedApp.Name), slog.String("error", err.Error()))
+			}
+		}
+	}
+	return nil
+}
+
+// otherAppsWithRunningContainers lists the apps other than appPath with a running container.
+func otherAppsWithRunningContainers(ctx context.Context, docker dockerClient.APIClient, appPath *paths.Path) (paths.PathList, error) {
+	containers, err := listAppContainers(ctx, docker, DockerAppLabel+"=true")
+	if err != nil {
+		return nil, err
+	}
+	var result paths.PathList
+	for _, c := range containers {
+		if other := paths.New(c.Labels[DockerAppPathLabel]); c.State == container.StateRunning && other != nil && !other.EqualsTo(appPath) {
+			result.AddIfMissing(other)
+		}
+	}
+	return result, nil
+}
+
+// stopReplacedApps stops the containers of the apps the launcher replaces.
+func stopReplacedApps(ctx context.Context, docker command.Cli, replaced paths.PathList, cb func(StreamMessage)) error {
+	var errs error
+	for _, appPath := range replaced {
+		slog.Debug("stopping the containers of the replaced app", slog.String("path", appPath.String()))
+		list, err := listAppContainers(ctx, docker.Client(), DockerAppPathLabel+"="+appPath.String())
+		if err != nil {
+			errs = errors.Join(errs, err)
+			continue
+		}
+		errs = errors.Join(errs, stopAppContainers(ctx, docker.Client(), byService(list), DefaultDockerStopTimeoutSeconds, cb))
+	}
+	return errs
 }
 
 func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.Platform, app app.ArduinoApp, cfg config.Configuration, cmd string, cb func(StreamMessage)) error {
@@ -336,7 +574,7 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 
 	if _, ok := app.GetSketchPath(); ok {
 		// Before stopping the microcontroller we want to make sure that the app was running.
-		running, err := getRunningApp(ctx, docker.Client())
+		running, err := getRunningApp(ctx, docker.Client(), cfg)
 		if err != nil {
 			return err
 		}
@@ -353,34 +591,77 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 		}
 	}
 
-	if app.MainPythonFile != nil {
-		// The project name stops the app without its compose file, which an update
-		// can remove, and finds what an older cli started just the same.
-		projectName := composeProjectName(app.FullPath, cfg.AppsDir())
-		line := func(line string) { cb(StreamMessage{data: line}) }
-		var err error
-		switch cmd {
-		case "down":
-			err = dockerhelper.ComposeDown(ctx, docker, projectName, line)
-		default:
-			var containers appContainers
-			if containers, err = getAppContainers(ctx, docker.Client(), projectName); err == nil {
-				err = stopAppContainers(ctx, docker.Client(), containers, DefaultDockerStopTimeoutSeconds, cb)
-			}
-		}
-		if err != nil {
-			return err
-		}
+	if err := stopAppProcesses(ctx, docker, app, cfg, cmd, cb); err != nil {
+		return err
 	}
 	cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
 	return nil
 }
 
+// stopAppProcesses stops the app launcher child, then the app project containers, main included
+// when it ran in classic mode. cmd "down" also removes the containers.
+func stopAppProcesses(ctx context.Context, docker command.Cli, app app.ArduinoApp, cfg config.Configuration, cmd string, cb func(StreamMessage)) error {
+	if cb == nil {
+		cb = func(StreamMessage) {}
+	}
+	if app.MainPythonFile == nil {
+		return nil
+	}
+	if err := stopLauncherApp(ctx, cfg, app.FullPath); err != nil {
+		return err
+	}
+
+	// The project name stops the app without its compose file, which an update
+	// can remove, and finds what an older cli started just the same.
+	projectName := composeProjectName(app.FullPath, cfg.AppsDir())
+	if cmd == "down" {
+		return dockerhelper.ComposeDown(ctx, docker, projectName, func(line string) { cb(StreamMessage{data: line}) })
+	}
+	containers, err := getAppContainers(ctx, docker.Client(), projectName)
+	if err != nil {
+		return err
+	}
+	return stopAppContainers(ctx, docker.Client(), containers, DefaultDockerStopTimeoutSeconds, cb)
+}
+
+// stopLauncherApp stops the app if the launcher runs it, every app when appPath is nil. An
+// unreachable launcher runs nothing.
+func stopLauncherApp(ctx context.Context, cfg config.Configuration, appPath *paths.Path) error {
+	if launcherDisabled() {
+		return nil
+	}
+	var target string
+	if appPath != nil {
+		target = appPath.String()
+	}
+	resp, err := newLauncherClient(cfg).WithTimeout(launcherStartTimeout).Stop(ctx, target)
+	var launcherErr *launcher.Error
+	switch {
+	case errors.As(err, &launcherErr):
+		return fmt.Errorf("failed to stop the app: %w", err)
+	case err != nil:
+		slog.Debug("app launcher unreachable, nothing to stop", slog.String("error", err.Error()))
+	default:
+		for _, s := range resp.Stopped {
+			slog.Debug("app stopped by the launcher", slog.String("app", s.App), slog.Int("pid", s.PID), slog.Any("exit_code", s.ExitCode), slog.Any("signal", s.Signal))
+		}
+	}
+	return clearLauncherWantedApp(cfg, appPath)
+}
+
 func StopApp(ctx context.Context, dockerClient command.Cli, platform platform.Platform, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
-	return stopAppWithCmd(ctx, dockerClient, platform, app, cfg, "stop", cb)
+	return withAppsLock(ctx, cfg, func() error {
+		return stopAppWithCmd(ctx, dockerClient, platform, app, cfg, "stop", cb)
+	})
 }
 
 func StopAndDestroyApp(ctx context.Context, dockerClient command.Cli, platform platform.Platform, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
+	return withAppsLock(ctx, cfg, func() error {
+		return stopAndDestroyApp(ctx, dockerClient, platform, app, cfg, cb)
+	})
+}
+
+func stopAndDestroyApp(ctx context.Context, dockerClient command.Cli, platform platform.Platform, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
 	if err := stopAppWithCmd(ctx, dockerClient, platform, app, cfg, "down", cb); err != nil {
 		return err
 	}
@@ -430,22 +711,36 @@ func RestartApp(
 	verbose bool,
 	cb func(StreamMessage),
 ) error {
-	runningApp, err := getRunningApp(ctx, docker.Client())
-	if err != nil {
-		return err
+	if cb == nil {
+		cb = func(StreamMessage) {}
 	}
-
-	if runningApp != nil {
-		if runningApp.FullPath.String() != appToStart.FullPath.String() {
-			return fmt.Errorf("another app %q is running", runningApp.Name)
-		}
-
-		if err := StopApp(ctx, docker, platform, *runningApp, cfg, cb); err != nil {
+	prepare := !appToStart.IsRelease()
+	return withAppsLock(ctx, cfg, func() error {
+		appBricks := appToStart.Bricks(bricksIndex)
+		appModels := appToStart.Models(modelsIndex, docker, cfg, platform)
+		if err := checkApp(ctx, docker, appToStart, appBricks, appModels, servicesIndex, platform, prepare, cb); err != nil {
 			return err
 		}
-	}
+		mode := selectRunMode(ctx, docker, bricksIndex, appToStart, cfg, platform, cb)
 
-	return StartApp(ctx, docker, provisioner, modelsIndex, bricksIndex, servicesIndex, appToStart, cfg, platform, verbose, !appToStart.IsRelease(), cb)
+		// The launcher restarts the app in place, leaving its sidecars running
+		if mode == classicMode {
+			runningApp, err := getRunningApp(ctx, docker.Client(), cfg)
+			if err != nil {
+				return err
+			}
+			if runningApp != nil {
+				if runningApp.FullPath.String() != appToStart.FullPath.String() {
+					return fmt.Errorf("another app %q is running", runningApp.Name)
+				}
+				if err := stopAppWithCmd(ctx, docker, platform, *runningApp, cfg, "stop", cb); err != nil {
+					return err
+				}
+			}
+		}
+
+		return startApp(ctx, docker, provisioner, appModels, appBricks, servicesIndex, appToStart, cfg, platform, verbose, prepare, mode, cb)
+	})
 }
 
 func StartDefaultApp(
@@ -534,7 +829,7 @@ func ListApps(
 	}
 
 	// Get the status of all apps (it will return only the apps that have been started at least once)
-	appsStatus, err := getAppsStatus(ctx, docker.Client())
+	appsStatus, err := getAppsStatus(ctx, docker.Client(), cfg)
 	if err != nil {
 		slog.Error("unable to get running app", slog.String("error", err.Error()))
 	}
@@ -631,10 +926,11 @@ func ListActiveApps(
 	ctx context.Context,
 	docker command.Cli,
 	idProvider *appid.Provider,
+	cfg config.Configuration,
 ) ([]AppInfo, error) {
 	// The statuses returned by getAppsStatus come only from Docker containers that have
 	// been started, so StatusUninitialized is never present.
-	appsStatus, err := getAppsStatus(ctx, docker.Client())
+	appsStatus, err := getAppsStatus(ctx, docker.Client(), cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list apps status: %w", err)
 	}
@@ -729,7 +1025,7 @@ func AppDetails(
 	var status Status
 	go func() {
 		defer wg.Done()
-		app, err := getAppStatus(ctx, docker.Client(), userApp)
+		app, err := getAppStatus(ctx, docker.Client(), userApp, cfg)
 		if err != nil {
 			slog.Warn("unable to get app status", slog.String("error", err.Error()), slog.String("path", userApp.FullPath.String()))
 			status = StatusStopped

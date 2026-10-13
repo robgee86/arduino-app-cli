@@ -8,7 +8,10 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 
 	rpc "github.com/arduino/arduino-cli/rpc/cc/arduino/cli/commands/v1"
@@ -21,6 +24,7 @@ import (
 	"github.com/arduino/arduino-app-cli/internal/dockerhelper"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/app"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
+	"github.com/arduino/arduino-app-cli/internal/orchestrator/launcher"
 	"github.com/arduino/arduino-app-cli/internal/platform"
 )
 
@@ -93,49 +97,127 @@ func parseAppStatus(containers []container.Summary) []AppStatusInfo {
 	return apps
 }
 
-func getAppsStatus(
-	ctx context.Context,
-	docker dockerClient.APIClient,
-) ([]AppStatusInfo, error) {
-	containers, err := dockerhelper.Containers(ctx, docker, DockerAppLabel+"=true")
+// launcherView is what the launcher runs, and the app it should be running.
+type launcherView struct {
+	children []launcher.Child
+	wanted   *paths.Path
+}
+
+// readLauncherView asks the launcher for its children. An unreachable launcher runs nothing.
+func readLauncherView(ctx context.Context, cfg config.Configuration) launcherView {
+	if launcherDisabled() {
+		return launcherView{}
+	}
+	view := launcherView{wanted: readLauncherWantedApp(cfg)}
+	status, err := newLauncherClient(cfg).Status(ctx)
+	if err != nil {
+		slog.Debug("app launcher status unavailable", slog.String("error", err.Error()))
+		return view
+	}
+	view.children = status.Children
+	return view
+}
+
+// mergeAppStatus combines the app containers with the launcher children. An app with a main
+// container keeps the container status. Otherwise an app neither run nor wanted is stopped, and
+// a failed sidecar or a wanted app without child makes it failed.
+func mergeAppStatus(containers []container.Summary, view launcherView) []AppStatusInfo {
+	classic := make(map[string]bool)
+	for _, c := range containers {
+		if c.Labels[DockerAppMainLabel] == "true" {
+			classic[c.Labels[DockerAppPathLabel]] = true
+		}
+	}
+	sidecars := make(map[string]Status)
+	for _, s := range parseAppStatus(containers) {
+		sidecars[s.AppPath.String()] = s.Status
+	}
+	children := make(map[string]launcher.Child, len(view.children))
+	for _, c := range view.children {
+		children[filepath.Clean(c.App)] = c
+	}
+
+	appPaths := slices.Concat(slices.Collect(maps.Keys(sidecars)), slices.Collect(maps.Keys(children)))
+	if view.wanted != nil {
+		appPaths = append(appPaths, view.wanted.String())
+	}
+	slices.Sort(appPaths)
+
+	result := make([]AppStatusInfo, 0, len(appPaths))
+	for _, appPath := range slices.Compact(appPaths) {
+		status := sidecars[appPath]
+		if !classic[appPath] {
+			child, running := children[appPath]
+			wanted := view.wanted != nil && view.wanted.String() == appPath
+			status = launcherAppStatus(status, child, running, wanted)
+		}
+		result = append(result, AppStatusInfo{AppPath: paths.New(appPath), Status: status})
+	}
+	return result
+}
+
+// launcherAppStatus is the status of an app run by the launcher; sidecars is empty without sidecars.
+func launcherAppStatus(sidecars Status, child launcher.Child, hasChild, wanted bool) Status {
+	switch {
+	// Nothing should run: the sidecar exit codes come from the stop, a runner may exit 0 on SIGTERM
+	case !hasChild && !wanted:
+		return StatusStopped
+	// A failed sidecar, or a wanted app whose child is gone
+	case sidecars == StatusFailed, !hasChild:
+		return StatusFailed
+	case child.State == launcher.StateStopping:
+		return StatusStopping
+	case sidecars == StatusStarting:
+		return StatusStarting
+	default:
+		return StatusRunning
+	}
+}
+
+func listAppContainers(ctx context.Context, docker dockerClient.APIClient, filter string) ([]container.Summary, error) {
+	containers, err := dockerhelper.Containers(ctx, docker, filter)
 	if err != nil {
 		return nil, err
 	}
-	if len(containers) == 0 {
-		return nil, nil
+	return containers, nil
+}
+
+func getAppsStatus(
+	ctx context.Context,
+	docker dockerClient.APIClient,
+	cfg config.Configuration,
+) ([]AppStatusInfo, error) {
+	containers, err := listAppContainers(ctx, docker, DockerAppLabel+"=true")
+	if err != nil {
+		return nil, err
 	}
-	return parseAppStatus(containers), nil
+	return mergeAppStatus(containers, readLauncherView(ctx, cfg)), nil
 }
 
 func getAppStatus(
 	ctx context.Context,
 	docker dockerClient.APIClient,
 	app app.ArduinoApp,
+	cfg config.Configuration,
 ) (AppStatusInfo, error) {
-	containers, err := dockerhelper.Containers(ctx, docker, DockerAppPathLabel+"="+app.FullPath.String())
+	containers, err := listAppContainers(ctx, docker, DockerAppPathLabel+"="+app.FullPath.String())
 	if err != nil {
 		return AppStatusInfo{}, err
 	}
-
-	if len(containers) == 0 {
-		return AppStatusInfo{
-			AppPath: app.FullPath,
-			Status:  StatusUninitialized,
-		}, nil
+	for _, s := range mergeAppStatus(containers, readLauncherView(ctx, cfg)) {
+		if s.AppPath.EqualsTo(app.FullPath) {
+			return s, nil
+		}
 	}
-
-	appInfo := parseAppStatus(containers)
-	if len(appInfo) == 0 {
-		return AppStatusInfo{}, fmt.Errorf("no app status found for app at path %s", app.FullPath)
-	}
-	return appInfo[0], nil
+	return AppStatusInfo{AppPath: app.FullPath, Status: StatusUninitialized}, nil
 }
 
 func getRunningApp(
 	ctx context.Context,
 	docker dockerClient.APIClient,
+	cfg config.Configuration,
 ) (*app.ArduinoApp, error) {
-	apps, err := getAppsStatus(ctx, docker)
+	apps, err := getAppsStatus(ctx, docker, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get running apps: %w", err)
 	}

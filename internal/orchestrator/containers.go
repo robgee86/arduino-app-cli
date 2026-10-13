@@ -42,11 +42,15 @@ func getAppContainers(ctx context.Context, docker dockerClient.APIClient, projec
 	if err != nil {
 		return nil, fmt.Errorf("failed to list the app containers: %w", err)
 	}
-	result := make(appContainers, len(containers.Items))
-	for _, c := range containers.Items {
+	return byService(containers.Items), nil
+}
+
+func byService(containers []container.Summary) appContainers {
+	result := make(appContainers, len(containers))
+	for _, c := range containers {
 		result[c.Labels[composeServiceLabel]] = c
 	}
-	return result, nil
+	return result
 }
 
 // HasMain tells whether the app was created before, i.e. a start can reuse its containers.
@@ -65,15 +69,18 @@ func (c appContainers) sidecars() []container.Summary {
 	return result
 }
 
-// startAppContainers starts the existing containers of an app: the sidecars together,
-// each waited until healthy, then the main one, as compose does for depends_on.
-func startAppContainers(ctx context.Context, docker dockerClient.APIClient, containers appContainers, cb func(StreamMessage)) error {
+// containerWait returns once a started container reached the state its dependents need.
+type containerWait func(ctx context.Context, docker dockerClient.APIClient, id string) error
+
+// startAppContainers starts the existing containers of an app: the sidecars together, each
+// waited by ready, then the main one when there is one, as compose does for depends_on.
+func startAppContainers(ctx context.Context, docker dockerClient.APIClient, containers appContainers, ready containerWait, cb func(StreamMessage)) error {
 	if err := forEachContainer(containers.sidecars(), func(c container.Summary) error {
 		cb(StreamMessage{data: fmt.Sprintf("Container %s Starting", containerName(c))})
 		if _, err := docker.ContainerStart(ctx, c.ID, dockerClient.ContainerStartOptions{}); err != nil {
 			return fmt.Errorf("failed to start %s: %w", containerName(c), err)
 		}
-		if err := waitContainerReady(ctx, docker, c.ID); err != nil {
+		if err := ready(ctx, docker, c.ID); err != nil {
 			return fmt.Errorf("%s did not become ready: %w", containerName(c), err)
 		}
 		cb(StreamMessage{data: fmt.Sprintf("Container %s Started", containerName(c))})
@@ -82,7 +89,10 @@ func startAppContainers(ctx context.Context, docker dockerClient.APIClient, cont
 		return err
 	}
 
-	main := containers[mainServiceName]
+	main, ok := containers[mainServiceName]
+	if !ok {
+		return nil
+	}
 	cb(StreamMessage{data: fmt.Sprintf("Container %s Starting", containerName(main))})
 	if _, err := docker.ContainerStart(ctx, main.ID, dockerClient.ContainerStartOptions{}); err != nil {
 		return fmt.Errorf("failed to start %s: %w", containerName(main), err)
@@ -113,6 +123,17 @@ func stopAppContainers(ctx context.Context, docker dockerClient.APIClient, conta
 	return forEachContainer(containers.sidecars(), stop)
 }
 
+// removeContainers force-removes containers, running or not.
+func removeContainers(ctx context.Context, docker dockerClient.APIClient, containers []container.Summary) error {
+	return forEachContainer(containers, func(c container.Summary) error {
+		slog.Debug("removing container", slog.String("container", containerName(c)))
+		if _, err := docker.ContainerRemove(ctx, c.ID, dockerClient.ContainerRemoveOptions{Force: true}); err != nil {
+			return fmt.Errorf("failed to remove %s: %w", containerName(c), err)
+		}
+		return nil
+	})
+}
+
 // waitContainerReady returns once a container with a healthcheck is healthy, or as soon
 // as it runs when it has none. It fails when the container stops meanwhile.
 func waitContainerReady(ctx context.Context, docker dockerClient.APIClient, id string) error {
@@ -140,6 +161,45 @@ func waitContainerReady(ctx context.Context, docker dockerClient.APIClient, id s
 		case <-time.After(readyPollInterval):
 		}
 	}
+}
+
+// waitContainerRunning returns once the container runs, when Docker resolves its name on its
+// networks. It fails when the container exits meanwhile.
+func waitContainerRunning(ctx context.Context, docker dockerClient.APIClient, id string) error {
+	deadline := time.Now().Add(sidecarReadyTimeout)
+	for {
+		inspected, err := docker.ContainerInspect(ctx, id, dockerClient.ContainerInspectOptions{})
+		if err != nil {
+			return err
+		}
+		info := inspected.Container
+		switch {
+		case info.State == nil:
+			return errors.New("the container has no state")
+		case info.State.Running && !info.State.Restarting:
+			return nil
+		case !info.State.Running && !info.State.Restarting && info.State.Status != container.StateCreated:
+			return fmt.Errorf("the container %s with code %d", info.State.Status, info.State.ExitCode)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("still %s after %s", info.State.Status, sidecarReadyTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(readyPollInterval):
+		}
+	}
+}
+
+// waitContainersRunning waits for every container to run, see waitContainerRunning.
+func waitContainersRunning(ctx context.Context, docker dockerClient.APIClient, containers appContainers) error {
+	return forEachContainer(containers.sidecars(), func(c container.Summary) error {
+		if err := waitContainerRunning(ctx, docker, c.ID); err != nil {
+			return fmt.Errorf("%s is not running: %w", containerName(c), err)
+		}
+		return nil
+	})
 }
 
 // forEachContainer runs fn on every container concurrently and returns the first error.
