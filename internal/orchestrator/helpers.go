@@ -105,9 +105,6 @@ type launcherView struct {
 
 // readLauncherView asks the launcher for its children. An unreachable launcher runs nothing.
 func readLauncherView(ctx context.Context, cfg config.Configuration) launcherView {
-	if launcherDisabled() {
-		return launcherView{}
-	}
 	view := launcherView{wanted: readLauncherWantedApp(cfg)}
 	status, err := newLauncherClient(cfg).Status(ctx)
 	if err != nil {
@@ -118,16 +115,9 @@ func readLauncherView(ctx context.Context, cfg config.Configuration) launcherVie
 	return view
 }
 
-// mergeAppStatus combines the app containers with the launcher children. An app with a main
-// container keeps the container status. Otherwise an app neither run nor wanted is stopped, and
-// a failed sidecar or a wanted app without child makes it failed.
+// mergeAppStatus combines the app sidecars with the launcher children. An app neither run nor
+// wanted is idle: its sidecar exit codes come from the stop, and a runner may exit 0 on SIGTERM.
 func mergeAppStatus(containers []container.Summary, view launcherView) []AppStatusInfo {
-	classic := make(map[string]bool)
-	for _, c := range containers {
-		if c.Labels[DockerAppMainLabel] == "true" {
-			classic[c.Labels[DockerAppPathLabel]] = true
-		}
-	}
 	sidecars := make(map[string]Status)
 	for _, s := range parseAppStatus(containers) {
 		sidecars[s.AppPath.String()] = s.Status
@@ -145,23 +135,21 @@ func mergeAppStatus(containers []container.Summary, view launcherView) []AppStat
 
 	result := make([]AppStatusInfo, 0, len(appPaths))
 	for _, appPath := range slices.Compact(appPaths) {
-		status := sidecars[appPath]
-		if !classic[appPath] {
-			child, running := children[appPath]
-			wanted := view.wanted != nil && view.wanted.String() == appPath
-			status = launcherAppStatus(status, child, running, wanted)
+		p := paths.New(appPath)
+		child, running := children[appPath]
+		wanted := view.wanted != nil && view.wanted.EqualsTo(p)
+		status := idleAppStatus(p)
+		if running || wanted {
+			status = launcherAppStatus(sidecars[appPath], child, running)
 		}
-		result = append(result, AppStatusInfo{AppPath: paths.New(appPath), Status: status})
+		result = append(result, AppStatusInfo{AppPath: p, Status: status})
 	}
 	return result
 }
 
-// launcherAppStatus is the status of an app run by the launcher; sidecars is empty without sidecars.
-func launcherAppStatus(sidecars Status, child launcher.Child, hasChild, wanted bool) Status {
+// launcherAppStatus is the status of an app the launcher runs or should run; sidecars is empty without sidecars.
+func launcherAppStatus(sidecars Status, child launcher.Child, hasChild bool) Status {
 	switch {
-	// Nothing should run: the sidecar exit codes come from the stop, a runner may exit 0 on SIGTERM
-	case !hasChild && !wanted:
-		return StatusStopped
 	// A failed sidecar, or a wanted app whose child is gone
 	case sidecars == StatusFailed, !hasChild:
 		return StatusFailed
@@ -172,6 +160,15 @@ func launcherAppStatus(sidecars Status, child launcher.Child, hasChild, wanted b
 	default:
 		return StatusRunning
 	}
+}
+
+// idleAppStatus is the status of an app that runs nothing: stopped once the CLI provisioned or
+// ran it, which creates its .cache folder, uninitialized before.
+func idleAppStatus(appPath *paths.Path) Status {
+	if isDir, _ := appPath.Join(".cache").IsDirCheck(); isDir {
+		return StatusStopped
+	}
+	return StatusUninitialized
 }
 
 func listAppContainers(ctx context.Context, docker dockerClient.APIClient, filter string) ([]container.Summary, error) {
@@ -209,7 +206,7 @@ func getAppStatus(
 			return s, nil
 		}
 	}
-	return AppStatusInfo{AppPath: app.FullPath, Status: StatusUninitialized}, nil
+	return AppStatusInfo{AppPath: app.FullPath, Status: idleAppStatus(app.FullPath)}, nil
 }
 
 func getRunningApp(

@@ -116,8 +116,13 @@ func StartApp(
 		if err := checkApp(ctx, docker, appToStart, appBricks, appModels, servicesIndex, platform, prepare, cb); err != nil {
 			return err
 		}
-		mode := selectRunMode(ctx, docker, bricksIndex, appToStart, cfg, platform, cb)
-		return startApp(ctx, docker, provisioner, appModels, appBricks, servicesIndex, appToStart, cfg, platform, verbose, prepare, mode, cb)
+		if appToStart.MainPythonFile != nil {
+			// The installed bricks only: their ports are the ones the launcher forwards
+			if err := prepareLauncher(ctx, docker, bricksIndex, appToStart, cfg, platform, cb); err != nil {
+				return err
+			}
+		}
+		return startApp(ctx, docker, provisioner, appModels, appBricks, servicesIndex, appToStart, cfg, platform, verbose, prepare, cb)
 	})
 }
 
@@ -167,7 +172,9 @@ func checkApp(
 	return nil
 }
 
-// startApp starts an app checked by checkApp: bricksIndex and modelsIndex are the ones it is wired with.
+// startApp runs the app Python code in the launcher, which replaces the app it ran; the sidecars of
+// the other apps are stopped along the way. An app with only a sketch replaces them all the same.
+// bricksIndex and modelsIndex are the ones the app is wired with.
 func startApp(
 	ctx context.Context,
 	docker command.Cli,
@@ -180,21 +187,11 @@ func startApp(
 	platform platform.Platform,
 	verbose bool,
 	prepare bool,
-	mode runMode,
 	cb func(StreamMessage),
 ) error {
-	// The launcher replaces the other apps; their sidecars are stopped along the way
-	var replaced paths.PathList
-	switch mode {
-	case launcherMode:
-		var err error
-		if replaced, err = otherAppsWithRunningContainers(ctx, docker.Client(), appToStart.FullPath); err != nil {
-			return err
-		}
-	case classicMode:
-		if err := stopOtherFailedApps(ctx, docker, appToStart, cfg, platform); err != nil {
-			return err
-		}
+	replaced, err := otherAppsWithRunningContainers(ctx, docker.Client(), appToStart.FullPath)
+	if err != nil {
+		return err
 	}
 
 	cb(StreamMessage{data: fmt.Sprintf("Starting app %q", appToStart.Name)})
@@ -250,11 +247,8 @@ func startApp(
 	}
 
 	if appToStart.MainPythonFile == nil {
-		if mode == launcherMode {
-			// Nothing to start in the launcher: what it runs is replaced all the same
-			if err := errors.Join(stopLauncherApp(ctx, cfg, nil), stopReplacedApps(ctx, docker, replaced, cb)); err != nil {
-				return err
-			}
+		if err := errors.Join(stopLauncherApp(ctx, cfg, nil), stopReplacedApps(ctx, docker, replaced, cb)); err != nil {
+			return err
 		}
 		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
 		return nil
@@ -290,11 +284,8 @@ func startApp(
 	}
 	after, _ := appToStart.AppComposeFilePath().ReadFile()
 	changed := !bytes.Equal(before, after)
-
-	var launcherEnv map[string]string
-	if mode == launcherMode {
-		launcherEnv = splitMainService(prj)
-	}
+	// The launcher runs the app with the environment of its main service
+	launcherEnv := splitMainService(prj)
 
 	// Without a prepare, a start never fetches a missing image: it fails and asks for
 	// one first.
@@ -311,32 +302,10 @@ func startApp(
 		return err
 	}
 
-	if mode == launcherMode {
-		if err := pullAppImages(ctx, docker, prj, cb); err != nil {
-			return err
-		}
-		if err := startWithLauncher(ctx, docker, appToStart, cfg, launcherEnv, prj, changed, containers, replaced, cb); err != nil {
-			return err
-		}
-		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
-		return nil
-	}
-
-	// Containers created by a previous start of the same configuration are started
-	// as they are: compose is only needed to create or recreate them.
-	if !changed && containers.HasMain() {
-		slog.Debug("starting the existing app containers", slog.String("project", prj.Name))
-		if err := startAppContainers(ctx, docker.Client(), containers, waitContainerReady, cb); err != nil {
-			return err
-		}
-		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
-		return nil
-	}
-
 	if err := pullAppImages(ctx, docker, prj, cb); err != nil {
 		return err
 	}
-	if err := composeUpApp(ctx, docker, prj, cb); err != nil {
+	if err := startWithLauncher(ctx, docker, appToStart, cfg, launcherEnv, prj, changed, containers, replaced, cb); err != nil {
 		return err
 	}
 	cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
@@ -427,7 +396,9 @@ func startWithLauncher(
 	err := errors.Join(previousStopErr, sidecarsErr)
 	var started launcher.StartResponse
 	if err == nil {
+		cb(StreamMessage{data: "Starting the app in the launcher, preparing its dependencies when they changed"})
 		started, err = newLauncherClient(cfg).WithTimeout(launcherStartTimeout).Start(ctx, appToStart.FullPath.String(), envs)
+		err = launcherStartError(err)
 	}
 	if err != nil {
 		// Half an app is of no use: stop what started
@@ -441,10 +412,33 @@ func startWithLauncher(
 		slog.Warn("failed to record the launcher app", slog.String("error", err.Error()))
 	}
 	slog.Info("app started by the launcher", slog.String("app", appToStart.FullPath.String()), slog.Int("pid", started.PID),
-		slog.Bool("warm", started.Warm), slog.Duration("previous_stop", stopped), slog.Float64("fork_ms", started.Timings.ForkMs))
+		slog.Bool("warm", started.Warm), slog.Duration("previous_stop", stopped), slog.Bool("prepared", started.Prepared),
+		slog.Float64("prepare_ms", started.Timings.PrepareMs), slog.Float64("fork_ms", started.Timings.ForkMs))
+	if started.Prepared {
+		cb(StreamMessage{data: fmt.Sprintf("Preparing dependencies took %d ms", int64(started.Timings.PrepareMs))})
+	}
 	cb(StreamMessage{data: fmt.Sprintf("App started by the launcher: %s runner, warm %t, previous app stopped in %d ms, forked in %.0f ms",
 		started.Runner, started.Warm, stopped.Milliseconds(), started.Timings.ForkMs)})
 	return nil
+}
+
+// PrepareError is a failed install of the app dependencies, to show as is: its message ends with
+// the install output, which tells the user what to fix.
+type PrepareError struct {
+	Message string
+}
+
+func (e *PrepareError) Error() string {
+	return e.Message
+}
+
+// launcherStartError turns a failed dependency install into a PrepareError.
+func launcherStartError(err error) error {
+	var launcherErr *launcher.Error
+	if errors.As(err, &launcherErr) && launcherErr.Code == launcher.CodePrepareFailed {
+		return &PrepareError{Message: launcherErr.Message}
+	}
+	return err
 }
 
 // startSidecars runs the sidecars of the app project, reusing their containers when the project
@@ -457,7 +451,7 @@ func startSidecars(
 	containers appContainers,
 	cb func(StreamMessage),
 ) error {
-	// A main container is left by a start in classic mode: its exit status would tell the app failed
+	// A main container left by an older CLI: its exit status would tell the app failed
 	if main, ok := containers[mainServiceName]; ok {
 		if err := removeContainers(ctx, docker.Client(), []container.Summary{main}); err != nil {
 			return err
@@ -470,7 +464,7 @@ func startSidecars(
 	}
 	if !changed && len(containers) > 0 {
 		slog.Debug("starting the existing sidecar containers")
-		err := startAppContainers(ctx, docker.Client(), containers, waitContainerRunning, cb)
+		err := startAppContainers(ctx, docker.Client(), containers, cb)
 		if err == nil {
 			return nil
 		}
@@ -490,40 +484,6 @@ func startSidecars(
 		return err
 	}
 	return waitContainersRunning(ctx, docker.Client(), created)
-}
-
-// stopOtherFailedApps rejects the start if another app is running/starting; otherwise it stops
-// any *other* failed app so its sibling services release resources (ports, volumes) that could
-// conflict with the app we're starting.
-func stopOtherFailedApps(ctx context.Context, docker command.Cli, appToStart app.ArduinoApp, cfg config.Configuration, platform platform.Platform) error {
-	appsStatus, err := getAppsStatus(ctx, docker.Client(), cfg)
-	if err != nil {
-		return fmt.Errorf("failed to list apps status: %w", err)
-	}
-	for _, s := range appsStatus {
-		switch s.Status {
-		case StatusRunning, StatusStarting:
-			runningApp, err := app.Load(s.AppPath)
-			if err != nil {
-				return fmt.Errorf("failed to load running app: %w", err)
-			}
-			return fmt.Errorf("app %q is running", runningApp.Name)
-		case StatusFailed:
-			if s.AppPath.EqualsTo(appToStart.FullPath) {
-				continue
-			}
-			failedApp, err := app.Load(s.AppPath)
-			if err != nil {
-				slog.Warn("skipping failed app: cannot load", slog.String("path", s.AppPath.String()), slog.String("error", err.Error()))
-				continue
-			}
-			slog.Debug("stopping failed app before starting a new one", slog.String("name", failedApp.Name))
-			if err := stopAppWithCmd(ctx, docker, platform, failedApp, cfg, "stop", nil); err != nil {
-				slog.Warn("failed to stop failed app", slog.String("name", failedApp.Name), slog.String("error", err.Error()))
-			}
-		}
-	}
-	return nil
 }
 
 // otherAppsWithRunningContainers lists the apps other than appPath with a running container.
@@ -598,8 +558,8 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 	return nil
 }
 
-// stopAppProcesses stops the app launcher child, then the app project containers, main included
-// when it ran in classic mode. cmd "down" also removes the containers.
+// stopAppProcesses stops the app launcher child, then the sidecars of the app project. cmd "down"
+// also removes the sidecars and their volumes.
 func stopAppProcesses(ctx context.Context, docker command.Cli, app app.ArduinoApp, cfg config.Configuration, cmd string, cb func(StreamMessage)) error {
 	if cb == nil {
 		cb = func(StreamMessage) {}
@@ -627,14 +587,11 @@ func stopAppProcesses(ctx context.Context, docker command.Cli, app app.ArduinoAp
 // stopLauncherApp stops the app if the launcher runs it, every app when appPath is nil. An
 // unreachable launcher runs nothing.
 func stopLauncherApp(ctx context.Context, cfg config.Configuration, appPath *paths.Path) error {
-	if launcherDisabled() {
-		return nil
-	}
 	var target string
 	if appPath != nil {
 		target = appPath.String()
 	}
-	resp, err := newLauncherClient(cfg).WithTimeout(launcherStartTimeout).Stop(ctx, target)
+	resp, err := newLauncherClient(cfg).WithTimeout(launcherStopTimeout).Stop(ctx, target)
 	var launcherErr *launcher.Error
 	switch {
 	case errors.As(err, &launcherErr):
@@ -721,25 +678,13 @@ func RestartApp(
 		if err := checkApp(ctx, docker, appToStart, appBricks, appModels, servicesIndex, platform, prepare, cb); err != nil {
 			return err
 		}
-		mode := selectRunMode(ctx, docker, bricksIndex, appToStart, cfg, platform, cb)
-
-		// The launcher restarts the app in place, leaving its sidecars running
-		if mode == classicMode {
-			runningApp, err := getRunningApp(ctx, docker.Client(), cfg)
-			if err != nil {
+		if appToStart.MainPythonFile != nil {
+			if err := prepareLauncher(ctx, docker, bricksIndex, appToStart, cfg, platform, cb); err != nil {
 				return err
 			}
-			if runningApp != nil {
-				if runningApp.FullPath.String() != appToStart.FullPath.String() {
-					return fmt.Errorf("another app %q is running", runningApp.Name)
-				}
-				if err := stopAppWithCmd(ctx, docker, platform, *runningApp, cfg, "stop", cb); err != nil {
-					return err
-				}
-			}
 		}
-
-		return startApp(ctx, docker, provisioner, appModels, appBricks, servicesIndex, appToStart, cfg, platform, verbose, prepare, mode, cb)
+		// The launcher restarts the app in place, leaving its sidecars running
+		return startApp(ctx, docker, provisioner, appModels, appBricks, servicesIndex, appToStart, cfg, platform, verbose, prepare, cb)
 	})
 }
 
@@ -873,11 +818,13 @@ func ListApps(
 		}
 
 		// Retrieve the app status if available
-		status := StatusUninitialized
+		var status Status
 		if idx := slices.IndexFunc(appsStatus, func(a AppStatusInfo) bool {
 			return a.AppPath.EqualsTo(app.FullPath)
 		}); idx != -1 {
 			status = appsStatus[idx].Status
+		} else {
+			status = idleAppStatus(app.FullPath)
 		}
 
 		// Apply status filter if requested
@@ -918,23 +865,26 @@ func ListApps(
 	return result, nil
 }
 
-// ListActiveApps returns all the apps that have a non-uninitialized status in Docker,
-// i.e. all apps that have been started at least once, including apps located outside the
-// standard apps directory and apps whose metadata is broken or missing on disk.
-// The result is sorted by app path.
+// ListActiveApps returns all the apps that have a non-uninitialized status, i.e. all apps
+// that have been started at least once, including apps located outside the standard apps
+// directory and apps whose metadata is broken or missing on disk. The result is sorted by
+// app path.
 func ListActiveApps(
 	ctx context.Context,
 	docker command.Cli,
 	idProvider *appid.Provider,
 	cfg config.Configuration,
 ) ([]AppInfo, error) {
-	// The statuses returned by getAppsStatus come only from Docker containers that have
-	// been started, so StatusUninitialized is never present.
 	appsStatus, err := getAppsStatus(ctx, docker.Client(), cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list apps status: %w", err)
 	}
+	return describeActiveApps(appsStatus, idProvider), nil
+}
 
+// describeActiveApps describes the apps of the statuses that were started at least once, sorted by path.
+func describeActiveApps(appsStatus []AppStatusInfo, idProvider *appid.Provider) []AppInfo {
+	appsStatus = slices.DeleteFunc(slices.Clone(appsStatus), func(s AppStatusInfo) bool { return s.Status == StatusUninitialized })
 	// getAppsStatus iterates over a map, so sort the result to have a deterministic output.
 	slices.SortFunc(appsStatus, func(a, b AppStatusInfo) int {
 		return strings.Compare(a.AppPath.String(), b.AppPath.String())
@@ -964,7 +914,7 @@ func ListActiveApps(
 		info.Description = userApp.Descriptor.Description
 		info.Icon = userApp.Descriptor.Icon
 		return info
-	}), nil
+	})
 }
 
 // exampleCompatibleWithBricksIndex returns true if all built-in bricks referenced by the app

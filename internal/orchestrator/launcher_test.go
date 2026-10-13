@@ -19,6 +19,7 @@ import (
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/app"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/bricksindex"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
+	"github.com/arduino/arduino-app-cli/internal/orchestrator/launcher"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/servicesindex"
 	"github.com/arduino/arduino-app-cli/internal/platform"
 )
@@ -133,19 +134,6 @@ func TestSplitMainService(t *testing.T) {
 		splitMainService(project)
 		assert.Empty(t, project.Services)
 	})
-
-	t.Run("the render keeps the main service for the classic mode", func(t *testing.T) {
-		a := newTestApp(t, cfg, "classic", "arduino:web_ui", "arduino:object_detection")
-		project := renderTestApp(t, cfg, &a, bricksIndex, servicesIndex, appEnv)
-
-		assert.ElementsMatch(t, []string{"main", "ei-obj-detection-runner"}, project.ServiceNames())
-		main := project.Services["main"]
-		assert.Equal(t, types.ShellCommand{"/run.sh"}, main.Entrypoint)
-		assert.Equal(t, "service_healthy", main.DependsOn["ei-obj-detection-runner"].Condition)
-		assert.Equal(t, "true", main.Labels[DockerAppMainLabel])
-		assert.Contains(t, main.Volumes, types.ServiceVolumeConfig{Type: "bind", Source: a.FullPath.String(), Target: "/app"})
-		assert.False(t, bool(project.Networks["default"].External))
-	})
 }
 
 func TestGenerateLauncherComposeFile(t *testing.T) {
@@ -190,6 +178,8 @@ func TestGenerateLauncherComposeFile(t *testing.T) {
 		"HOST_IP":             new("10.0.0.2"),
 		"APP_LAUNCHER_PORTS":  new("7000,8000"),
 		"APP_LAUNCHER_SOCKET": new("/run/arduino-app-cli/app-launcher.sock"),
+		// The CLI waits for a start as long as the launcher may prepare it
+		"APP_LAUNCHER_PREPARE_TIMEOUT_S": new("600"),
 	}, svc.Environment)
 
 	targets := make(map[string]string, len(svc.Volumes))
@@ -230,6 +220,36 @@ func TestUncoveredAppPort(t *testing.T) {
 	port, uncovered := uncoveredAppPort(app.ArduinoApp{Descriptor: app.AppDescriptor{Ports: []int{7000, 8080}}}, bricksIndex)
 	assert.True(t, uncovered)
 	assert.Equal(t, 8080, port)
+}
+
+func TestPrepareLauncherRejectsWhatItCannotRun(t *testing.T) {
+	cfg := setTestOrchestratorConfig(t)
+	bricksIndex, _ := setTestBricks(t, cfg)
+	noop := func(StreamMessage) {}
+
+	ownPort := newTestApp(t, cfg, "own-port")
+	ownPort.Descriptor.Ports = []int{8080}
+	err := prepareLauncher(t.Context(), nil, bricksIndex, ownPort, cfg, platform.Platform{}, noop)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "port 8080")
+	assert.Contains(t, err.Error(), "only the ports of the installed bricks are forwarded")
+
+	elsewhere := app.ArduinoApp{Name: "elsewhere", FullPath: paths.New(t.TempDir())}
+	err = prepareLauncher(t.Context(), nil, bricksIndex, elsewhere, cfg, platform.Platform{}, noop)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), cfg.AppsDir().String())
+}
+
+func TestLauncherStartError(t *testing.T) {
+	installOutput := "failed to install the app requirements\nERROR: No matching distribution found for nump"
+	err := launcherStartError(&launcher.Error{Code: launcher.CodePrepareFailed, Message: installOutput})
+	assert.EqualError(t, err, installOutput, "shown as is")
+	var prepareErr *PrepareError
+	assert.ErrorAs(t, err, &prepareErr)
+
+	busy := &launcher.Error{Code: launcher.CodeBusy, Message: "a start is in progress"}
+	assert.Same(t, busy, launcherStartError(busy))
+	assert.NoError(t, launcherStartError(nil))
 }
 
 func TestIsInsideLauncherRoots(t *testing.T) {

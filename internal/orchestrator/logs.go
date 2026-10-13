@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -64,20 +63,6 @@ func AppLogs(
 		return helpers.EmptyIter[LogMessage](), nil
 	}
 
-	services, err := getAppServicesFromContainers(ctx, dockerCli.Client(), app)
-	if err != nil {
-		return nil, err
-	}
-
-	// A main container means the app last ran in classic mode, with its logs in Docker
-	if slices.Contains(services, mainServiceName) {
-		source, err := composeLogs(app, req, services, dockerCli, bricksIndex, servicesIndex, cfg)
-		if err != nil {
-			return nil, err
-		}
-		return func(yield func(LogMessage) bool) { source(ctx, yield) }, nil
-	}
-
 	// The launcher writes the app output to a file, Docker holds the sidecar logs
 	var sources []logSource
 	if req.ShowAppLogs {
@@ -85,12 +70,20 @@ func AppLogs(
 			readAppLogFile(ctx, appLogFile(app), req.Tail, req.Follow, yield)
 		})
 	}
-	if req.ShowServicesLogs && len(services) > 0 {
-		source, err := composeLogs(app, AppLogsRequest{ShowServicesLogs: true, Follow: req.Follow, Tail: req.Tail}, services, dockerCli, bricksIndex, servicesIndex, cfg)
+	if req.ShowServicesLogs {
+		services, err := getAppServicesFromContainers(ctx, dockerCli.Client(), app)
 		if err != nil {
 			return nil, err
 		}
-		sources = append(sources, source)
+		// A main container is left by an older CLI: the launcher writes the app logs
+		services = f.Filter(services, f.NotEquals(mainServiceName))
+		if len(services) > 0 {
+			source, err := sidecarLogs(app, req, services, dockerCli, bricksIndex, servicesIndex, cfg)
+			if err != nil {
+				return nil, err
+			}
+			sources = append(sources, source)
+		}
 	}
 	return mergeLogSources(ctx, sources...), nil
 }
@@ -133,8 +126,8 @@ func mergeLogSources(ctx context.Context, sources ...logSource) iter.Seq[LogMess
 	}
 }
 
-// composeLogs yields the Docker logs of the app containers, attributing each service to its brick.
-func composeLogs(
+// sidecarLogs yields the logs of the app project services, the sidecars, attributing each to its brick.
+func sidecarLogs(
 	app app.ArduinoApp,
 	req AppLogsRequest,
 	services []string,
@@ -148,16 +141,6 @@ func composeLogs(
 	serviceToBrickMapping, err := serviceBricks(app, bricksIndex, servicesIndex)
 	if err != nil {
 		return nil, err
-	}
-
-	if req.ShowAppLogs && !req.ShowServicesLogs {
-		services = []string{mainServiceName}
-	} else if req.ShowServicesLogs && !req.ShowAppLogs {
-		services = f.Filter(services, f.NotEquals(mainServiceName))
-	}
-	// An empty service list makes compose show every container of the project
-	if len(services) == 0 {
-		return func(context.Context, func(LogMessage) bool) {}, nil
 	}
 
 	backend, err := compose.NewComposeService(dockerCli)

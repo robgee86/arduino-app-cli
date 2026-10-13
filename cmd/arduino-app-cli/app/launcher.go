@@ -40,7 +40,10 @@ func newLauncherCmd(cfg config.Configuration) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "up",
 		Short: "Create or update the app launcher and wait until it answers",
-		Args:  cobra.NoArgs,
+		Long: "Create or update the app launcher and wait until it answers.\n\n" +
+			"For development and support: it creates or refreshes the launcher ahead of the first app start, e.g. after an image update.",
+		Hidden: true,
+		Args:   cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			elapsed, err := orchestrator.EnsureLauncher(cmd.Context(), servicelocator.GetDockerClient(), servicelocator.GetBricksIndex(), cfg, servicelocator.GetPlatform(), false)
 			if err != nil {
@@ -53,7 +56,10 @@ func newLauncherCmd(cfg config.Configuration) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "down",
 		Short: "Remove the app launcher, stopping every app",
-		Args:  cobra.NoArgs,
+		Long: "Remove the app launcher, stopping every app.\n\n" +
+			"For development and support: it removes the launcher and the shared network, which also stops every app and frees port 7000.",
+		Hidden: true,
+		Args:   cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			out, _, getResult := feedback.OutputStreams()
 			if err := orchestrator.LauncherDown(cmd.Context(), servicelocator.GetDockerClient(), cfg, func(message orchestrator.StreamMessage) {
