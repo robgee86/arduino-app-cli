@@ -55,8 +55,10 @@ type StartResponse struct {
 	Warm      bool      `json:"warm"`
 	Runner    string    `json:"runner"`
 	// Prepared tells the launcher installed the app dependencies before the start.
-	Prepared bool    `json:"prepared"`
-	Timings  Timings `json:"timings"`
+	Prepared bool `json:"prepared"`
+	// Ports maps each public port the launcher forwards to the internal port of the app.
+	Ports   map[int]int `json:"ports"`
+	Timings Timings     `json:"timings"`
 }
 
 type StoppedChild struct {
@@ -81,9 +83,10 @@ type Child struct {
 	PID       int       `json:"pid"`
 	State     string    `json:"state"`
 	StartedAt time.Time `json:"started_at"`
-	HTTPPort  int       `json:"http_port"`
-	Runner    string    `json:"runner"`
-	Warm      bool      `json:"warm"`
+	// Ports maps each public port the launcher forwards to the internal port of the app.
+	Ports  map[int]int `json:"ports"`
+	Runner string      `json:"runner"`
+	Warm   bool        `json:"warm"`
 }
 
 type StatusResponse struct {

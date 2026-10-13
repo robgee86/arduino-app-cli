@@ -70,11 +70,11 @@ func TestClientRequests(t *testing.T) {
 	fake := newFakeLauncher(t, func(cmd string) string {
 		switch cmd {
 		case cmdStart:
-			return `{"ok":true,"pid":42,"started_at":"2026-10-13T10:00:00.5+00:00","warm":true,"runner":"python","prepared":true,"timings":{"stop_ms":12.5,"prepare_ms":2500,"fork_ms":3}}`
+			return `{"ok":true,"pid":42,"started_at":"2026-10-13T10:00:00.5+00:00","warm":true,"runner":"python","prepared":true,"ports":{"7000":17000,"8000":18000},"timings":{"stop_ms":12.5,"prepare_ms":2500,"fork_ms":3}}`
 		case cmdStop:
 			return `{"ok":true,"stopped":[{"app":"/apps/a","pid":42,"exit_code":null,"signal":15}]}`
 		case cmdStatus:
-			return `{"ok":true,"children":[{"app":"/apps/a","pid":42,"state":"running","started_at":"2026-10-13T10:00:00+00:00","http_port":17000,"runner":"python","warm":true}],"preload":{"modules":["numpy"]},"version":"1.0","uptime_s":3.5}`
+			return `{"ok":true,"children":[{"app":"/apps/a","pid":42,"state":"running","started_at":"2026-10-13T10:00:00+00:00","ports":{"7000":17000},"runner":"python","warm":true}],"preload":{"modules":["numpy"]},"version":"1.0","uptime_s":3.5}`
 		default:
 			return `{"ok":true}`
 		}
@@ -95,6 +95,7 @@ func TestClientRequests(t *testing.T) {
 		assert.True(t, resp.Warm)
 		assert.Equal(t, "python", resp.Runner)
 		assert.True(t, resp.Prepared)
+		assert.Equal(t, map[int]int{7000: 17000, 8000: 18000}, resp.Ports)
 		assert.Equal(t, Timings{StopMs: 12.5, PrepareMs: 2500, ForkMs: 3}, resp.Timings)
 		assert.Equal(t, time.Date(2026, 10, 13, 10, 0, 0, 5e8, time.UTC), resp.StartedAt.UTC())
 	})
@@ -120,7 +121,7 @@ func TestClientRequests(t *testing.T) {
 		<-fake.requests
 		assert.Equal(t, []Child{{
 			App: testApp, PID: 42, State: StateRunning, StartedAt: resp.Children[0].StartedAt,
-			HTTPPort: 17000, Runner: "python", Warm: true,
+			Ports: map[int]int{7000: 17000}, Runner: "python", Warm: true,
 		}}, resp.Children)
 		assert.Equal(t, "1.0", resp.Version)
 		assert.InDelta(t, 3.5, resp.UptimeS, 0)
