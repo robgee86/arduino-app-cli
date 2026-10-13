@@ -300,12 +300,3 @@ func stopSidecars(ctx context.Context, docker dockerClient.APIClient, cb func(St
 	}
 	return stopAppContainers(ctx, docker, containers, DefaultDockerStopTimeoutSeconds, cb)
 }
-
-// removeSidecars removes the zone containers: the next start creates them again.
-func removeSidecars(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration) error {
-	containers, err := getAppContainers(ctx, docker, sidecarsProject)
-	if err != nil {
-		return err
-	}
-	return errors.Join(writeSidecarsRecord(cfg, nil), removeContainers(ctx, docker, slices.Collect(maps.Values(containers))))
-}
