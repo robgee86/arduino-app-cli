@@ -164,12 +164,71 @@ func generateComposeTemplate(
 	}
 	mainAppCompose.Include = includes
 
+	runtime, err := newPythonRuntime(cfg, platform)
+	if err != nil {
+		return err
+	}
+
+	// A service with a healthcheck is waited for, the others only have to be started.
+	dependsOn := make(map[string]dependsOnCondition, len(services))
+	for _, s := range services {
+		if s.hasHealthcheck {
+			dependsOn[s.name] = dependsOnCondition{
+				Condition: "service_healthy",
+			}
+		} else {
+			dependsOn[s.name] = dependsOnCondition{
+				Condition: "service_started",
+			}
+		}
+	}
+
+	main := runtime.service(pythonImage, volume{
+		Type:   "bind",
+		Source: appHomeRef,
+		Target: "/app",
+	})
+	main.Ports = slices.Collect(maps.Keys(ports))
+	main.Entrypoint = "/run.sh"
+	main.DependsOn = dependsOn
+	main.Labels = map[string]string{
+		DockerAppLabel:     "true",
+		DockerAppMainLabel: "true",
+		DockerAppPathLabel: appHomeRef,
+	}
+	main.Environment = templateEnvironment(appEnv)
+	mainAppCompose.Services = map[string]any{"main": main}
+
+	// A compose file cannot declare a service it also includes, so the overrides of the
+	// included services go in a template of their own.
+	if err := writeOverrideTemplate(genPath, services, appEnv, runtime.cgroupRules, runtime.groupNames); err != nil {
+		return err
+	}
+
+	// Write the main compose file
+	data, err := yaml.Marshal(mainAppCompose)
+	if err != nil {
+		return err
+	}
+	mainTemplateFile := genPath.Join(app.MainTemplateFileName)
+	if err := mainTemplateFile.WriteFile(data); err != nil {
+		return err
+	}
+
+	// Done!
+	return nil
+}
+
+// pythonRuntime is what the app main service and the launcher share of the python container:
+// the host devices and sockets, as expressions rendered on the board, and the groups to access them.
+type pythonRuntime struct {
+	volumes     []any
+	groupNames  []string
+	cgroupRules []string
+}
+
+func newPythonRuntime(cfg config.Configuration, platform platform.Platform) (pythonRuntime, error) {
 	volumes := []any{
-		volume{
-			Type:   "bind",
-			Source: appHomeRef,
-			Target: "/app",
-		},
 		volume{
 			Type:   "bind",
 			Source: "/dev",
@@ -192,7 +251,7 @@ func generateComposeTemplate(
 	for _, mount := range optionalMounts {
 		expr, err := mountExpr(mount)
 		if err != nil {
-			return err
+			return pythonRuntime{}, err
 		}
 		volumes = append(volumes, expr)
 	}
@@ -204,7 +263,7 @@ func generateComposeTemplate(
 		for _, path := range runtime.Paths {
 			expr, err := mountExpr(path)
 			if err != nil {
-				return err
+				return pythonRuntime{}, err
 			}
 			volumes = append(volumes, expr)
 		}
@@ -220,74 +279,43 @@ func generateComposeTemplate(
 		[]string{"gpiod"},              // support GPIO access
 	)
 
-	// A service with a healthcheck is waited for, the others only have to be started.
-	dependsOn := make(map[string]dependsOnCondition, len(services))
-	for _, s := range services {
-		if s.hasHealthcheck {
-			dependsOn[s.name] = dependsOnCondition{
-				Condition: "service_healthy",
-			}
-		} else {
-			dependsOn[s.name] = dependsOnCondition{
-				Condition: "service_started",
-			}
-		}
-	}
-
 	deviceDrivers := []string{"drm", "dma_heap", "media", "video4linux", "alsa", "ttyUSB", "ttyACM"}
 
 	// The DSP is reached through the fastrpc nodes. They are misc devices, so a rule per
 	// node, by number: the major they share, 10, also holds tun, fuse and the loop control.
 	const fastrpcRules = exprPrefix + `{{ range deviceNumbers "misc" "fastrpc-*" }}c {{ . }} rmw{{ "\n" }}{{ end }}`
 
-	cgroupRules := append(cgroupRuleExprs(deviceDrivers), fastrpcRules)
+	return pythonRuntime{
+		volumes:     volumes,
+		groupNames:  groupNames,
+		cgroupRules: append(cgroupRuleExprs(deviceDrivers), fastrpcRules),
+	}, nil
+}
 
-	mainAppCompose.Services = map[string]any{"main": service{
+// service is a python container of the image with the runtime: extraVolumes come first.
+func (r pythonRuntime) service(pythonImage string, extraVolumes ...any) service {
+	return service{
 		Image: pythonImage,
 		// tini as PID 1: forwards SIGTERM to run.sh and reaps what the app leaves behind
 		Init:              new(true),
-		Volumes:           volumes,
-		Ports:             slices.Collect(maps.Keys(ports)),
-		Entrypoint:        "/run.sh",
-		DependsOn:         dependsOn,
+		Volumes:           slices.Concat(extraVolumes, r.volumes),
 		User:              appUserExpr,
-		GroupAdd:          groupExprs(groupNames),
-		DeviceCgroupRules: cgroupRules,
+		GroupAdd:          groupExprs(r.groupNames),
+		DeviceCgroupRules: r.cgroupRules,
 		ExtraHosts:        []string{"msgpack-rpc-router:host-gateway"},
-		Labels: map[string]string{
-			DockerAppLabel:     "true",
-			DockerAppMainLabel: "true",
-			DockerAppPathLabel: appHomeRef,
+		Logging:           containerLogging(),
+	}
+}
+
+// containerLogging bounds the logs the board keeps for a container.
+func containerLogging() *logging {
+	return &logging{
+		Driver: "json-file",
+		Options: map[string]string{
+			"max-size": "5m",
+			"max-file": "2",
 		},
-		Environment: templateEnvironment(appEnv),
-		Logging: &logging{
-			Driver: "json-file",
-			Options: map[string]string{
-				"max-size": "5m",
-				"max-file": "2",
-			},
-		},
-	},
 	}
-
-	// A compose file cannot declare a service it also includes, so the overrides of the
-	// included services go in a template of their own.
-	if err := writeOverrideTemplate(genPath, services, appEnv, cgroupRules, groupNames); err != nil {
-		return err
-	}
-
-	// Write the main compose file
-	data, err := yaml.Marshal(mainAppCompose)
-	if err != nil {
-		return err
-	}
-	mainTemplateFile := genPath.Join(app.MainTemplateFileName)
-	if err := mainTemplateFile.WriteFile(data); err != nil {
-		return err
-	}
-
-	// Done!
-	return nil
 }
 
 // frozenComposeIncludes copies every brick and service compose next to the template it is

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,16 +68,128 @@ func AppLogs(
 	if err != nil {
 		return nil, err
 	}
-	// No container, so the app was never started
-	if len(services) == 0 {
-		return helpers.EmptyIter[LogMessage](), nil
+
+	// A main container means the app last ran in classic mode, with its logs in Docker
+	if slices.Contains(services, mainServiceName) {
+		source, err := composeLogs(app, req, services, dockerCli, bricksIndex, servicesIndex, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return func(yield func(LogMessage) bool) { source(ctx, yield) }, nil
 	}
 
+	// The launcher writes the app output to a file, Docker holds the sidecar logs
+	var sources []logSource
+	if req.ShowAppLogs {
+		sources = append(sources, func(ctx context.Context, yield func(LogMessage) bool) {
+			readAppLogFile(ctx, appLogFile(app), req.Tail, req.Follow, yield)
+		})
+	}
+	if req.ShowServicesLogs && len(services) > 0 {
+		source, err := composeLogs(app, AppLogsRequest{ShowServicesLogs: true, Follow: req.Follow, Tail: req.Tail}, services, dockerCli, bricksIndex, servicesIndex, cfg)
+		if err != nil {
+			return nil, err
+		}
+		sources = append(sources, source)
+	}
+	return mergeLogSources(ctx, sources...), nil
+}
+
+// logSource yields log lines until yield returns false or ctx is done.
+type logSource func(ctx context.Context, yield func(LogMessage) bool)
+
+// mergeLogSources yields the lines of every source as they come.
+func mergeLogSources(ctx context.Context, sources ...logSource) iter.Seq[LogMessage] {
+	return func(yield func(LogMessage) bool) {
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		messages := make(chan LogMessage)
+		var wg sync.WaitGroup
+		for _, source := range sources {
+			wg.Go(func() {
+				source(ctx, func(msg LogMessage) bool {
+					select {
+					case messages <- msg:
+						return true
+					case <-ctx.Done():
+						return false
+					}
+				})
+			})
+		}
+		go func() {
+			wg.Wait()
+			close(messages)
+		}()
+		for msg := range messages {
+			if !yield(msg) {
+				cancel()
+				// Drain so that the sources see the cancellation and the closer goroutine ends
+				for range messages {
+				}
+				return
+			}
+		}
+	}
+}
+
+// composeLogs yields the Docker logs of the app containers, attributing each service to its brick.
+func composeLogs(
+	app app.ArduinoApp,
+	req AppLogsRequest,
+	services []string,
+	dockerCli command.Cli,
+	bricksIndex *bricksindex.BricksIndex,
+	servicesIndex *servicesindex.ServicesIndex,
+	cfg config.Configuration,
+) (logSource, error) {
 	projectName := composeProjectName(app.FullPath, cfg.AppsDir())
 
+	serviceToBrickMapping, err := serviceBricks(app, bricksIndex, servicesIndex)
+	if err != nil {
+		return nil, err
+	}
+
+	if req.ShowAppLogs && !req.ShowServicesLogs {
+		services = []string{mainServiceName}
+	} else if req.ShowServicesLogs && !req.ShowAppLogs {
+		services = f.Filter(services, f.NotEquals(mainServiceName))
+	}
+	// An empty service list makes compose show every container of the project
+	if len(services) == 0 {
+		return func(context.Context, func(LogMessage) bool) {}, nil
+	}
+
+	backend, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context, yield func(LogMessage) bool) {
+		opts := api.LogOptions{
+			Follow:     req.Follow,
+			Services:   services,
+			Timestamps: false,
+		}
+		if req.Tail != nil {
+			opts.Tail = fmt.Sprintf("%d", *req.Tail)
+		}
+		err := backend.Logs(
+			ctx,
+			projectName,
+			NewDockerLogConsumer(ctx, yield, serviceToBrickMapping),
+			opts,
+		)
+		if err != nil {
+			slog.Error("docker logs error", slog.String("error", err.Error()))
+			return
+		}
+	}, nil
+}
+
+// serviceBricks maps each compose service of the app to the brick that declares or requires it.
+func serviceBricks(app app.ArduinoApp, bricksIndex *bricksindex.BricksIndex, servicesIndex *servicesindex.ServicesIndex) (map[string]string, error) {
 	bricksIndex = bricksIndex.WithAppBricks(app.LocalBricks)
 
-	// Obtain mapping compose service name <-> brick name
 	serviceToBrickMapping := make(map[string]string, len(app.Descriptor.Bricks))
 	addServices := func(composeFile *paths.Path, brickID string) error {
 		services, err := extractServicesFromComposeFile(composeFile)
@@ -99,7 +212,7 @@ func AppLogs(
 
 		if composeFile, found := brick.GetComposeFile(); found && composeFile.Exist() {
 			if err := addServices(composeFile, brick.ID); err != nil {
-				return helpers.EmptyIter[LogMessage](), err
+				return nil, err
 			}
 		} else {
 			slog.Debug("brick has no compose file", slog.String("brick_id", brick.ID))
@@ -128,41 +241,7 @@ func AppLogs(
 			}
 		}
 	}
-
-	if req.ShowAppLogs && !req.ShowServicesLogs {
-		services = []string{"main"}
-	} else if req.ShowServicesLogs && !req.ShowAppLogs {
-		services = f.Filter(services, f.NotEquals("main"))
-	}
-	// An empty service list makes compose show every container of the project
-	if len(services) == 0 {
-		return helpers.EmptyIter[LogMessage](), nil
-	}
-
-	backend, err := compose.NewComposeService(dockerCli)
-	if err != nil {
-		return nil, err
-	}
-	return func(yield func(LogMessage) bool) {
-		opts := api.LogOptions{
-			Follow:     req.Follow,
-			Services:   services,
-			Timestamps: false,
-		}
-		if req.Tail != nil {
-			opts.Tail = fmt.Sprintf("%d", *req.Tail)
-		}
-		err := backend.Logs(
-			ctx,
-			projectName,
-			NewDockerLogConsumer(ctx, yield, serviceToBrickMapping),
-			opts,
-		)
-		if err != nil {
-			slog.Error("docker logs error", slog.String("error", err.Error()))
-			return
-		}
-	}, nil
+	return serviceToBrickMapping, nil
 }
 
 var _ api.LogConsumer = (*DockerLogConsumer)(nil)
