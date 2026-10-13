@@ -264,7 +264,7 @@ func ensureLauncher(
 	}
 	// A new or restarted launcher runs no app
 	if recreated {
-		if err := errors.Join(clearLauncherWantedApp(cfg, nil), closeAppPorts(ctx, docker, cfg)); err != nil {
+		if err := errors.Join(clearLauncherWantedApp(cfg, nil), closeAppPorts(ctx, docker.Client())); err != nil {
 			return 0, err
 		}
 	}
@@ -277,7 +277,7 @@ func ensureLauncher(
 	return elapsed, nil
 }
 
-// composeUpReason tells whether compose up has to run for the launcher or the ingress, and why.
+// composeUpReason tells whether compose up has to run for the launcher, and why.
 func composeUpReason(forceUp, changed, running bool) (string, bool) {
 	switch {
 	case changed:
@@ -398,8 +398,8 @@ func clearLauncherWantedApp(cfg config.Configuration, appPath *paths.Path) error
 	return nil
 }
 
-// EnsureLauncher brings the launcher and the ingress up, recreating them on a new image, and stops
-// what the launcher runs when stopApps, as the daemon does at boot.
+// EnsureLauncher brings the launcher up, recreating it on a new image, and pulls the ingress image.
+// When stopApps, as the daemon does at boot, it stops what the launcher runs and closes its ports.
 func EnsureLauncher(
 	ctx context.Context,
 	docker command.Cli,
@@ -412,13 +412,14 @@ func EnsureLauncher(
 		if _, err := ensureLauncher(ctx, docker, cfg, platform, true, func(StreamMessage) {}); err != nil {
 			return err
 		}
+		// Pulled here so that no start has to: an app without ports runs without it
+		if err := pullIngressImage(ctx, docker.Client(), func(StreamMessage) {}); err != nil {
+			slog.Warn("the ingress image is unavailable, the apps with ports cannot start", slog.String("error", err.Error()))
+		}
 		if !stopApps {
-			return ensureIngress(ctx, docker, cfg)
+			return nil
 		}
-		if err := stopLauncherApp(ctx, cfg, nil); err != nil {
-			return err
-		}
-		return applyIngress(ctx, docker, cfg, nil, true)
+		return errors.Join(stopLauncherApp(ctx, cfg, nil), closeAppPorts(ctx, docker.Client()))
 	})
 	return time.Since(started), err
 }
