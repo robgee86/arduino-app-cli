@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -26,8 +25,6 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/goccy/go-yaml"
 	"github.com/gosimple/slug"
-	"github.com/moby/moby/api/types/container"
-	dockerClient "github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
 	"go.bug.st/f"
 	semver "go.bug.st/relaxed-semver"
@@ -172,9 +169,9 @@ func checkApp(
 	return nil
 }
 
-// startApp runs the app Python code in the launcher, which replaces the app it ran; the sidecars of
-// the other apps are stopped along the way. An app with only a sketch replaces them all the same.
-// bricksIndex and modelsIndex are the ones the app is wired with.
+// startApp runs the app Python code in the launcher, which replaces the app it ran, and brings the
+// sidecars zone to the sidecars of the app. An app with only a sketch stops the zone. bricksIndex
+// and modelsIndex are the ones the app is wired with.
 func startApp(
 	ctx context.Context,
 	docker command.Cli,
@@ -189,11 +186,6 @@ func startApp(
 	prepare bool,
 	cb func(StreamMessage),
 ) error {
-	replaced, err := otherAppsWithRunningContainers(ctx, docker.Client(), appToStart.FullPath)
-	if err != nil {
-		return err
-	}
-
 	cb(StreamMessage{data: fmt.Sprintf("Starting app %q", appToStart.Name)})
 
 	// An app installed from a release holds in .cache what a start generates: the
@@ -247,7 +239,7 @@ func startApp(
 	}
 
 	if appToStart.MainPythonFile == nil {
-		if err := errors.Join(stopLauncherApp(ctx, cfg, nil), stopReplacedApps(ctx, docker, replaced, cb)); err != nil {
+		if err := errors.Join(stopLauncherApp(ctx, cfg, nil), stopSidecars(ctx, docker.Client(), cb)); err != nil {
 			return err
 		}
 		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
@@ -277,15 +269,16 @@ func startApp(
 	// What the template references, answered on this board. The app half is in
 	// the template already, frozen, when the app comes from a release.
 	env := hostEnvironment(ctx, appToStart.FullPath, cfg).Merge(appEnv)
-	before, _ := appToStart.AppComposeFilePath().ReadFile()
 	prj, err := provisioner.Render(ctx, &appToStart, env, appToStart.Secrets(bricksIndex))
 	if err != nil {
 		return err
 	}
-	after, _ := appToStart.AppComposeFilePath().ReadFile()
-	changed := !bytes.Equal(before, after)
-	// The launcher runs the app with the environment of its main service
+	// The launcher runs the app with the environment of its main service, the zone the rest
 	launcherEnv := splitMainService(prj)
+	zone, err := generateSidecarsZone(prj, cfg)
+	if err != nil {
+		return err
+	}
 
 	// Without a prepare, a start never fetches a missing image: it fails and asks for
 	// one first.
@@ -297,23 +290,18 @@ func startApp(
 
 	cb(StreamMessage{data: "python downloading"})
 
-	containers, err := getAppContainers(ctx, docker.Client(), prj.Name)
-	if err != nil {
-		return err
-	}
-
 	if err := pullAppImages(ctx, docker, prj, cb); err != nil {
 		return err
 	}
-	if err := startWithLauncher(ctx, docker, appToStart, cfg, launcherEnv, prj, changed, containers, replaced, cb); err != nil {
+	if err := startWithLauncher(ctx, docker, appToStart, cfg, launcherEnv, zone, cb); err != nil {
 		return err
 	}
 	cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
 	return nil
 }
 
-// splitMainService takes the main service out of the project, leaving the sidecars on the network
-// shared with the launcher, and returns the environment the main service would run the app with.
+// splitMainService takes the main service out of the project, leaving the sidecars, and returns
+// the environment the main service would run the app with.
 func splitMainService(prj *types.Project) map[string]string {
 	envs := make(map[string]string)
 	if main, ok := prj.Services[mainServiceName]; ok {
@@ -324,7 +312,6 @@ func splitMainService(prj *types.Project) map[string]string {
 		}
 		delete(prj.Services, mainServiceName)
 	}
-	prj.Networks = types.Networks{"default": types.NetworkConfig{Name: launcherNetwork, External: true}}
 	return envs
 }
 
@@ -338,43 +325,16 @@ func pullAppImages(ctx context.Context, docker command.Cli, prj *types.Project, 
 		})
 }
 
-// composeUpApp creates or recreates the containers of the project and starts them.
-func composeUpApp(ctx context.Context, docker command.Cli, prj *types.Project, cb func(StreamMessage)) error {
-	slog.Debug("starting app", slog.String("project", prj.Name))
-	line := func(line string) { cb(StreamMessage{data: line}) }
-	err := dockerhelper.ComposeUp(ctx, docker, prj, line)
-	if errors.Is(err, dockerhelper.ErrNetwork) {
-		// The board is likely out of subnets: the apps give up the networks they
-		// keep, and this app is started once more.
-		cb(StreamMessage{data: "Could not create the network, freeing the ones the apps keep"})
-		appContainers, pruneErr := dockerhelper.Containers(ctx, docker.Client(), DockerAppLabel+"=true")
-		if pruneErr != nil {
-			slog.Warn("failed to list the app containers", slog.String("error", pruneErr.Error()))
-		}
-		freed, pruneErr := dockerhelper.PruneNetworks(ctx, docker.Client(), ourNetworks(appContainers))
-		if pruneErr != nil {
-			slog.Warn("failed to free the networks of the apps", slog.String("error", pruneErr.Error()))
-		}
-		slog.Debug("freed app networks", slog.Int("count", freed))
-		err = dockerhelper.ComposeUp(ctx, docker, prj, line)
-	}
-	return err
-}
-
-// startWithLauncher brings the sidecars to running, when Docker resolves their names, then has the
-// launcher start the app; the bricks retry until the sidecars accept connections. The previous
-// launcher app stops meanwhile, and the sidecars of the replaced apps go before the new ones come
-// up: apps often publish the same sidecar ports.
+// startWithLauncher brings the sidecars zone to running, when Docker resolves their names, then has
+// the launcher start the app; the bricks retry until the sidecars accept connections. The previous
+// launcher app stops meanwhile.
 func startWithLauncher(
 	ctx context.Context,
 	docker command.Cli,
 	appToStart app.ArduinoApp,
 	cfg config.Configuration,
 	envs map[string]string,
-	prj *types.Project,
-	changed bool,
-	containers appContainers,
-	replaced paths.PathList,
+	zone sidecarsZone,
 	cb func(StreamMessage),
 ) error {
 	var (
@@ -387,10 +347,7 @@ func startWithLauncher(
 		previousStopErr = stopLauncherApp(ctx, cfg, nil)
 		stopped = time.Since(stopping)
 	})
-	sidecarsErr := stopReplacedApps(ctx, docker, replaced, cb)
-	if sidecarsErr == nil {
-		sidecarsErr = startSidecars(ctx, docker, prj, changed, containers, cb)
-	}
+	sidecarsErr := reconcileSidecars(ctx, docker, cfg, zone, cb)
 	wg.Wait()
 
 	err := errors.Join(previousStopErr, sidecarsErr)
@@ -402,7 +359,7 @@ func startWithLauncher(
 	}
 	if err != nil {
 		// Half an app is of no use: stop what started
-		if stopErr := stopAppProcesses(ctx, docker, appToStart, cfg, "stop", nil); stopErr != nil {
+		if stopErr := stopAppProcesses(ctx, docker, appToStart, cfg, nil); stopErr != nil {
 			slog.Warn("failed to stop the app after a failed start", slog.String("error", stopErr.Error()))
 		}
 		return err
@@ -441,81 +398,6 @@ func launcherStartError(err error) error {
 	return err
 }
 
-// startSidecars runs the sidecars of the app project, reusing their containers when the project
-// is unchanged, and returns once they run.
-func startSidecars(
-	ctx context.Context,
-	docker command.Cli,
-	prj *types.Project,
-	changed bool,
-	containers appContainers,
-	cb func(StreamMessage),
-) error {
-	// A main container left by an older CLI: its exit status would tell the app failed
-	if main, ok := containers[mainServiceName]; ok {
-		if err := removeContainers(ctx, docker.Client(), []container.Summary{main}); err != nil {
-			return err
-		}
-		delete(containers, mainServiceName)
-	}
-	// Without sidecars what is left are orphans
-	if len(prj.Services) == 0 {
-		return removeContainers(ctx, docker.Client(), slices.Collect(maps.Values(containers)))
-	}
-	if !changed && len(containers) > 0 {
-		slog.Debug("starting the existing sidecar containers")
-		err := startAppContainers(ctx, docker.Client(), containers, cb)
-		if err == nil {
-			return nil
-		}
-		// e.g. the shared network was recreated with the launcher
-		slog.Warn("failed to start the existing sidecars, recreating them", slog.String("error", err.Error()))
-		if err := removeContainers(ctx, docker.Client(), slices.Collect(maps.Values(containers))); err != nil {
-			return err
-		}
-	}
-	if err := composeUpApp(ctx, docker, prj, cb); err != nil {
-		return err
-	}
-
-	// up returns once it started the containers: this catches one that exited right away
-	created, err := getAppContainers(ctx, docker.Client(), prj.Name)
-	if err != nil {
-		return err
-	}
-	return waitContainersRunning(ctx, docker.Client(), created)
-}
-
-// otherAppsWithRunningContainers lists the apps other than appPath with a running container.
-func otherAppsWithRunningContainers(ctx context.Context, docker dockerClient.APIClient, appPath *paths.Path) (paths.PathList, error) {
-	containers, err := listAppContainers(ctx, docker, DockerAppLabel+"=true")
-	if err != nil {
-		return nil, err
-	}
-	var result paths.PathList
-	for _, c := range containers {
-		if other := paths.New(c.Labels[DockerAppPathLabel]); c.State == container.StateRunning && other != nil && !other.EqualsTo(appPath) {
-			result.AddIfMissing(other)
-		}
-	}
-	return result, nil
-}
-
-// stopReplacedApps stops the containers of the apps the launcher replaces.
-func stopReplacedApps(ctx context.Context, docker command.Cli, replaced paths.PathList, cb func(StreamMessage)) error {
-	var errs error
-	for _, appPath := range replaced {
-		slog.Debug("stopping the containers of the replaced app", slog.String("path", appPath.String()))
-		list, err := listAppContainers(ctx, docker.Client(), DockerAppPathLabel+"="+appPath.String())
-		if err != nil {
-			errs = errors.Join(errs, err)
-			continue
-		}
-		errs = errors.Join(errs, stopAppContainers(ctx, docker.Client(), byService(list), DefaultDockerStopTimeoutSeconds, cb))
-	}
-	return errs
-}
-
 func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.Platform, app app.ArduinoApp, cfg config.Configuration, cmd string, cb func(StreamMessage)) error {
 	if cb == nil {
 		cb = func(StreamMessage) {}
@@ -551,37 +433,32 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 		}
 	}
 
-	if err := stopAppProcesses(ctx, docker, app, cfg, cmd, cb); err != nil {
+	if err := stopAppProcesses(ctx, docker, app, cfg, cb); err != nil {
 		return err
 	}
 	cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
 	return nil
 }
 
-// stopAppProcesses stops the app launcher child, then the sidecars of the app project. cmd "down"
-// also removes the sidecars and their volumes.
-func stopAppProcesses(ctx context.Context, docker command.Cli, app app.ArduinoApp, cfg config.Configuration, cmd string, cb func(StreamMessage)) error {
+// stopAppProcesses stops the app launcher child, then the sidecars zone unless it runs the
+// sidecars of another app. The zone stays: the next start of the same app is a plain start.
+func stopAppProcesses(ctx context.Context, docker command.Cli, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
 	if cb == nil {
 		cb = func(StreamMessage) {}
 	}
 	if app.MainPythonFile == nil {
 		return nil
 	}
+	// Read before the stop, which forgets it
+	wanted := readLauncherWantedApp(cfg)
 	if err := stopLauncherApp(ctx, cfg, app.FullPath); err != nil {
 		return err
 	}
-
-	// The project name stops the app without its compose file, which an update
-	// can remove, and finds what an older cli started just the same.
-	projectName := composeProjectName(app.FullPath, cfg.AppsDir())
-	if cmd == "down" {
-		return dockerhelper.ComposeDown(ctx, docker, projectName, func(line string) { cb(StreamMessage{data: line}) })
+	if wanted != nil && !wanted.EqualsTo(app.FullPath) {
+		slog.Debug("the sidecars zone runs another app, left running", slog.String("app", wanted.String()))
+		return nil
 	}
-	containers, err := getAppContainers(ctx, docker.Client(), projectName)
-	if err != nil {
-		return err
-	}
-	return stopAppContainers(ctx, docker.Client(), containers, DefaultDockerStopTimeoutSeconds, cb)
+	return stopSidecars(ctx, docker.Client(), cb)
 }
 
 // stopLauncherApp stops the app if the launcher runs it, every app when appPath is nil. An
