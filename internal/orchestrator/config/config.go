@@ -26,19 +26,21 @@ import (
 var RunnerVersion = "0.13.1"
 
 type Configuration struct {
-	appsDir                          *paths.Path
-	dataDir                          *paths.Path
-	releasesDir                      *paths.Path
-	runtimeDir                       *paths.Path
-	requiredRuntimes                 []RequiredRuntime
-	customModelsDir                  *paths.Path
-	modelsDir                        *paths.Path
-	assetDir                         *paths.Path
-	dockerRegistryBase               string
-	usedPythonImageTag               string
-	PythonImage                      string
-	RunnerVersion                    string
-	AllowRoot                        bool
+	appsDir            *paths.Path
+	dataDir            *paths.Path
+	releasesDir        *paths.Path
+	runtimeDir         *paths.Path
+	requiredRuntimes   []RequiredRuntime
+	customModelsDir    *paths.Path
+	modelsDir          *paths.Path
+	assetDir           *paths.Path
+	dockerRegistryBase string
+	usedPythonImageTag string
+	PythonImage        string
+	RunnerVersion      string
+	AllowRoot          bool
+	// LauncherPreload overrides the modules the app launcher imports at boot, comma separated; empty keeps its default
+	LauncherPreload                  string
 	LibrariesAPIURL                  *url.URL
 	EdgeImpulseAPIURL                *url.URL
 	ArduinoPlatformVersionConstraint semver.Constraint
@@ -167,6 +169,7 @@ func NewFromEnv() (Configuration, error) {
 		usedPythonImageTag:               usedPythonImageTag,
 		RunnerVersion:                    RunnerVersion,
 		AllowRoot:                        allowRoot,
+		LauncherPreload:                  os.Getenv("ARDUINO_APP_CLI__LAUNCHER_PRELOAD"),
 		LibrariesAPIURL:                  parsedLibrariesURL,
 		EdgeImpulseAPIURL:                parsedEdgeImpulseURL,
 		ArduinoPlatformVersionConstraint: constraint,
