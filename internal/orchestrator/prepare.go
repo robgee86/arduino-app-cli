@@ -9,10 +9,12 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/command"
+	dockerClient "github.com/moby/moby/client"
 
 	"github.com/arduino/arduino-app-cli/internal/dockerhelper"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/app"
@@ -125,16 +127,23 @@ func checkImages(
 	docker command.Cli,
 	prj *types.Project,
 ) error {
-	allImages, err := dockerhelper.ListImages(ctx, docker.Client())
-	if err != nil {
-		return fmt.Errorf("failed to list the images of the board: %w", err)
-	}
-	for _, image := range dockerhelper.ComposeImages(prj) {
-		if !slices.Contains(allImages, image) {
-			return fmt.Errorf("%w: the container %q is not on the board", ErrNotPrepared, image)
-		}
+	if missing := missingImages(ctx, docker.Client(), dockerhelper.ComposeImages(prj)); len(missing) > 0 {
+		return fmt.Errorf("%w: the container %q is not on the board", ErrNotPrepared, missing[0])
 	}
 	return nil
+}
+
+// missingImages are the images the board cannot inspect. Each is asked on its own: listing
+// every image of the board takes most of a second on the containerd store.
+func missingImages(ctx context.Context, docker dockerClient.APIClient, images []string) []string {
+	var missing []string
+	for _, image := range slices.Compact(slices.Sorted(slices.Values(images))) {
+		if _, err := docker.ImageInspect(ctx, image); err != nil {
+			slog.Debug("image not on the board", slog.String("image", image), slog.String("error", err.Error()))
+			missing = append(missing, image)
+		}
+	}
+	return missing
 }
 
 // prepareModels installs the models an editable app is wired with but does not have yet, so

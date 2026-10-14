@@ -317,7 +317,11 @@ func splitMainService(prj *types.Project) map[string]string {
 
 // pullAppImages downloads the images of the project the board does not have.
 func pullAppImages(ctx context.Context, docker command.Cli, prj *types.Project, cb func(StreamMessage)) error {
-	return dockerhelper.PullImages(ctx, docker.Client(), dockerhelper.ComposeImages(prj),
+	missing := missingImages(ctx, docker.Client(), dockerhelper.ComposeImages(prj))
+	if len(missing) == 0 {
+		return nil
+	}
+	return dockerhelper.PullImages(ctx, docker.Client(), missing,
 		func(line string) { cb(StreamMessage{data: line}) },
 		func(label string, curr, total int64) {
 			// Downloading the images is from 20% to 80% of the start of an app.
