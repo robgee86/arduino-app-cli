@@ -8,6 +8,7 @@ package orchestrator
 import (
 	"testing"
 
+	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -99,4 +100,14 @@ func TestPrepareModelsSkipsWhatItShould(t *testing.T) {
 	assert.NotContains(t, messages, "downloading the model installed-default-model")
 	assert.NotContains(t, messages, "downloading the model installed-override-model")
 	assert.NotContains(t, messages, "downloading the model unknown-model")
+}
+
+func TestReleaseImages(t *testing.T) {
+	cfg := setTestOrchestratorConfig(t)
+	prj := &types.Project{Services: types.Services{
+		"main":   {Name: "main", Image: "ghcr.io/arduino/app-bricks/python-apps-base:0.12.0"},
+		"runner": {Name: "runner", Image: "ghcr.io/arduino/app-bricks/ei-models-runner:0.12.0"},
+	}}
+	// The launcher runs the release: the image its build froze for the main service is not pulled
+	assert.ElementsMatch(t, []string{cfg.PythonImage, "ghcr.io/arduino/app-bricks/ei-models-runner:0.12.0"}, releaseImages(prj, cfg))
 }
