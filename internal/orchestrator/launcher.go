@@ -142,6 +142,9 @@ func generateLauncherComposeFile(
 	envs := boardEnvs.Clone()
 	envs["APP_LAUNCHER_SOCKET"] = launcherSocketDir + "/" + launcher.SocketName
 	envs["APP_LAUNCHER_PREPARE_TIMEOUT_S"] = strconv.Itoa(int(launcherPrepareTimeout.Seconds()))
+	if cfg.LauncherPreload != "" {
+		envs["APP_LAUNCHER_PRELOAD"] = cfg.LauncherPreload // Part of the compose file: changing it recreates the launcher
+	}
 
 	// The launcher is given host paths
 	volumes := []any{volume{Type: "bind", Source: cfg.RuntimeDir().String(), Target: launcherSocketDir}}

@@ -341,6 +341,15 @@ func TestGenerateLauncherComposeFile(t *testing.T) {
 		assert.True(t, changed)
 	})
 
+	t.Run("a preload override reaches the launcher and changes the file", func(t *testing.T) {
+		cfg.LauncherPreload = "arduino.app_utils,arduino.app_peripherals.camera"
+		changed, err := generateLauncherComposeFile(testPythonImage, cfg, boardEnvs, platform.Platform{})
+		require.NoError(t, err)
+		assert.True(t, changed)
+		svc := loadCompose(t, launcherComposeFile(cfg)).Services[launcherServiceName]
+		assert.Equal(t, new("arduino.app_utils,arduino.app_peripherals.camera"), svc.Environment["APP_LAUNCHER_PRELOAD"])
+	})
+
 }
 
 func TestLauncherAppPorts(t *testing.T) {
