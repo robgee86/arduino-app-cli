@@ -378,18 +378,17 @@ func TestLauncherAppPorts(t *testing.T) {
 
 func TestComposeUpReason(t *testing.T) {
 	for _, tc := range []struct {
-		name                                    string
-		forceUp, changed, running, imageChanged bool
-		wantUp                                  bool
+		name                      string
+		forceUp, changed, running bool
+		wantUp                    bool
 	}{
 		{name: "boot or up, to follow the image", forceUp: true, running: true, wantUp: true},
 		{name: "compose file changed", changed: true, running: true, wantUp: true},
 		{name: "container not running", wantUp: true},
-		{name: "image changed under its tag", running: true, imageChanged: true, wantUp: true},
 		{name: "start with nothing changed", running: true, wantUp: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			reason, up := composeUpReason(tc.forceUp, tc.changed, tc.running, tc.imageChanged)
+			reason, up := composeUpReason(tc.forceUp, tc.changed, tc.running)
 			assert.Equal(t, tc.wantUp, up)
 			assert.Equal(t, tc.wantUp, reason != "")
 		})
