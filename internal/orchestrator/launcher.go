@@ -244,8 +244,9 @@ func ensureLauncher(
 		return 0, err
 	}
 	running := current != nil && current.State == container.StateRunning
+	imageChanged := running && launcherImageChanged(ctx, docker.Client(), current, cfg.PythonImage)
 	recreated := false
-	if reason, up := composeUpReason(forceUp, changed, running); up {
+	if reason, up := composeUpReason(forceUp, changed, running, imageChanged); up {
 		slog.Debug("running compose up for the app launcher", slog.String("reason", reason))
 		cb(StreamMessage{data: "Starting the app launcher"})
 		if err := composeUpFile(ctx, docker, launcherComposeFile(cfg), cb); err != nil {
@@ -278,13 +279,25 @@ func ensureLauncher(
 	return elapsed, nil
 }
 
+// launcherImageChanged tells whether the image behind the launcher's tag is no longer the one the
+// container runs, as after a pull of the same tag. An image missing on the board is left to compose.
+func launcherImageChanged(ctx context.Context, docker dockerClient.APIClient, current *container.Summary, image string) bool {
+	info, err := docker.ImageInspect(ctx, image)
+	if err != nil {
+		return false
+	}
+	return info.ID != current.ImageID
+}
+
 // composeUpReason tells whether compose up has to run for the launcher, and why.
-func composeUpReason(forceUp, changed, running bool) (string, bool) {
+func composeUpReason(forceUp, changed, running, imageChanged bool) (string, bool) {
 	switch {
 	case changed:
 		return "compose file changed", true
 	case !running:
 		return "container not running", true
+	case imageChanged:
+		return "image changed under its tag", true
 	case forceUp:
 		return "forced, to follow the image", true
 	default:
