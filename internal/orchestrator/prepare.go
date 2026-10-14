@@ -22,8 +22,8 @@ import (
 	"github.com/arduino/arduino-app-cli/internal/platform"
 )
 
-// PrepareRelease downloads what an installed release needs to run: the containers its
-// frozen compose file names and the models it is wired with.
+// PrepareRelease downloads what an installed release needs to run: the containers it runs
+// with, see releaseImages, and the models it is wired with.
 func PrepareRelease(
 	ctx context.Context,
 	docker command.Cli,
@@ -43,7 +43,7 @@ func PrepareRelease(
 	// The containers first: a failure here is not worth waiting for a model to find out.
 	cb(StreamMessage{data: "downloading the containers"})
 	cb(StreamMessage{progress: &Progress{Name: "containers", Progress: 0.0}})
-	if err := dockerhelper.PullImages(ctx, docker.Client(), dockerhelper.ComposeImages(prj),
+	if err := dockerhelper.PullImages(ctx, docker.Client(), releaseImages(prj, cfg),
 		func(line string) { cb(StreamMessage{data: line}) },
 		func(label string, curr, total int64) {
 			// The containers are the first half of a prepare, the models the second.
@@ -105,6 +105,18 @@ func PrepareInstalledRelease(
 		return err
 	}
 	return PrepareRelease(ctx, docker, arduinoApp, prj, cfg, plat, cb)
+}
+
+// releaseImages are the images a release runs with on this board: the sidecars its frozen compose
+// file names, and the launcher image in place of the one of its main service, which never runs.
+func releaseImages(prj *types.Project, cfg config.Configuration) []string {
+	images := []string{cfg.PythonImage}
+	for name, service := range prj.Services {
+		if name != mainServiceName && service.Image != "" && !slices.Contains(images, service.Image) {
+			images = append(images, service.Image)
+		}
+	}
+	return images
 }
 
 // checkImages verifies the container images an app needs are on the board
