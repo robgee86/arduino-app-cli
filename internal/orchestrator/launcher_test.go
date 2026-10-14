@@ -279,6 +279,7 @@ func TestGenerateLauncherComposeFile(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
 	require.NoError(t, cfg.AppsDir().MkdirAll())
 	require.NoError(t, cfg.ExamplesBaseDir().MkdirAll())
+	require.NoError(t, cfg.ReleasesDir().MkdirAll())
 	require.NoError(t, cfg.RuntimeDir().MkdirAll())
 	boardEnvs := types.Mapping{"BOARD_NAME": "unoq", "HOST_IP": "10.0.0.2"}
 
@@ -320,6 +321,7 @@ func TestGenerateLauncherComposeFile(t *testing.T) {
 	}
 	assert.Equal(t, cfg.AppsDir().String(), targets[cfg.AppsDir().String()])
 	assert.Equal(t, cfg.ExamplesBaseDir().String(), targets[cfg.ExamplesBaseDir().String()])
+	assert.Equal(t, cfg.ReleasesDir().String(), targets[cfg.ReleasesDir().String()], "the installed releases run in place too")
 	assert.Equal(t, cfg.RuntimeDir().String(), targets[launcherSocketDir])
 	assert.NotContains(t, targets, "/app")
 
@@ -416,6 +418,7 @@ func TestIsInsideLauncherRoots(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
 	assert.True(t, isInsideLauncherRoots(cfg.AppsDir().Join("my-app"), cfg))
 	assert.True(t, isInsideLauncherRoots(cfg.ExamplesBaseDir().Join("inspirational", "common", "blink"), cfg))
+	assert.True(t, isInsideLauncherRoots(cfg.ReleasesDir().Join("my-release"), cfg))
 	assert.False(t, isInsideLauncherRoots(paths.New("/somewhere/else/my-app"), cfg))
 }
 

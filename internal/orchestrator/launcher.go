@@ -116,9 +116,10 @@ func prepareLauncher(
 	return nil
 }
 
-// launcherAppRoots are the folders mounted in the launcher at their host path: the apps run in place.
+// launcherAppRoots are the folders mounted in the launcher at their host path: the apps run in place,
+// the installed releases included.
 func launcherAppRoots(cfg config.Configuration) paths.PathList {
-	return paths.PathList{cfg.AppsDir(), cfg.ExamplesBaseDir()}
+	return paths.PathList{cfg.AppsDir(), cfg.ExamplesBaseDir(), cfg.ReleasesDir()}
 }
 
 func isInsideLauncherRoots(appPath *paths.Path, cfg config.Configuration) bool {
