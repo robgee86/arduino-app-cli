@@ -183,13 +183,13 @@ func checkForModelReferences(ctx context.Context, dockerClient command.Cli,
 	return slices.Collect(maps.Keys(references)), runningAppReference, nil
 }
 
-func isModelInUse(ctx context.Context, modelsIndex *modelsindex.ModelsIndex, dockerClient command.Cli, modelId string) error {
+func isModelInUse(ctx context.Context, cfg config.Configuration, modelsIndex *modelsindex.ModelsIndex, dockerClient command.Cli, modelId string) error {
 	model, err := modelsIndex.NewLookup().ByID(ctx, modelId)
 	if err != nil {
 		return fmt.Errorf("error retrieving model %q: %w", modelId, err)
 	}
 	if model != nil {
-		runningApp, err := getRunningApp(ctx, dockerClient.Client())
+		runningApp, err := getRunningApp(ctx, dockerClient.Client(), cfg)
 		if err != nil {
 			return fmt.Errorf("error retrieving the current running app: %w", err)
 		}
@@ -208,7 +208,7 @@ func isModelInUse(ctx context.Context, modelsIndex *modelsindex.ModelsIndex, doc
 	return nil
 }
 
-func InstallEIModel(ctx context.Context, bricksIndex *bricksindex.BricksIndex, modelsIndex *modelsindex.ModelsIndex, dockerClient command.Cli, eiClient *edgeimpulse.EIClient, eiModelsDir *paths.Path, platform platform.Platform, projectID int, impulseID int) (modelsindex.AIModel, error) {
+func InstallEIModel(ctx context.Context, cfg config.Configuration, bricksIndex *bricksindex.BricksIndex, modelsIndex *modelsindex.ModelsIndex, dockerClient command.Cli, eiClient *edgeimpulse.EIClient, eiModelsDir *paths.Path, platform platform.Platform, projectID int, impulseID int) (modelsindex.AIModel, error) {
 
 	eiParams, err := platform.EIDeploymentParams()
 	if err != nil {
@@ -216,7 +216,7 @@ func InstallEIModel(ctx context.Context, bricksIndex *bricksindex.BricksIndex, m
 	}
 
 	id := fmt.Sprintf("ei-model-%d-%d", projectID, impulseID)
-	err = isModelInUse(ctx, modelsIndex, dockerClient, id)
+	err = isModelInUse(ctx, cfg, modelsIndex, dockerClient, id)
 	if err != nil {
 		return modelsindex.AIModel{}, fmt.Errorf("cannot install EI model: %w", err)
 	}

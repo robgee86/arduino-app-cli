@@ -28,6 +28,7 @@ import (
 
 	"github.com/arduino/arduino-app-cli/cmd/feedback"
 	"github.com/arduino/arduino-app-cli/internal/dockerhelper"
+	"github.com/arduino/arduino-app-cli/internal/fatomic"
 	"github.com/arduino/arduino-app-cli/internal/helpers"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/app"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/bricksindex"
@@ -133,8 +134,8 @@ func downloadSupportedImages(ctx context.Context, cfg config.Configuration, bric
 	}
 	handlerImages := modelsIndex.Handlers.GetDockerImages()
 
-	imagesToPreinstall := make([]string, 0, 1+len(brickImages)+len(handlerImages))
-	imagesToPreinstall = append(imagesToPreinstall, cfg.PythonImage)
+	imagesToPreinstall := make([]string, 0, 2+len(brickImages)+len(handlerImages))
+	imagesToPreinstall = append(imagesToPreinstall, cfg.PythonImage, IngressImage)
 	imagesToPreinstall = append(imagesToPreinstall, brickImages...)
 	imagesToPreinstall = append(imagesToPreinstall, handlerImages...)
 
@@ -216,6 +217,8 @@ func isOurImage(image string) bool {
 		"ghcr.io/arduino/",
 		"influxdb",
 		"artifacts.codelinaro.org/iot-solutions-microservices/",
+		// The exact image: a broader prefix would let the cleanup remove nginx images it did not pull
+		IngressImage,
 	}
 	return slices.ContainsFunc(prefixes, func(p string) bool { return strings.HasPrefix(image, p) })
 }
@@ -245,7 +248,7 @@ func SystemCleanup(ctx context.Context, cfg config.Configuration, bricksindex *b
 	removeNetwork := ourNetworks(appContainers)
 
 	// Remove running app
-	runningApp, err := getRunningApp(ctx, docker.Client())
+	runningApp, err := getRunningApp(ctx, docker.Client(), cfg)
 	if err != nil {
 		feedback.Warnf("failed to get running app - %v", err)
 	}
@@ -315,8 +318,8 @@ func getRequiredImages(cfg config.Configuration, bricksindex *bricksindex.Bricks
 
 	handlerImages := modelsIndex.Handlers.GetDockerImages()
 
-	requiredImages := make([]string, 0, 1+len(bricksContainers)+len(handlerImages))
-	requiredImages = append(requiredImages, cfg.PythonImage)
+	requiredImages := make([]string, 0, 2+len(bricksContainers)+len(handlerImages))
+	requiredImages = append(requiredImages, cfg.PythonImage, IngressImage)
 	requiredImages = append(requiredImages, bricksContainers...)
 	requiredImages = append(requiredImages, handlerImages...)
 
@@ -439,6 +442,7 @@ func downloadLibsAndPlatformsUsedInExamples(ctx context.Context, cfg config.Conf
 			}, str); err != nil {
 				return fmt.Errorf("could not install %s platform %s: %w", platform.PlatformID, version, err)
 			}
+			fatomic.Sync()
 		}
 	}
 
@@ -461,6 +465,7 @@ func downloadLibsAndPlatformsUsedInExamples(ctx context.Context, cfg config.Conf
 			return fmt.Errorf("could not download libs in app %s: %w", appPath, err)
 		}
 	}
+	fatomic.Sync()
 
 	return nil
 }

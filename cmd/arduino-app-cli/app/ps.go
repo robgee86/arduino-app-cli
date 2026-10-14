@@ -16,10 +16,11 @@ import (
 	"github.com/arduino/arduino-app-cli/cmd/arduino-app-cli/internal/servicelocator"
 	"github.com/arduino/arduino-app-cli/cmd/feedback"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator"
+	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
 	"github.com/arduino/arduino-app-cli/internal/tablestyle"
 )
 
-func newPsCmd() *cobra.Command {
+func newPsCmd(cfg config.Configuration) *cobra.Command {
 	var showAll bool
 
 	cmd := &cobra.Command{
@@ -30,7 +31,7 @@ func newPsCmd() *cobra.Command {
 			"include stopped apps. Apps that have never been started are never shown; use 'app list' to " +
 			"browse the full catalog instead.",
 		Run: func(cmd *cobra.Command, args []string) {
-			psHandler(cmd.Context(), showAll)
+			psHandler(cmd.Context(), cfg, showAll)
 		},
 	}
 
@@ -38,11 +39,12 @@ func newPsCmd() *cobra.Command {
 	return cmd
 }
 
-func psHandler(ctx context.Context, showAll bool) {
+func psHandler(ctx context.Context, cfg config.Configuration, showAll bool) {
 	apps, err := orchestrator.ListActiveApps(
 		ctx,
 		servicelocator.GetDockerClient(),
 		servicelocator.GetAppIDProvider(),
+		cfg,
 	)
 	if err != nil {
 		feedback.Fatal(err.Error(), feedback.ErrGeneric)

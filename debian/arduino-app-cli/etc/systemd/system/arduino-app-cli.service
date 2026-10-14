@@ -1,12 +1,17 @@
 [Unit]
 Description=Arduino App CLI daemon Service
-After=network-online.target docker.service arduino-router.service
-Wants=network-online.target docker.service arduino-router.service
+After=network-online.target docker.service arduino-router.service user@1000.service
+# The user session holds the pipewire socket the launcher container mounts: keep it up while the daemon runs
+Wants=network-online.target docker.service arduino-router.service user@1000.service
 
 [Service]
 ExecStart=/usr/bin/arduino-app-cli daemon --port 8800 --log-level error
 User=1000
 Group=arduino
+# Holds the app launcher control socket, kept across restarts: the launcher container mounts it
+RuntimeDirectory=arduino-app-cli
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
 StandardOutput=journal
 StandardError=journal
 Restart=always

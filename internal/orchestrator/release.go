@@ -448,6 +448,8 @@ func buildPythonEnv(ctx context.Context, docker command.Cli, pythonImage string,
 	err := dockerhelper.Run(ctx, docker.Client(), dockerhelper.RunOptions{
 		Image: pythonImage,
 		Cmd:   []string{"prepare"},
+		// The launcher image prepares the app at APP_DIR
+		Env: map[string]string{"APP_DIR": "/app"},
 		Binds: []string{
 			srcDir.String() + ":/app:ro",
 			prebuildDir.String() + ":/app/.cache",

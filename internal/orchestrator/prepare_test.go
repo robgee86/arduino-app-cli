@@ -6,8 +6,15 @@
 package orchestrator
 
 import (
+	"context"
+	"errors"
+	"slices"
 	"testing"
 
+	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/docker/cli/cli/command"
+	"github.com/docker/cli/cli/flags"
+	dockerClient "github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -99,4 +106,54 @@ func TestPrepareModelsSkipsWhatItShould(t *testing.T) {
 	assert.NotContains(t, messages, "downloading the model installed-default-model")
 	assert.NotContains(t, messages, "downloading the model installed-override-model")
 	assert.NotContains(t, messages, "downloading the model unknown-model")
+}
+
+func TestReleaseImages(t *testing.T) {
+	cfg := setTestOrchestratorConfig(t)
+	prj := &types.Project{Services: types.Services{
+		"main":   {Name: "main", Image: "ghcr.io/arduino/app-bricks/python-apps-base:0.12.0"},
+		"runner": {Name: "runner", Image: "ghcr.io/arduino/app-bricks/ei-models-runner:0.12.0"},
+	}}
+	// The launcher runs the release: the image its build froze for the main service is not pulled
+	assert.ElementsMatch(t, []string{cfg.PythonImage, "ghcr.io/arduino/app-bricks/ei-models-runner:0.12.0"}, releaseImages(prj, cfg))
+}
+
+// inspectOnlyDocker answers image inspects only: a listing of the images panics.
+type inspectOnlyDocker struct {
+	dockerClient.APIClient
+	present   []string
+	inspected []string
+}
+
+func (d *inspectOnlyDocker) ImageInspect(_ context.Context, image string, _ ...dockerClient.ImageInspectOption) (dockerClient.ImageInspectResult, error) {
+	d.inspected = append(d.inspected, image)
+	if slices.Contains(d.present, image) {
+		return dockerClient.ImageInspectResult{}, nil
+	}
+	return dockerClient.ImageInspectResult{}, errors.New("no such image")
+}
+
+func (d *inspectOnlyDocker) Ping(context.Context, dockerClient.PingOptions) (dockerClient.PingResult, error) {
+	return dockerClient.PingResult{}, errors.New("docker daemon not reachable")
+}
+
+func TestCheckImagesInspectsOnlyTheImagesOfTheApp(t *testing.T) {
+	docker := &inspectOnlyDocker{present: []string{"runner:1"}}
+	cli, err := command.NewDockerCli(command.WithAPIClient(docker), command.WithBaseContext(t.Context()))
+	require.NoError(t, err)
+	require.NoError(t, cli.Initialize(&flags.ClientOptions{}))
+
+	present := &types.Project{Services: types.Services{
+		"runner": {Name: "runner", Image: "runner:1"},
+		"other":  {Name: "other", Image: "runner:1"},
+	}}
+	require.NoError(t, checkImages(t.Context(), cli, present))
+	assert.Equal(t, []string{"runner:1"}, docker.inspected, "once per image, no listing")
+
+	missing := &types.Project{Services: types.Services{"db": {Name: "db", Image: "db:2"}}}
+	require.ErrorIs(t, checkImages(t.Context(), cli, missing), ErrNotPrepared)
+
+	docker.inspected = nil
+	require.NoError(t, checkImages(t.Context(), cli, &types.Project{}))
+	assert.Empty(t, docker.inspected, "an app without sidecars asks nothing")
 }

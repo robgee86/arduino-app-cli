@@ -9,10 +9,12 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/command"
+	dockerClient "github.com/moby/moby/client"
 
 	"github.com/arduino/arduino-app-cli/internal/dockerhelper"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/app"
@@ -22,8 +24,8 @@ import (
 	"github.com/arduino/arduino-app-cli/internal/platform"
 )
 
-// PrepareRelease downloads what an installed release needs to run: the containers its
-// frozen compose file names and the models it is wired with.
+// PrepareRelease downloads what an installed release needs to run: the containers it runs
+// with, see releaseImages, and the models it is wired with.
 func PrepareRelease(
 	ctx context.Context,
 	docker command.Cli,
@@ -43,7 +45,7 @@ func PrepareRelease(
 	// The containers first: a failure here is not worth waiting for a model to find out.
 	cb(StreamMessage{data: "downloading the containers"})
 	cb(StreamMessage{progress: &Progress{Name: "containers", Progress: 0.0}})
-	if err := dockerhelper.PullImages(ctx, docker.Client(), dockerhelper.ComposeImages(prj),
+	if err := dockerhelper.PullImages(ctx, docker.Client(), releaseImages(prj, cfg),
 		func(line string) { cb(StreamMessage{data: line}) },
 		func(label string, curr, total int64) {
 			// The containers are the first half of a prepare, the models the second.
@@ -107,22 +109,41 @@ func PrepareInstalledRelease(
 	return PrepareRelease(ctx, docker, arduinoApp, prj, cfg, plat, cb)
 }
 
+// releaseImages are the images a release runs with on this board: the sidecars its frozen compose
+// file names, and the launcher image in place of the one of its main service, which never runs.
+func releaseImages(prj *types.Project, cfg config.Configuration) []string {
+	images := []string{cfg.PythonImage}
+	for name, service := range prj.Services {
+		if name != mainServiceName && service.Image != "" && !slices.Contains(images, service.Image) {
+			images = append(images, service.Image)
+		}
+	}
+	return images
+}
+
 // checkImages verifies the container images an app needs are on the board
 func checkImages(
 	ctx context.Context,
 	docker command.Cli,
 	prj *types.Project,
 ) error {
-	allImages, err := dockerhelper.ListImages(ctx, docker.Client())
-	if err != nil {
-		return fmt.Errorf("failed to list the images of the board: %w", err)
-	}
-	for _, image := range dockerhelper.ComposeImages(prj) {
-		if !slices.Contains(allImages, image) {
-			return fmt.Errorf("%w: the container %q is not on the board", ErrNotPrepared, image)
-		}
+	if missing := missingImages(ctx, docker.Client(), dockerhelper.ComposeImages(prj)); len(missing) > 0 {
+		return fmt.Errorf("%w: the container %q is not on the board", ErrNotPrepared, missing[0])
 	}
 	return nil
+}
+
+// missingImages are the images the board cannot inspect. Each is asked on its own: listing
+// every image of the board takes most of a second on the containerd store.
+func missingImages(ctx context.Context, docker dockerClient.APIClient, images []string) []string {
+	var missing []string
+	for _, image := range slices.Compact(slices.Sorted(slices.Values(images))) {
+		if _, err := docker.ImageInspect(ctx, image); err != nil {
+			slog.Debug("image not on the board", slog.String("image", image), slog.String("error", err.Error()))
+			missing = append(missing, image)
+		}
+	}
+	return missing
 }
 
 // prepareModels installs the models an editable app is wired with but does not have yet, so
