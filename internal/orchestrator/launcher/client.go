@@ -20,18 +20,6 @@ import (
 // SocketName is the control socket file name inside the runtime directory.
 const SocketName = "app-launcher.sock"
 
-// InternalPortOffset is how far the app listens from a public port: the launcher maps public port P
-// to internal port P+InternalPortOffset, which the ingress forwards P to.
-const InternalPortOffset = 10000
-
-// MaxPublicPort is the highest public port whose internal port is still a valid port.
-const MaxPublicPort = 65535 - InternalPortOffset
-
-// InternalPort is the port the app listens on in the launcher for a public port.
-func InternalPort(public int) int {
-	return public + InternalPortOffset
-}
-
 const maxResponseBytes = 1024 * 1024
 
 // Error codes of the launcher protocol.
@@ -67,10 +55,8 @@ type StartResponse struct {
 	Warm      bool      `json:"warm"`
 	Runner    string    `json:"runner"`
 	// Prepared tells the launcher installed the app dependencies before the start.
-	Prepared bool `json:"prepared"`
-	// Ports maps each public port of the app to its internal port.
-	Ports   map[int]int `json:"ports"`
-	Timings Timings     `json:"timings"`
+	Prepared bool    `json:"prepared"`
+	Timings  Timings `json:"timings"`
 }
 
 type StoppedChild struct {
@@ -95,10 +81,8 @@ type Child struct {
 	PID       int       `json:"pid"`
 	State     string    `json:"state"`
 	StartedAt time.Time `json:"started_at"`
-	// Ports maps each public port of the app to its internal port.
-	Ports  map[int]int `json:"ports"`
-	Runner string      `json:"runner"`
-	Warm   bool        `json:"warm"`
+	Runner    string    `json:"runner"`
+	Warm      bool      `json:"warm"`
 }
 
 type StatusResponse struct {
@@ -141,8 +125,6 @@ type request struct {
 	App  string            `json:"app,omitempty"`
 	Env  map[string]string `json:"env,omitempty"`
 	Mode string            `json:"mode,omitempty"`
-	// Ports are the public ports of a started app, sent even when empty.
-	Ports []int `json:"ports,omitzero"`
 }
 
 func (c *Client) Ping(ctx context.Context) error {
@@ -150,13 +132,10 @@ func (c *Client) Ping(ctx context.Context) error {
 }
 
 // Start runs the app in place of every other running app, installing its dependencies first when
-// they changed. The app listens on the internal ports of its public ports.
-func (c *Client) Start(ctx context.Context, app string, env map[string]string, ports []int) (StartResponse, error) {
-	if ports == nil {
-		ports = []int{}
-	}
+// they changed.
+func (c *Client) Start(ctx context.Context, app string, env map[string]string) (StartResponse, error) {
 	var resp StartResponse
-	err := c.do(ctx, request{Cmd: cmdStart, App: app, Env: env, Mode: "replace", Ports: ports}, &resp)
+	err := c.do(ctx, request{Cmd: cmdStart, App: app, Env: env, Mode: "replace"}, &resp)
 	return resp, err
 }
 

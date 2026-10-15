@@ -33,12 +33,12 @@ stream {
     server {
         listen 7000;
         set $launcher launcher;
-        proxy_pass $launcher:17000;
+        proxy_pass $launcher:7000;
     }
     server {
         listen 8080;
         set $launcher launcher;
-        proxy_pass $launcher:18080;
+        proxy_pass $launcher:8080;
     }
 }
 `, string(generateIngressConf([]int{7000, 8080})))
@@ -54,7 +54,7 @@ func TestWriteIngressFiles(t *testing.T) {
 
 	changed, err := writeIngressFiles(cfg, []int{8080, 7000, 8080})
 	require.NoError(t, err)
-	assert.True(t, changed)
+	assert.Equal(t, ingressFiles{Conf: true, Compose: true}, changed)
 
 	project := loadCompose(t, ingressComposeFile(cfg))
 	assert.Equal(t, ingressProject, project.Name)
@@ -105,13 +105,20 @@ func TestWriteIngressFiles(t *testing.T) {
 	t.Run("the same ports change nothing", func(t *testing.T) {
 		changed, err := writeIngressFiles(cfg, []int{7000, 8080})
 		require.NoError(t, err)
-		assert.False(t, changed)
+		assert.Equal(t, ingressFiles{}, changed)
+	})
+
+	t.Run("a conf written by hand is noticed on its own", func(t *testing.T) {
+		require.NoError(t, ingressConfFile(cfg).WriteFile([]byte("events {}\n")))
+		changed, err := writeIngressFiles(cfg, []int{7000, 8080})
+		require.NoError(t, err)
+		assert.Equal(t, ingressFiles{Conf: true}, changed)
 	})
 
 	t.Run("no ports, nothing published", func(t *testing.T) {
 		changed, err := writeIngressFiles(cfg, nil)
 		require.NoError(t, err)
-		assert.True(t, changed)
+		assert.Equal(t, ingressFiles{Conf: true, Compose: true}, changed)
 		data, err := ingressComposeFile(cfg).ReadFile()
 		require.NoError(t, err)
 		assert.NotContains(t, string(data), "ports:")
@@ -163,6 +170,11 @@ func (f *fakeDocker) ContainerStop(_ context.Context, id string, _ dockerClient.
 	return dockerClient.ContainerStopResult{}, nil
 }
 
+func (f *fakeDocker) ContainerKill(_ context.Context, id string, options dockerClient.ContainerKillOptions) (dockerClient.ContainerKillResult, error) {
+	f.calls = append(f.calls, "kill "+options.Signal+" "+id)
+	return dockerClient.ContainerKillResult{}, nil
+}
+
 func (f *fakeDocker) ContainerInspect(context.Context, string, dockerClient.ContainerInspectOptions) (dockerClient.ContainerInspectResult, error) {
 	return dockerClient.ContainerInspectResult{Container: container.InspectResponse{State: &container.State{Running: true}}}, nil
 }
@@ -196,6 +208,15 @@ func TestOpenAppPorts(t *testing.T) {
 		docker := newFakeDocker(t, container.StateRunning)
 		require.NoError(t, openAppPorts(t.Context(), docker.cli(t), cfg, []int{7000}, noop))
 		assert.Empty(t, docker.calls)
+	})
+
+	t.Run("a conf that changed under the running ingress reloads it", func(t *testing.T) {
+		// What an upgrade leaves behind: the same ports, a conf written by an older daemon
+		require.NoError(t, ingressConfFile(cfg).WriteFile([]byte("events {}\n")))
+		docker := newFakeDocker(t, container.StateRunning)
+		require.NoError(t, openAppPorts(t.Context(), docker.cli(t), cfg, []int{7000}, noop))
+		assert.Equal(t, []string{"kill HUP " + testIngressID}, docker.calls)
+		assertIngressConf(t, cfg, []int{7000})
 	})
 
 	t.Run("other ports recreate it with compose", func(t *testing.T) {
