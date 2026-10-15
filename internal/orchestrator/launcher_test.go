@@ -404,11 +404,11 @@ func TestPrepareLauncherRejectsWhatItCannotRun(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), cfg.AppsDir().String())
 
-	// Its internal port would be above 65535
+	// Not a TCP port
 	high := newTestApp(t, cfg, "high")
-	err = prepareLauncher(t.Context(), nil, high, []int{8000, 60000}, cfg, platform.Platform{}, noop)
+	err = prepareLauncher(t.Context(), nil, high, []int{8000, 70000}, cfg, platform.Platform{}, noop)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "cannot forward port 60000")
+	assert.Contains(t, err.Error(), "cannot publish port 70000")
 }
 
 func TestLauncherStartError(t *testing.T) {

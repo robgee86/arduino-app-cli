@@ -103,9 +103,10 @@ func prepareLauncher(
 	if roots := launcherAppRoots(cfg); !isInsideLauncherRoots(appToStart.FullPath, cfg) {
 		return fmt.Errorf("the app launcher runs only the apps inside %s", strings.Join(roots.AsStrings(), " or "))
 	}
+	const maxPort = 65535
 	for _, p := range ports {
-		if p < 1 || p > launcher.MaxPublicPort {
-			return fmt.Errorf("the app launcher cannot forward port %d: the app ports go from 1 to %d", p, launcher.MaxPublicPort)
+		if p < 1 || p > maxPort {
+			return fmt.Errorf("the ingress cannot publish port %d: the app ports go from 1 to %d", p, maxPort)
 		}
 	}
 	elapsed, err := ensureLauncher(ctx, docker, cfg, platform, false, cb)
