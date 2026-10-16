@@ -13,6 +13,16 @@ reviewed:
     # multiple licenses all of which are compatible
     - github.com/apparentlymart/go-textseg/v15/textseg
     - sigs.k8s.io/yaml
+    # BSD-3-Clause, its LICENSE file titled "New BSD License" is not detected
+    - github.com/hanwen/go-fuse/v2/fs
+    - github.com/hanwen/go-fuse/v2/fuse
+    - github.com/hanwen/go-fuse/v2/internal
+    - github.com/hanwen/go-fuse/v2/internal/fallocate
+    - github.com/hanwen/go-fuse/v2/internal/ioctl
+    - github.com/hanwen/go-fuse/v2/internal/openat
+    - github.com/hanwen/go-fuse/v2/internal/renameat
+    - github.com/hanwen/go-fuse/v2/internal/xattr
+    - github.com/hanwen/go-fuse/v2/splice
 
 # Source: https://github.com/arduino/tooling-project-assets/blob/main/workflow-templates/assets/check-dependencies/GPL-3.0/.licensed.yml
 allowed:

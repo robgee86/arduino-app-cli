@@ -17,6 +17,7 @@ require (
 	github.com/google/renameio/v2 v2.0.2
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/gosimple/slug v1.15.0
+	github.com/hanwen/go-fuse/v2 v2.12.0
 	github.com/jedib0t/go-pretty/v6 v6.6.8
 	github.com/jub0bs/cors v0.7.0
 	github.com/leonelquinteros/gotext v1.7.2
