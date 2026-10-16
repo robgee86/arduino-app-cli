@@ -75,18 +75,29 @@ type launcherView struct {
 	sidecars []string
 }
 
-// readLauncherView asks the launcher for its children. An unreachable launcher runs nothing.
+// readLauncherView asks the active slot for its child, named by the app folder it mirrors. An
+// unreachable slot runs nothing.
 func readLauncherView(ctx context.Context, cfg config.Configuration) launcherView {
-	view := launcherView{wanted: readLauncherWantedApp(cfg)}
+	var view launcherView
 	if record := readSidecarsRecord(cfg); record != nil {
 		view.sidecars = slices.Collect(maps.Keys(record))
 	}
-	status, err := newLauncherClient(cfg).Status(ctx)
-	if err != nil {
-		slog.Debug("app launcher status unavailable", slog.String("error", err.Error()))
+	s, ok := activeSlot(cfg, nil)
+	if !ok {
 		return view
 	}
-	view.children = status.Children
+	view.wanted = paths.New(s.App)
+	status, err := s.client(cfg).Status(ctx)
+	if err != nil {
+		slog.Debug("slot status unavailable", slog.Int("slot", s.ID), slog.String("error", err.Error()))
+		return view
+	}
+	for _, c := range status.Children {
+		if filepath.Clean(c.App) == slotAppTarget {
+			c.App = s.App
+		}
+		view.children = append(view.children, c)
+	}
 	return view
 }
 

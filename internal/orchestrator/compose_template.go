@@ -42,7 +42,8 @@ import (
 const exprPrefix = "x-arduino-expr:"
 
 type bindOptions struct {
-	CreateHostPath bool `yaml:"create_host_path" json:"create_host_path"`
+	CreateHostPath bool   `yaml:"create_host_path" json:"create_host_path"`
+	Propagation    string `yaml:"propagation,omitempty" json:"propagation,omitempty"`
 }
 
 func generateComposeTemplate(

@@ -14,6 +14,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/arduino/go-paths-helper"
 	semver "go.bug.st/relaxed-semver"
@@ -40,7 +41,9 @@ type Configuration struct {
 	RunnerVersion      string
 	AllowRoot          bool
 	// LauncherPreload overrides the modules the app launcher imports at boot, comma separated; empty keeps its default
-	LauncherPreload                  string
+	LauncherPreload string
+	// SlotFSCacheTimeout is how long the kernel trusts what it read through the app folder mirror of a slot
+	SlotFSCacheTimeout               time.Duration
 	LibrariesAPIURL                  *url.URL
 	EdgeImpulseAPIURL                *url.URL
 	ArduinoPlatformVersionConstraint semver.Constraint
@@ -170,6 +173,7 @@ func NewFromEnv() (Configuration, error) {
 		RunnerVersion:                    RunnerVersion,
 		AllowRoot:                        allowRoot,
 		LauncherPreload:                  os.Getenv("ARDUINO_APP_CLI__LAUNCHER_PRELOAD"),
+		SlotFSCacheTimeout:               durationFromEnv("ARDUINO_APP_CLI__SLOT_FS_CACHE_TIMEOUT", time.Second),
 		LibrariesAPIURL:                  parsedLibrariesURL,
 		EdgeImpulseAPIURL:                parsedEdgeImpulseURL,
 		ArduinoPlatformVersionConstraint: constraint,
@@ -337,4 +341,18 @@ func getPythonImageAndTag(registryBase string) (string, string) {
 		usedPythonImageTag = pythonImage[idx+1:]
 	}
 	return pythonImage, usedPythonImageTag
+}
+
+// durationFromEnv reads a duration such as 1s from the variable, the fallback when unset or invalid.
+func durationFromEnv(name string, fallback time.Duration) time.Duration {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil || d < 0 {
+		slog.Warn("ignoring an invalid duration", slog.String("variable", name), slog.String("value", value))
+		return fallback
+	}
+	return d
 }

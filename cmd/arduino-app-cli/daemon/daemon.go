@@ -33,6 +33,8 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 		Short: "Run the Arduino App CLI as an HTTP daemon",
 		Run: func(cmd *cobra.Command, args []string) {
 			daemonPort, _ := cmd.Flags().GetString("port")
+			// The slot removed and the spare warmed after a start do not hold the request
+			orchestrator.RunSlotsInBackground()
 
 			// The launcher and the ingress survive the cleanup: they carry no app label, the launcher app stops below
 			err := orchestrator.StopAllAppContainers(cmd.Context(), servicelocator.GetDockerClient().Client())

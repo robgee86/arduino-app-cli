@@ -6,11 +6,12 @@
 package orchestrator
 
 import (
+	"bufio"
 	"maps"
 	"os"
 	"slices"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/arduino/go-paths-helper"
 	"github.com/compose-spec/compose-go/v2/loader"
@@ -275,81 +276,62 @@ func TestAppContainers(t *testing.T) {
 	assert.Equal(t, []container.Summary{zone["db"]}, zone.orphans([]string{"runner"}))
 }
 
-func TestGenerateLauncherComposeFile(t *testing.T) {
+func TestGenerateSlotComposeFile(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
-	require.NoError(t, cfg.AppsDir().MkdirAll())
-	require.NoError(t, cfg.ExamplesBaseDir().MkdirAll())
-	require.NoError(t, cfg.ReleasesDir().MkdirAll())
-	require.NoError(t, cfg.RuntimeDir().MkdirAll())
 	boardEnvs := types.Mapping{"BOARD_NAME": "unoq", "HOST_IP": "10.0.0.2"}
+	s := slot{ID: 7}
+	require.NoError(t, s.dir(cfg).MkdirAll())
+	require.NoError(t, s.mountpoint(cfg).MkdirAll())
+	require.NoError(t, s.socketDir(cfg).MkdirAll())
 
-	changed, err := generateLauncherComposeFile(testPythonImage, cfg, boardEnvs, platform.Platform{})
-	require.NoError(t, err)
-	assert.True(t, changed)
+	require.NoError(t, generateSlotComposeFile(testPythonImage, cfg, boardEnvs, platform.Platform{}, s))
 
-	project := loadCompose(t, launcherComposeFile(cfg))
-	assert.Equal(t, launcherProject, project.Name)
-	assert.Equal(t, []string{launcherServiceName}, project.ServiceNames())
-	svc := project.Services[launcherServiceName]
+	project := loadCompose(t, s.composeFile(cfg))
+	assert.Equal(t, "arduino-app-slot-7", project.Name)
+	assert.Equal(t, []string{"slot7"}, project.ServiceNames(), "a name of its own on the network, the ingress upstream")
+	svc := project.Services["slot7"]
 
 	assert.Equal(t, testPythonImage, svc.Image)
 	assert.Equal(t, types.ShellCommand{"/run.sh", "serve"}, svc.Entrypoint)
 	assert.True(t, *svc.Init)
-	assert.Equal(t, "unless-stopped", svc.Restart)
-	assert.Equal(t, types.Duration(10*time.Second), *svc.StopGracePeriod)
-	assert.Equal(t, map[string]string{DockerLauncherLabel: "true"}, map[string]string(svc.Labels))
-
+	assert.Empty(t, svc.Restart, "a slot that stops is replaced, not restarted")
+	assert.Equal(t, map[string]string{DockerLauncherLabel: "true", DockerSlotLabel: "7"}, map[string]string(svc.Labels))
 	require.NotNil(t, svc.HealthCheck)
 	assert.Equal(t, types.HealthCheckTest{"CMD", "arduino-app-launcher", "ping"}, svc.HealthCheck.Test)
-	assert.Equal(t, types.Duration(2*time.Second), *svc.HealthCheck.Interval)
-	assert.Equal(t, types.Duration(60*time.Second), *svc.HealthCheck.StartPeriod)
-	assert.Equal(t, types.Duration(500*time.Millisecond), *svc.HealthCheck.StartInterval)
-
 	assert.Empty(t, svc.Ports, "the ingress publishes the app ports")
 
 	assert.Equal(t, types.MappingWithEquals{
 		"BOARD_NAME":          new("unoq"),
 		"HOST_IP":             new("10.0.0.2"),
+		"APP_HOME":            new("/app"),
 		"APP_LAUNCHER_SOCKET": new("/run/arduino-app-cli/app-launcher.sock"),
 		// The CLI waits for a start as long as the launcher may prepare it
 		"APP_LAUNCHER_PREPARE_TIMEOUT_S": new("600"),
 	}, svc.Environment)
 
-	targets := make(map[string]string, len(svc.Volumes))
+	volumes := make(map[string]types.ServiceVolumeConfig, len(svc.Volumes))
 	for _, v := range svc.Volumes {
-		targets[v.Target] = v.Source
+		volumes[v.Target] = v
 	}
-	assert.Equal(t, cfg.AppsDir().String(), targets[cfg.AppsDir().String()])
-	assert.Equal(t, cfg.ExamplesBaseDir().String(), targets[cfg.ExamplesBaseDir().String()])
-	assert.Equal(t, cfg.ReleasesDir().String(), targets[cfg.ReleasesDir().String()], "the installed releases run in place too")
-	assert.Equal(t, cfg.RuntimeDir().String(), targets[launcherSocketDir])
-	assert.NotContains(t, targets, "/app")
+	require.Contains(t, volumes, "/app")
+	assert.Equal(t, s.mountpoint(cfg).String(), volumes["/app"].Source)
+	require.NotNil(t, volumes["/app"].Bind)
+	assert.Equal(t, "rslave", volumes["/app"].Bind.Propagation, "the mirror mounted later shows inside")
+	assert.Equal(t, s.socketDir(cfg).String(), volumes[launcherSocketDir].Source, "its own socket folder only")
+	for _, root := range launcherAppRoots(cfg) {
+		assert.NotContains(t, volumes, root.String(), "no apps tree is mounted")
+	}
 
 	network := project.Networks["default"]
 	assert.Equal(t, launcherNetwork, network.Name)
-	assert.False(t, bool(network.External))
+	assert.True(t, bool(network.External))
 
-	t.Run("a second generation changes nothing", func(t *testing.T) {
-		changed, err := generateLauncherComposeFile(testPythonImage, cfg, boardEnvs, platform.Platform{})
-		require.NoError(t, err)
-		assert.False(t, changed)
-	})
-
-	t.Run("another board environment changes it", func(t *testing.T) {
-		changed, err := generateLauncherComposeFile(testPythonImage, cfg, types.Mapping{"HOST_IP": "10.0.0.3"}, platform.Platform{})
-		require.NoError(t, err)
-		assert.True(t, changed)
-	})
-
-	t.Run("a preload override reaches the launcher and changes the file", func(t *testing.T) {
+	t.Run("a preload override reaches the launcher", func(t *testing.T) {
 		cfg.LauncherPreload = "arduino.app_utils,arduino.app_peripherals.camera"
-		changed, err := generateLauncherComposeFile(testPythonImage, cfg, boardEnvs, platform.Platform{})
-		require.NoError(t, err)
-		assert.True(t, changed)
-		svc := loadCompose(t, launcherComposeFile(cfg)).Services[launcherServiceName]
+		require.NoError(t, generateSlotComposeFile(testPythonImage, cfg, boardEnvs, platform.Platform{}, s))
+		svc := loadCompose(t, s.composeFile(cfg)).Services["slot7"]
 		assert.Equal(t, new("arduino.app_utils,arduino.app_peripherals.camera"), svc.Environment["APP_LAUNCHER_PRELOAD"])
 	})
-
 }
 
 func TestLauncherAppPorts(t *testing.T) {
@@ -376,39 +358,21 @@ func TestLauncherAppPorts(t *testing.T) {
 	})
 }
 
-func TestComposeUpReason(t *testing.T) {
-	for _, tc := range []struct {
-		name                      string
-		forceUp, changed, running bool
-		wantUp                    bool
-	}{
-		{name: "boot or up, to follow the image", forceUp: true, running: true, wantUp: true},
-		{name: "compose file changed", changed: true, running: true, wantUp: true},
-		{name: "container not running", wantUp: true},
-		{name: "start with nothing changed", running: true, wantUp: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			reason, up := composeUpReason(tc.forceUp, tc.changed, tc.running)
-			assert.Equal(t, tc.wantUp, up)
-			assert.Equal(t, tc.wantUp, reason != "")
-		})
-	}
-}
-
-func TestPrepareLauncherRejectsWhatItCannotRun(t *testing.T) {
+func TestCheckLauncherCanRun(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
-	noop := func(StreamMessage) {}
 
 	elsewhere := app.ArduinoApp{Name: "elsewhere", FullPath: paths.New(t.TempDir())}
-	err := prepareLauncher(t.Context(), nil, elsewhere, nil, cfg, platform.Platform{}, noop)
+	err := checkLauncherCanRun(elsewhere, nil, cfg)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), cfg.AppsDir().String())
 
 	// Not a TCP port
 	high := newTestApp(t, cfg, "high")
-	err = prepareLauncher(t.Context(), nil, high, []int{8000, 70000}, cfg, platform.Platform{}, noop)
+	err = checkLauncherCanRun(high, []int{8000, 70000}, cfg)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot publish port 70000")
+
+	assert.NoError(t, checkLauncherCanRun(high, []int{7000}, cfg))
 }
 
 func TestLauncherStartError(t *testing.T) {
@@ -441,21 +405,51 @@ func TestBoardEnvironment(t *testing.T) {
 	assert.NotContains(t, board, "VIDEO_DEVICE")
 }
 
-func TestLauncherWantedApp(t *testing.T) {
+func TestSlotRecords(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
 	first, second := cfg.AppsDir().Join("first"), cfg.AppsDir().Join("second")
 
-	assert.Nil(t, readLauncherWantedApp(cfg))
-	require.NoError(t, setLauncherWantedApp(cfg, first))
-	assert.Equal(t, first.String(), readLauncherWantedApp(cfg).String())
+	assert.Empty(t, readSlots(cfg))
+	_, ok := activeSlot(cfg, nil)
+	assert.False(t, ok)
 
-	require.NoError(t, clearLauncherWantedApp(cfg, second))
-	assert.Equal(t, first.String(), readLauncherWantedApp(cfg).String(), "another app keeps it")
+	spare, err := newSlotDir(cfg)
+	require.NoError(t, err)
+	assert.Equal(t, 1, spare.ID)
+	assert.Empty(t, readSlots(cfg), "a slot without record is still warming, never taken")
+	require.NoError(t, writeSlot(cfg, spare))
 
-	require.NoError(t, clearLauncherWantedApp(cfg, first))
-	assert.Nil(t, readLauncherWantedApp(cfg))
+	next, err := newSlotDir(cfg)
+	require.NoError(t, err)
+	assert.Equal(t, 2, next.ID, "ids are not reused while a folder exists")
+	writeTestSlot(t, cfg, slot{ID: next.ID, App: first.String(), FSPid: 42})
 
-	require.NoError(t, setLauncherWantedApp(cfg, second))
-	require.NoError(t, clearLauncherWantedApp(cfg, nil))
-	assert.Nil(t, readLauncherWantedApp(cfg))
+	got, ok := activeSlot(cfg, first)
+	require.True(t, ok)
+	assert.Equal(t, slot{ID: 2, App: first.String(), FSPid: 42}, got)
+	_, ok = activeSlot(cfg, second)
+	assert.False(t, ok, "another app has no slot")
+
+	got.Retired = true
+	writeTestSlot(t, cfg, got)
+	_, ok = activeSlot(cfg, nil)
+	assert.False(t, ok, "a retired slot runs nothing")
+	assert.Equal(t, []slot{{ID: 1}, {ID: 2, App: first.String(), Retired: true, FSPid: 42}}, readSlots(cfg))
+}
+
+func TestParseSlotFSMounts(t *testing.T) {
+	mountinfo := `22 1 179:68 / / rw,relatime shared:1 - ext4 /dev/mmcblk0p68 rw
+90 22 0:61 / /var/lib/arduino-app-cli/slots/3/app rw,nosuid,nodev,relatime shared:70 - fuse.slotfs /home/arduino/ArduinoApps/blink rw,user_id=1000,group_id=1000
+91 22 0:62 / /var/lib/arduino-app-cli/slots/4/my\040app rw,nosuid,nodev - fuse.slotfs /home/arduino/ArduinoApps/my\040app rw,user_id=1000
+92 22 0:63 / /tmp/other rw,nosuid,nodev - fuse.sshfs host:/ rw
+`
+	assert.Equal(t, []string{"/var/lib/arduino-app-cli/slots/3/app", "/var/lib/arduino-app-cli/slots/4/my app"},
+		parseSlotFSMounts(bufio.NewScanner(strings.NewReader(mountinfo))))
+}
+
+// writeTestSlot records a slot, its folder created.
+func writeTestSlot(t *testing.T, cfg config.Configuration, s slot) {
+	t.Helper()
+	require.NoError(t, s.dir(cfg).MkdirAll())
+	require.NoError(t, writeSlot(cfg, s))
 }

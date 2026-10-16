@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -21,7 +20,6 @@ import (
 	"github.com/compose-spec/compose-go/v2/loader"
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/command"
-	yaml "github.com/goccy/go-yaml"
 	"github.com/moby/moby/api/types/container"
 	dockerClient "github.com/moby/moby/client"
 
@@ -37,8 +35,6 @@ import (
 const (
 	DockerLauncherLabel = "cc.arduino.app.launcher"
 
-	launcherProject     = "arduino-app-launcher"
-	launcherServiceName = "launcher"
 	// launcherNetwork is shared by the launcher and the app sidecars, which reach each other by service name.
 	launcherNetwork      = "arduino-apps"
 	launcherSocketDir    = "/run/arduino-app-cli"
@@ -52,19 +48,6 @@ const (
 	// A start stops the running app, prepares the new one and forks it.
 	launcherStartTimeout = launcherStopTimeout + launcherPrepareTimeout
 )
-
-func launcherComposeFile(cfg config.Configuration) *paths.Path {
-	return cfg.DataDir().Join("launcher", "compose.yaml")
-}
-
-// launcherWantedAppFile holds the app the launcher should be running: a missing child means the app died.
-func launcherWantedAppFile(cfg config.Configuration) *paths.Path {
-	return cfg.DataDir().Join("launcher", "wanted-app")
-}
-
-func newLauncherClient(cfg config.Configuration) *launcher.Client {
-	return launcher.New(cfg.RuntimeDir().Join(launcher.SocketName).String(), launcherRequestTimeout)
-}
 
 // appPorts are the public ports of an app: the defaults of its bricks, then the ports of app.yaml.
 func appPorts(a app.ArduinoApp, bricksIndex *bricksindex.BricksIndex) []int {
@@ -90,16 +73,9 @@ func appPorts(a app.ArduinoApp, bricksIndex *bricksindex.BricksIndex) []int {
 	return slices.Compact(ports)
 }
 
-// prepareLauncher checks that the launcher can run the app on its public ports, then brings it up.
-func prepareLauncher(
-	ctx context.Context,
-	docker command.Cli,
-	appToStart app.ArduinoApp,
-	ports []int,
-	cfg config.Configuration,
-	platform platform.Platform,
-	cb func(StreamMessage),
-) error {
+// checkLauncherCanRun checks that a slot can run the app: its folder is one the CLI mirrors, its ports
+// ones the ingress can publish.
+func checkLauncherCanRun(appToStart app.ArduinoApp, ports []int, cfg config.Configuration) error {
 	if roots := launcherAppRoots(cfg); !isInsideLauncherRoots(appToStart.FullPath, cfg) {
 		return fmt.Errorf("the app launcher runs only the apps inside %s", strings.Join(roots.AsStrings(), " or "))
 	}
@@ -109,16 +85,10 @@ func prepareLauncher(
 			return fmt.Errorf("the ingress cannot publish port %d: the app ports go from 1 to %d", p, maxPort)
 		}
 	}
-	elapsed, err := ensureLauncher(ctx, docker, cfg, platform, false, cb)
-	if err != nil {
-		return fmt.Errorf("the app launcher is unavailable: %w", err)
-	}
-	cb(StreamMessage{data: fmt.Sprintf("App launcher ready in %s", elapsed.Round(time.Millisecond))})
 	return nil
 }
 
-// launcherAppRoots are the folders mounted in the launcher at their host path: the apps run in place,
-// the installed releases included.
+// launcherAppRoots are the folders whose apps the slots run, each mirrored on its own.
 func launcherAppRoots(cfg config.Configuration) paths.PathList {
 	return paths.PathList{cfg.AppsDir(), cfg.ExamplesBaseDir(), cfg.ReleasesDir()}
 }
@@ -130,73 +100,6 @@ func isInsideLauncherRoots(appPath *paths.Path, cfg config.Configuration) bool {
 		}
 	}
 	return false
-}
-
-// generateLauncherComposeFile writes the launcher compose project, rendered on this board, and
-// tells whether it changed.
-func generateLauncherComposeFile(
-	pythonImage string,
-	cfg config.Configuration,
-	boardEnvs types.Mapping,
-	platform platform.Platform,
-) (bool, error) {
-	envs := boardEnvs.Clone()
-	envs["APP_LAUNCHER_SOCKET"] = launcherSocketDir + "/" + launcher.SocketName
-	envs["APP_LAUNCHER_PREPARE_TIMEOUT_S"] = strconv.Itoa(int(launcherPrepareTimeout.Seconds()))
-	if cfg.LauncherPreload != "" {
-		envs["APP_LAUNCHER_PRELOAD"] = cfg.LauncherPreload // Part of the compose file: changing it recreates the launcher
-	}
-
-	// The launcher is given host paths
-	volumes := []any{volume{Type: "bind", Source: cfg.RuntimeDir().String(), Target: launcherSocketDir}}
-	for _, root := range launcherAppRoots(cfg) {
-		expr, err := mountExpr(root.String())
-		if err != nil {
-			return false, err
-		}
-		volumes = append(volumes, expr)
-	}
-	runtime, err := newPythonRuntime(cfg, platform)
-	if err != nil {
-		return false, err
-	}
-	svc := runtime.service(pythonImage, volumes...)
-	svc.Entrypoint = "/run.sh serve"
-	svc.Restart = "unless-stopped"
-	svc.StopGracePeriod = "10s"
-	svc.Healthcheck = &healthcheck{
-		Test:          []string{"CMD", "arduino-app-launcher", "ping"},
-		Interval:      "2s",
-		StartPeriod:   "60s",
-		StartInterval: "500ms",
-	}
-	svc.Labels = map[string]string{DockerLauncherLabel: "true"}
-	svc.Environment = envs
-
-	compose := struct {
-		Name     string                    `yaml:"name"`
-		Services map[string]service        `yaml:"services"`
-		Networks map[string]composeNetwork `yaml:"networks"`
-	}{
-		Name:     launcherProject,
-		Services: map[string]service{launcherServiceName: svc},
-		Networks: map[string]composeNetwork{"default": {Name: launcherNetwork}},
-	}
-	template, err := yaml.Marshal(compose)
-	if err != nil {
-		return false, err
-	}
-	// The host devices and groups are answered here, the board the launcher runs on
-	data, err := renderComposeTemplate(template)
-	if err != nil {
-		return false, fmt.Errorf("failed to render the launcher compose file: %w", err)
-	}
-
-	changed, err := writeFileIfChanged(launcherComposeFile(cfg), data)
-	if err != nil {
-		return false, fmt.Errorf("failed to write the launcher compose file: %w", err)
-	}
-	return changed, nil
 }
 
 // writeFileIfChanged writes data atomically unless the file already holds it, and tells whether it wrote.
@@ -217,83 +120,10 @@ func writeFileIfChanged(file *paths.Path, data []byte) (bool, error) {
 // The camera is a fact of the app start: a plugged camera must not recreate the launcher.
 func boardEnvironment(ctx context.Context, plat platform.Platform, cfg config.Configuration) types.Mapping {
 	envs := hostEnvironment(ctx, cfg.AppsDir(), cfg)
-	delete(envs, "APP_HOME")
+	delete(envs, appHomeVar)
 	delete(envs, "VIDEO_DEVICE")
 	envs["BOARD_NAME"] = plat.BoardName
 	return envs
-}
-
-// ensureLauncher brings the launcher up to date and running, and waits until it answers. forceUp
-// runs compose up even when nothing changed here, so that a new image under the same tag is picked
-// up: compose recreates the container only when its configuration or image differ.
-func ensureLauncher(
-	ctx context.Context,
-	docker command.Cli,
-	cfg config.Configuration,
-	platform platform.Platform,
-	forceUp bool,
-	cb func(StreamMessage),
-) (time.Duration, error) {
-	started := time.Now()
-	if err := cfg.RuntimeDir().MkdirAll(); err != nil {
-		return 0, fmt.Errorf("failed to create the runtime folder: %w", err)
-	}
-	changed, err := generateLauncherComposeFile(cfg.PythonImage, cfg, boardEnvironment(ctx, platform, cfg), platform)
-	if err != nil {
-		return 0, err
-	}
-
-	current, err := getContainerWithLabel(ctx, docker.Client(), DockerLauncherLabel)
-	if err != nil {
-		return 0, err
-	}
-	running := current != nil && current.State == container.StateRunning
-	recreated := false
-	if reason, up := composeUpReason(forceUp, changed, running); up {
-		slog.Debug("running compose up for the app launcher", slog.String("reason", reason))
-		cb(StreamMessage{data: "Starting the app launcher"})
-		if err := composeUpFile(ctx, docker, launcherComposeFile(cfg), cb); err != nil {
-			return 0, fmt.Errorf("failed to start the app launcher: %w", err)
-		}
-		previous := current
-		if current, err = getContainerWithLabel(ctx, docker.Client(), DockerLauncherLabel); err != nil {
-			return 0, err
-		}
-		if current == nil {
-			return 0, errors.New("the app launcher container was not created")
-		}
-		recreated = previous == nil || previous.ID != current.ID || !running
-		slog.Debug("app launcher compose up done", slog.Bool("recreated", recreated))
-	} else {
-		slog.Debug("app launcher up to date and running, compose up skipped")
-	}
-	// A new or restarted launcher runs no app
-	if recreated {
-		if err := errors.Join(clearLauncherWantedApp(cfg, nil), closeAppPorts(ctx, docker.Client())); err != nil {
-			return 0, err
-		}
-	}
-
-	if err := waitLauncherReady(ctx, docker.Client(), newLauncherClient(cfg), current.ID); err != nil {
-		return 0, err
-	}
-	elapsed := time.Since(started)
-	slog.Info("app launcher ready", slog.Duration("elapsed", elapsed), slog.Bool("recreated", recreated))
-	return elapsed, nil
-}
-
-// composeUpReason tells whether compose up has to run for the launcher, and why.
-func composeUpReason(forceUp, changed, running bool) (string, bool) {
-	switch {
-	case changed:
-		return "compose file changed", true
-	case !running:
-		return "container not running", true
-	case forceUp:
-		return "forced, to follow the image", true
-	default:
-		return "", false
-	}
 }
 
 // waitLauncherReady polls ping until the preload is over. It fails early when the container stops
@@ -376,59 +206,6 @@ func StopAllAppContainers(ctx context.Context, docker dockerClient.APIClient) er
 	return nil
 }
 
-func readLauncherWantedApp(cfg config.Configuration) *paths.Path {
-	data, err := launcherWantedAppFile(cfg).ReadFile()
-	if err != nil || len(data) == 0 {
-		return nil
-	}
-	return paths.New(string(data))
-}
-
-func setLauncherWantedApp(cfg config.Configuration, appPath *paths.Path) error {
-	file := launcherWantedAppFile(cfg)
-	if err := file.Parent().MkdirAll(); err != nil {
-		return err
-	}
-	return fatomic.WriteFile(file.String(), []byte(appPath.String()), 0o644)
-}
-
-// clearLauncherWantedApp forgets the wanted app when it is appPath, or whatever it is when nil.
-func clearLauncherWantedApp(cfg config.Configuration, appPath *paths.Path) error {
-	if wanted := readLauncherWantedApp(cfg); wanted == nil || (appPath != nil && !wanted.EqualsTo(appPath)) {
-		return nil
-	}
-	if err := launcherWantedAppFile(cfg).Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return nil
-}
-
-// EnsureLauncher brings the launcher up, recreating it on a new image, and pulls the ingress image.
-// When stopApps, as the daemon does at boot, it stops what the launcher runs and closes its ports.
-func EnsureLauncher(
-	ctx context.Context,
-	docker command.Cli,
-	cfg config.Configuration,
-	platform platform.Platform,
-	stopApps bool,
-) (time.Duration, error) {
-	started := time.Now()
-	err := withAppsLock(ctx, cfg, func() error {
-		if _, err := ensureLauncher(ctx, docker, cfg, platform, true, func(StreamMessage) {}); err != nil {
-			return err
-		}
-		// Pulled here so that no start has to: an app without ports runs without it
-		if err := pullIngressImage(ctx, docker.Client(), func(StreamMessage) {}); err != nil {
-			slog.Warn("the ingress image is unavailable, the apps with ports cannot start", slog.String("error", err.Error()))
-		}
-		if !stopApps {
-			return nil
-		}
-		return errors.Join(stopLauncherApp(ctx, cfg, nil), closeAppPorts(ctx, docker.Client()))
-	})
-	return time.Since(started), err
-}
-
 // composeUpFile creates, recreates or starts the containers of one of our compose files, as
 // compose up does, and returns once they are started.
 func composeUpFile(ctx context.Context, docker command.Cli, file *paths.Path, cb func(StreamMessage)) error {
@@ -445,4 +222,28 @@ func composeUpFile(ctx context.Context, docker command.Cli, file *paths.Path, cb
 	}
 	prj.ComposeFiles = []string{file.String()}
 	return dockerhelper.ComposeUp(ctx, docker, prj, func(line string) { cb(StreamMessage{data: line}) })
+}
+
+// EnsureLauncher prepares the slots, as the daemon does at boot: it clears what a previous run left,
+// the apps it ran included, warms a spare and pulls the ingress image, so that no start has to.
+func EnsureLauncher(
+	ctx context.Context,
+	docker command.Cli,
+	cfg config.Configuration,
+	platform platform.Platform,
+	_ bool,
+) (time.Duration, error) {
+	started := time.Now()
+	err := withAppsLock(ctx, cfg, func() error {
+		clearSlots(ctx, docker, cfg)
+		if err := errors.Join(ensureAppsNetwork(ctx, docker.Client()), closeAppPorts(ctx, docker.Client())); err != nil {
+			return err
+		}
+		if err := pullIngressImage(ctx, docker.Client(), func(StreamMessage) {}); err != nil {
+			slog.Warn("the ingress image is unavailable, the apps with ports cannot start", slog.String("error", err.Error()))
+		}
+		ensureSpare(ctx, docker, cfg, platform)
+		return nil
+	})
+	return time.Since(started), err
 }

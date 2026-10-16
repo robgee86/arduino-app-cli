@@ -47,10 +47,10 @@ func ingressConfFile(cfg config.Configuration) *paths.Path {
 	return cfg.DataDir().Join("ingress", "nginx", "nginx.conf")
 }
 
-// generateIngressConf forwards each public port to the same port in the launcher, where the app binds
-// it. nginx finds the launcher by its service name through the Docker DNS at each connection, so that
-// it follows a recreated launcher and starts without one.
-func generateIngressConf(ports []int) []byte {
+// generateIngressConf forwards each public port to the same port in the slot running the app, upstream.
+// nginx finds the slot by its service name through the Docker DNS at each connection, so that it
+// starts without one.
+func generateIngressConf(ports []int, upstream string) []byte {
 	var b strings.Builder
 	b.WriteString("worker_processes 1;\nerror_log /dev/stderr warn;\npid /tmp/nginx.pid;\nevents {}\n")
 	if len(ports) == 0 {
@@ -59,7 +59,7 @@ func generateIngressConf(ports []int) []byte {
 	}
 	b.WriteString("stream {\n    resolver 127.0.0.11 valid=5s ipv6=off;\n")
 	for _, p := range ports {
-		fmt.Fprintf(&b, "    server {\n        listen %d;\n        set $launcher %s;\n        proxy_pass $launcher:%d;\n    }\n", p, launcherServiceName, p)
+		fmt.Fprintf(&b, "    server {\n        listen %d;\n        set $launcher %s;\n        proxy_pass $launcher:%d;\n    }\n", p, upstream, p)
 	}
 	b.WriteString("}\n")
 	return []byte(b.String())
@@ -111,9 +111,9 @@ type ingressFiles struct {
 
 // writeIngressFiles writes the ingress for the ports and tells which files changed.
 // The conf goes first: a container created from the compose file finds it.
-func writeIngressFiles(cfg config.Configuration, ports []int) (ingressFiles, error) {
+func writeIngressFiles(cfg config.Configuration, ports []int, upstream string) (ingressFiles, error) {
 	ports = slices.Compact(slices.Sorted(slices.Values(ports)))
-	confChanged, err := writeFileIfChanged(ingressConfFile(cfg), generateIngressConf(ports))
+	confChanged, err := writeFileIfChanged(ingressConfFile(cfg), generateIngressConf(ports, upstream))
 	if err != nil {
 		return ingressFiles{}, fmt.Errorf("failed to write the ingress configuration: %w", err)
 	}
@@ -130,11 +130,11 @@ func writeIngressFiles(cfg config.Configuration, ports []int) (ingressFiles, err
 
 // openAppPorts makes the ingress publish exactly the ports of the app being started. The ingress
 // keeps the last ports while stopped: the same ports start it again, other ones recreate it.
-func openAppPorts(ctx context.Context, docker command.Cli, cfg config.Configuration, ports []int, cb func(StreamMessage)) error {
+func openAppPorts(ctx context.Context, docker command.Cli, cfg config.Configuration, ports []int, upstream string, cb func(StreamMessage)) error {
 	if len(ports) == 0 {
 		return closeAppPorts(ctx, docker.Client())
 	}
-	changed, err := writeIngressFiles(cfg, ports)
+	changed, err := writeIngressFiles(cfg, ports, upstream)
 	if err != nil {
 		return err
 	}
