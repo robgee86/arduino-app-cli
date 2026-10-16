@@ -10,9 +10,22 @@ import (
 	"fmt"
 	"os/user"
 	"strings"
+	"sync"
 
 	"github.com/arduino/go-paths-helper"
 )
+
+var lingering struct {
+	once sync.Once
+	err  error
+}
+
+// EnsureLingering keeps the user's systemd --user manager running without a login session, so that
+// the units started on it outlive the sessions; once per process, never undone.
+func EnsureLingering(ctx context.Context) error {
+	lingering.once.Do(func() { lingering.err = enableLingering(ctx) })
+	return lingering.err
+}
 
 // enableLingering enables lingering for the current user if not already enabled.
 func enableLingering(ctx context.Context) error {

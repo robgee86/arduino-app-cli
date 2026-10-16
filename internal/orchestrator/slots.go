@@ -32,6 +32,7 @@ import (
 	"github.com/arduino/arduino-app-cli/internal/fatomic"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/launcher"
+	"github.com/arduino/arduino-app-cli/internal/orchestrator/pipewire"
 	"github.com/arduino/arduino-app-cli/internal/platform"
 )
 
@@ -59,8 +60,9 @@ type slot struct {
 	App string `json:"app,omitempty"`
 	// Retired marks a slot whose app stopped: it is never used again and goes away.
 	Retired bool `json:"retired,omitempty"`
-	// FSPid is the process serving the mirror of App.
-	FSPid int `json:"fs_pid,omitempty"`
+	// FSUnit is the user unit serving the mirror of App, FSPid its process when no user manager runs.
+	FSUnit string `json:"fs_unit,omitempty"`
+	FSPid  int    `json:"fs_pid,omitempty"`
 }
 
 func slotsDir(cfg config.Configuration) *paths.Path {
@@ -96,6 +98,11 @@ func (s slot) project() string {
 // service is the name of the slot on the shared network, the ingress upstream.
 func (s slot) service() string {
 	return "slot" + strconv.Itoa(s.ID)
+}
+
+// mirrorUnit is the user unit serving the app folder mirror of the slot.
+func (s slot) mirrorUnit() string {
+	return slotProjectPrefix + strconv.Itoa(s.ID) + "-fs.service"
 }
 
 func (s slot) client(cfg config.Configuration) *launcher.Client {
@@ -291,46 +298,64 @@ func removeSlot(ctx context.Context, docker dockerClient.APIClient, cfg config.C
 }
 
 // attachAppFolder mirrors the app folder onto the slot's /app through FUSE and returns once the
-// mirror is mounted. The mirror is served by this executable in a process of its own, so that it
-// outlives a CLI call; fusermount3 mounts it for the user, who owns the mount point.
-func attachAppFolder(cfg config.Configuration, s slot, appPath *paths.Path) (int, error) {
+// mirror is mounted. The mirror is served by this executable in a unit of the user's systemd
+// manager, so that it lives as long as the app, whoever started it and whatever happens to the
+// daemon; without a user manager, in a process of its own. fusermount3 mounts it for the user, who
+// owns the mount point.
+func attachAppFolder(ctx context.Context, cfg config.Configuration, s *slot, appPath *paths.Path) error {
 	started := time.Now()
 	exe, err := os.Executable()
 	if err != nil {
-		return 0, err
+		return err
 	}
-	logFile, err := os.Create(s.dir(cfg).Join("slotfs.log").String())
-	if err != nil {
-		return 0, err
-	}
-	defer logFile.Close()
-	cmd := exec.Command(exe, "system", "slot-fs", "--cache-timeout", cfg.SlotFSCacheTimeout.String(), appPath.String(), s.mountpoint(cfg).String())
-	cmd.Stdout, cmd.Stderr = logFile, logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("failed to start the app folder mirror: %w", err)
-	}
+	serve := []string{exe, "system", "slot-fs", "--cache-timeout", cfg.SlotFSCacheTimeout.String(), appPath.String(), s.mountpoint(cfg).String()}
 	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
+	if hasUserManager() {
+		if err := pipewire.EnsureLingering(ctx); err != nil {
+			slog.Warn("lingering is off: the app folder mirrors end with the last login session", slog.String("error", err.Error()))
+		}
+		//nolint:gosec // this executable and folders the CLI resolved itself
+		cmd := exec.CommandContext(ctx, "systemd-run", append([]string{"--user", "--quiet", "--collect",
+			"--unit=" + s.mirrorUnit(), "--description=App folder mirror of slot " + strconv.Itoa(s.ID), "--"}, serve...)...)
+		cmd.Env = append(os.Environ(), userRuntimeDirEnv())
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to start the app folder mirror: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		s.FSUnit = s.mirrorUnit()
+	} else {
+		logFile, err := os.Create(s.dir(cfg).Join("slotfs.log").String())
+		if err != nil {
+			return err
+		}
+		defer logFile.Close()
+		cmd := exec.Command(serve[0], serve[1:]...) //nolint:gosec // this executable and folders the CLI resolved itself
+		cmd.Stdout, cmd.Stderr = logFile, logFile
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("failed to start the app folder mirror: %w", err)
+		}
+		go func() { exited <- cmd.Wait() }()
+		s.FSPid = cmd.Process.Pid
+	}
 	mountpoint := s.mountpoint(cfg).String()
 	deadline := time.Now().Add(slotAttachTimeout)
 	for !isSlotFSMounted(mountpoint) {
 		select {
 		case err := <-exited:
 			out, _ := s.dir(cfg).Join("slotfs.log").ReadFile()
-			return 0, fmt.Errorf("the app folder mirror exited: %v: %s", err, strings.TrimSpace(string(out)))
+			return fmt.Errorf("the app folder mirror exited: %v: %s", err, strings.TrimSpace(string(out)))
 		case <-time.After(2 * time.Millisecond):
 		}
 		if time.Now().After(deadline) {
-			_ = cmd.Process.Kill()
-			return 0, fmt.Errorf("the app folder mirror was not mounted within %s", slotAttachTimeout)
+			detachAppFolder(cfg, *s)
+			return fmt.Errorf("the app folder mirror was not mounted within %s, see `journalctl --user -u %s`", slotAttachTimeout, s.mirrorUnit())
 		}
 	}
-	slog.Debug("app folder attached", slog.Int("slot", s.ID), slog.String("app", appPath.String()), slog.Duration("elapsed", time.Since(started)))
-	return cmd.Process.Pid, nil
+	slog.Debug("app folder attached", slog.Int("slot", s.ID), slog.String("app", appPath.String()), slog.String("unit", s.FSUnit), slog.Duration("elapsed", time.Since(started)))
+	return nil
 }
 
-// detachAppFolder unmounts the mirror of the slot, which ends the process serving it.
+// detachAppFolder unmounts the mirror of the slot, which ends what serves it.
 func detachAppFolder(cfg config.Configuration, s slot) {
 	mountpoint := s.mountpoint(cfg).String()
 	if isSlotFSMounted(mountpoint) {
@@ -339,9 +364,35 @@ func detachAppFolder(cfg config.Configuration, s slot) {
 			_ = exec.Command("fusermount3", "-uz", mountpoint).Run()
 		}
 	}
-	if s.FSPid > 0 && isSlotFSProcess(s.FSPid) {
+	switch {
+	case s.FSUnit != "":
+		_ = userSystemctl(context.Background(), "stop", s.FSUnit)
+	case s.FSPid > 0 && isSlotFSProcess(s.FSPid):
 		_ = syscall.Kill(s.FSPid, syscall.SIGTERM)
 	}
+}
+
+// hasUserManager tells whether the user's systemd --user manager runs, from its private socket.
+func hasUserManager() bool {
+	if _, err := exec.LookPath("systemd-run"); err != nil {
+		return false
+	}
+	return paths.New(userRuntimeDir(), "systemd", "private").Exist()
+}
+
+func userRuntimeDir() string {
+	return "/run/user/" + strconv.Itoa(os.Getuid())
+}
+
+func userRuntimeDirEnv() string {
+	return "XDG_RUNTIME_DIR=" + userRuntimeDir()
+}
+
+// userSystemctl runs systemctl on the user's manager.
+func userSystemctl(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, "systemctl", append([]string{"--user"}, args...)...) //nolint:gosec // unit names of the CLI
+	cmd.Env = append(os.Environ(), userRuntimeDirEnv())
+	return cmd.Run()
 }
 
 // isSlotFSMounted tells whether a mirror is mounted on the folder.
@@ -518,6 +569,9 @@ func clearSlots(ctx context.Context, docker command.Cli, cfg config.Configuratio
 		for _, c := range containers {
 			_, _ = docker.Client().ContainerRemove(ctx, c.ID, dockerClient.ContainerRemoveOptions{Force: true})
 		}
+	}
+	if hasUserManager() {
+		_ = userSystemctl(ctx, "stop", slotProjectPrefix+"*-fs.service")
 	}
 	prefix := slotsDir(cfg).String() + string(os.PathSeparator)
 	for _, mountpoint := range slotFSMounts() {

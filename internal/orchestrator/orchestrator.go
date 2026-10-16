@@ -372,13 +372,12 @@ func startWithLauncher(
 				return
 			}
 			warm = wasWarm
-			pid, err := attachAppFolder(cfg, spare, appToStart.FullPath)
-			if err != nil {
+			if err := attachAppFolder(ctx, cfg, &spare, appToStart.FullPath); err != nil {
 				removeSlot(ctx, docker.Client(), cfg, spare)
 				attachErr = err
 				return
 			}
-			spare.App, spare.FSPid = appToStart.FullPath.String(), pid
+			spare.App = appToStart.FullPath.String()
 			attachErr = writeSlot(cfg, spare)
 			target = spare
 		})
