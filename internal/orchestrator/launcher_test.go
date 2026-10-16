@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/arduino/go-paths-helper"
 	"github.com/compose-spec/compose-go/v2/loader"
@@ -452,4 +453,27 @@ func writeTestSlot(t *testing.T, cfg config.Configuration, s slot) {
 	t.Helper()
 	require.NoError(t, s.dir(cfg).MkdirAll())
 	require.NoError(t, writeSlot(cfg, s))
+}
+
+func TestSlotSettleSignals(t *testing.T) {
+	t.Run("the unified hierarchy path of a container", func(t *testing.T) {
+		path, ok := cgroupV2Path("0::/system.slice/docker-0123abcd.scope\n")
+		assert.True(t, ok)
+		assert.Equal(t, "/system.slice/docker-0123abcd.scope", path)
+		_, ok = cgroupV2Path("12:cpu,cpuacct:/docker/0123abcd\n")
+		assert.False(t, ok, "cgroup v1 is not read")
+	})
+
+	t.Run("the CPU time of a cgroup", func(t *testing.T) {
+		stat := paths.New(t.TempDir(), "cpu.stat")
+		require.NoError(t, stat.WriteFile([]byte("usage_usec 1500000\nuser_usec 1000000\nsystem_usec 500000\n")))
+		usage, err := readCPUUsage(stat.String())
+		require.NoError(t, err)
+		assert.Equal(t, 1500*time.Millisecond, usage)
+	})
+
+	t.Run("quiet below a sixth of a core", func(t *testing.T) {
+		assert.True(t, isQuiet(10*time.Millisecond, 200*time.Millisecond))
+		assert.False(t, isQuiet(80*time.Millisecond, 200*time.Millisecond), "an app still importing")
+	})
 }

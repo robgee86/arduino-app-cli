@@ -245,7 +245,7 @@ func startApp(
 
 	if appToStart.MainPythonFile == nil {
 		err := errors.Join(stopLauncherApp(ctx, cfg, nil), closeAppPorts(ctx, docker.Client()), stopSidecars(ctx, docker.Client(), cb))
-		afterSlotChange(docker, cfg, platform)
+		afterSlotChange(docker, cfg, platform, nil)
 		if err != nil {
 			return err
 		}
@@ -420,7 +420,7 @@ func startWithLauncher(
 		if stopErr := stopAppProcesses(ctx, docker.Client(), appToStart, cfg, nil); stopErr != nil {
 			slog.Warn("failed to stop the app after a failed start", slog.String("error", stopErr.Error()))
 		}
-		afterSlotChange(docker, cfg, platform)
+		afterSlotChange(docker, cfg, platform, nil)
 		return err
 	}
 
@@ -436,7 +436,7 @@ func startWithLauncher(
 	// The app runs: the start is over for the caller, the lock is held until the orphans are gone
 	cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
 	waitOrphans()
-	afterSlotChange(docker, cfg, platform)
+	afterSlotChange(docker, cfg, platform, &target)
 	return nil
 }
 
@@ -498,7 +498,7 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 		return err
 	}
 	cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
-	afterSlotChange(docker, cfg, platform)
+	afterSlotChange(docker, cfg, platform, nil)
 	return nil
 }
 

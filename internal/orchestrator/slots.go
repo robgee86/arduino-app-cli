@@ -502,14 +502,18 @@ func takeSpare(ctx context.Context, docker command.Cli, cfg config.Configuration
 }
 
 // afterSlotChange removes the retired slots and warms a spare when none is left, in the background
-// in the daemon, before returning otherwise.
-func afterSlotChange(docker command.Cli, cfg config.Configuration, platform platform.Platform) {
+// in the daemon, before returning otherwise. After a start, started, the spare waits until the app
+// has started for real: a warm-up next to a starting app slows both.
+func afterSlotChange(docker command.Cli, cfg config.Configuration, platform platform.Platform, started *slot) {
 	work := func() {
 		ctx := context.Background()
 		for _, s := range readSlots(cfg) {
 			if s.Retired {
 				removeSlot(ctx, docker.Client(), cfg, s)
 			}
+		}
+		if started != nil {
+			waitSlotSettled(ctx, docker.Client(), *started)
 		}
 		ensureSpare(ctx, docker, cfg, platform)
 	}
@@ -593,4 +597,101 @@ func ensureAppsNetwork(ctx context.Context, docker dockerClient.APIClient) error
 		return fmt.Errorf("failed to create the %s network: %w", launcherNetwork, err)
 	}
 	return nil
+}
+
+// The app in a slot has started once its container stays below settledCPU of one core for
+// settledSamples samples in a row; an app that keeps busy, a camera stream, is given settleMaxWait.
+const (
+	settleInterval = 200 * time.Millisecond
+	settledCPU     = 0.15
+	settledSamples = 2
+	settleMaxWait  = 10 * time.Second
+)
+
+// waitSlotSettled waits until the app of the slot is past its start, read from the CPU time of the
+// container's cgroup. Without the cgroup it does not wait.
+func waitSlotSettled(ctx context.Context, docker dockerClient.APIClient, s slot) {
+	started := time.Now()
+	stat, err := slotCPUStat(ctx, docker, s)
+	if err != nil {
+		slog.Debug("slot CPU unavailable, the spare is not deferred", slog.Int("slot", s.ID), slog.String("error", err.Error()))
+		return
+	}
+	previous, err := readCPUUsage(stat)
+	if err != nil {
+		return
+	}
+	quiet := 0
+	for quiet < settledSamples && time.Since(started) < settleMaxWait {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(settleInterval):
+		}
+		usage, err := readCPUUsage(stat)
+		if err != nil {
+			return
+		}
+		if isQuiet(usage-previous, settleInterval) {
+			quiet++
+		} else {
+			quiet = 0
+		}
+		previous = usage
+	}
+	slog.Debug("slot settled, warming the next spare", slog.Int("slot", s.ID), slog.Duration("waited", time.Since(started)))
+}
+
+// isQuiet tells whether a CPU time used over an interval is below settledCPU of one core.
+func isQuiet(used, interval time.Duration) bool {
+	return float64(used) < settledCPU*float64(interval)
+}
+
+// slotCPUStat is the cpu.stat file of the cgroup of the slot container.
+func slotCPUStat(ctx context.Context, docker dockerClient.APIClient, s slot) (string, error) {
+	c, err := slotContainer(ctx, docker, s)
+	if err != nil || c == nil {
+		return "", errors.Join(errors.New("no slot container"), err)
+	}
+	inspected, err := docker.ContainerInspect(ctx, c.ID, dockerClient.ContainerInspectOptions{})
+	if err != nil {
+		return "", err
+	}
+	if inspected.Container.State == nil || inspected.Container.State.Pid == 0 {
+		return "", errors.New("the slot container is not running")
+	}
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(inspected.Container.State.Pid) + "/cgroup")
+	if err != nil {
+		return "", err
+	}
+	group, ok := cgroupV2Path(string(data))
+	if !ok {
+		return "", errors.New("not a cgroup v2 hierarchy")
+	}
+	return "/sys/fs/cgroup" + group + "/cpu.stat", nil
+}
+
+// cgroupV2Path reads the unified hierarchy path from /proc/<pid>/cgroup.
+func cgroupV2Path(procCgroup string) (string, bool) {
+	for line := range strings.SplitSeq(procCgroup, "\n") {
+		if path, ok := strings.CutPrefix(line, "0::"); ok && path != "" {
+			return path, true
+		}
+	}
+	return "", false
+}
+
+// readCPUUsage reads usage_usec from a cpu.stat file.
+func readCPUUsage(stat string) (time.Duration, error) {
+	data, err := os.ReadFile(stat)
+	if err != nil {
+		return 0, err
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if value, ok := strings.CutPrefix(line, "usage_usec "); ok {
+			usec, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+			return time.Duration(usec) * time.Microsecond, err
+		}
+	}
+	return 0, errors.New("no usage_usec in " + stat)
 }
