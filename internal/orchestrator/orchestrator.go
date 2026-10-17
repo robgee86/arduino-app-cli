@@ -330,9 +330,10 @@ func pullAppImages(ctx context.Context, docker command.Cli, prj *types.Project, 
 }
 
 // startWithLauncher brings the sidecars zone to running, when Docker resolves their names, then has
-// the launcher start the app on the internal ports of its public ports, which the ingress then
-// forwards; the bricks retry until the sidecars accept connections. The previous launcher app stops
-// meanwhile.
+// the launcher start the app on its ports, which the ingress then forwards; the bricks retry until
+// the sidecars accept connections. A previous, different app stops meanwhile; the app itself, when
+// it is the one running, is left to the launcher, which stops it right before the fork: no separate
+// round trip, and its /app alias stays in place.
 func startWithLauncher(
 	ctx context.Context,
 	docker command.Cli,
@@ -349,10 +350,14 @@ func startWithLauncher(
 	)
 	stopping := time.Now()
 	var stopped time.Duration
-	wg.Go(func() {
-		previousStopErr = stopLauncherApp(ctx, cfg, nil)
-		stopped = time.Since(stopping)
-	})
+	wanted := readLauncherWantedApp(cfg)
+	reload := wanted != nil && wanted.EqualsTo(appToStart.FullPath)
+	if !reload {
+		wg.Go(func() {
+			previousStopErr = stopLauncherApp(ctx, cfg, nil)
+			stopped = time.Since(stopping)
+		})
+	}
 	removeOrphans, sidecarsErr := reconcileSidecars(ctx, docker, cfg, zone, cb)
 	wg.Wait()
 
@@ -395,7 +400,10 @@ func startWithLauncher(
 	if err := setLauncherWantedApp(cfg, appToStart.FullPath); err != nil {
 		slog.Warn("failed to record the launcher app", slog.String("error", err.Error()))
 	}
-	slog.Info("app started by the launcher", slog.String("app", appToStart.FullPath.String()), slog.Int("pid", started.PID),
+	if reload {
+		stopped = time.Duration(started.Timings.StopMs * float64(time.Millisecond))
+	}
+	slog.Info("app started by the launcher", slog.String("app", appToStart.FullPath.String()), slog.Int("pid", started.PID), slog.Bool("reload", reload),
 		slog.Bool("warm", started.Warm), slog.Any("ports", ports), slog.Duration("previous_stop", stopped), slog.Bool("prepared", started.Prepared),
 		slog.Float64("prepare_ms", started.Timings.PrepareMs), slog.Float64("fork_ms", started.Timings.ForkMs))
 	if started.Prepared {
