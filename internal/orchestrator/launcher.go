@@ -242,11 +242,22 @@ func ensureLauncher(
 	if err != nil {
 		return 0, err
 	}
+	rendered := time.Since(started)
+	// An unchanged compose file and a launcher answering on its socket: up to date and running,
+	// the Docker round trips below have nothing to add
+	if !forceUp && !changed {
+		if err := newLauncherClient(cfg).WithTimeout(pingTimeout).Ping(ctx); err == nil {
+			elapsed := time.Since(started)
+			slog.Debug("app launcher answers, up to date", slog.Duration("elapsed", elapsed), slog.Duration("render", rendered))
+			return elapsed, nil
+		}
+	}
 
 	current, err := getContainerWithLabel(ctx, docker.Client(), DockerLauncherLabel)
 	if err != nil {
 		return 0, err
 	}
+	listed := time.Since(started) - rendered
 	running := current != nil && current.State == container.StateRunning
 	recreated := false
 	if reason, up := composeUpReason(forceUp, changed, running); up {
@@ -278,7 +289,8 @@ func ensureLauncher(
 		return 0, err
 	}
 	elapsed := time.Since(started)
-	slog.Info("app launcher ready", slog.Duration("elapsed", elapsed), slog.Bool("recreated", recreated))
+	slog.Info("app launcher ready", slog.Duration("elapsed", elapsed), slog.Bool("recreated", recreated),
+		slog.Duration("render", rendered), slog.Duration("list", listed))
 	return elapsed, nil
 }
 
@@ -296,10 +308,12 @@ func composeUpReason(forceUp, changed, running bool) (string, bool) {
 	}
 }
 
+// pingTimeout bounds one ping of the launcher, a local socket round trip.
+const pingTimeout = 500 * time.Millisecond
+
 // waitLauncherReady polls ping until the preload is over. It fails early when the container stops
 // or restarts, as an image without the serve mode does.
 func waitLauncherReady(ctx context.Context, docker dockerClient.APIClient, client *launcher.Client, id string) error {
-	const pingTimeout = 500 * time.Millisecond
 	inspected, err := docker.ContainerInspect(ctx, id, dockerClient.ContainerInspectOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to inspect the app launcher: %w", err)
