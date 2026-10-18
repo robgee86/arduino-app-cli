@@ -380,7 +380,7 @@ func startWithLauncher(
 	var started launcher.StartResponse
 	if err == nil {
 		cb(StreamMessage{data: "Starting the app in the launcher, preparing its dependencies when they changed"})
-		started, err = newLauncherClient(cfg).WithTimeout(launcherStartTimeout).Start(ctx, appToStart.FullPath.String(), envs)
+		started, err = newLauncherClient(cfg).WithTimeout(launcherStartTimeout).Start(ctx, appToStart.FullPath.String(), envs, ports)
 		err = launcherStartError(err)
 	}
 	if err == nil {
@@ -404,7 +404,7 @@ func startWithLauncher(
 		stopped = time.Duration(started.Timings.StopMs * float64(time.Millisecond))
 	}
 	slog.Info("app started by the launcher", slog.String("app", appToStart.FullPath.String()), slog.Int("pid", started.PID), slog.Bool("reload", reload),
-		slog.Bool("warm", started.Warm), slog.Any("ports", ports), slog.Duration("previous_stop", stopped), slog.Bool("prepared", started.Prepared),
+		slog.Bool("warm", started.Warm), slog.Bool("confined", started.Confined), slog.Any("ports", ports), slog.Duration("previous_stop", stopped), slog.Bool("prepared", started.Prepared),
 		slog.Float64("prepare_ms", started.Timings.PrepareMs), slog.Float64("fork_ms", started.Timings.ForkMs))
 	if started.Prepared {
 		cb(StreamMessage{data: fmt.Sprintf("Preparing dependencies took %d ms", int64(started.Timings.PrepareMs))})
