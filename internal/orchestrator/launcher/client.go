@@ -56,6 +56,8 @@ type StartResponse struct {
 	StartedAt time.Time `json:"started_at"`
 	Warm      bool      `json:"warm"`
 	Runner    string    `json:"runner"`
+	// Confined tells the app runs confined to its folder.
+	Confined bool `json:"confined"`
 	// Prepared tells the launcher installed the app dependencies before the start.
 	Prepared bool    `json:"prepared"`
 	Timings  Timings `json:"timings"`
@@ -127,6 +129,8 @@ type request struct {
 	App  string            `json:"app,omitempty"`
 	Env  map[string]string `json:"env,omitempty"`
 	Mode string            `json:"mode,omitempty"`
+	// Ports are the TCP ports the app may bind, the ones it declares; sent on every start, even when empty.
+	Ports []int `json:"ports,omitzero"`
 }
 
 func (c *Client) Ping(ctx context.Context) error {
@@ -134,10 +138,13 @@ func (c *Client) Ping(ctx context.Context) error {
 }
 
 // Start runs the app in place of every other running app, installing its dependencies first when
-// they changed.
-func (c *Client) Start(ctx context.Context, app string, env map[string]string) (StartResponse, error) {
+// they changed. The app may bind only its ports.
+func (c *Client) Start(ctx context.Context, app string, env map[string]string, ports []int) (StartResponse, error) {
+	if ports == nil {
+		ports = []int{}
+	}
 	var resp StartResponse
-	err := c.do(ctx, request{Cmd: cmdStart, App: app, Env: env, Mode: "replace"}, &resp)
+	err := c.do(ctx, request{Cmd: cmdStart, App: app, Env: env, Mode: "replace", Ports: ports}, &resp)
 	return resp, err
 }
 
