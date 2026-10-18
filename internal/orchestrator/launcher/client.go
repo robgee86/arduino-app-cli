@@ -27,8 +27,10 @@ const (
 	CodeBadRequest  = "bad_request"
 	CodeNotFound    = "not_found"
 	CodeUnsupported = "unsupported"
-	CodeBusy        = "busy"
-	CodeInternal    = "internal"
+	// CodeForbidden is a request from a process of an app, which the launcher refuses.
+	CodeForbidden = "forbidden"
+	CodeBusy      = "busy"
+	CodeInternal  = "internal"
 	// CodePrepareFailed is a start whose dependencies failed to install: the message ends with the install output.
 	CodePrepareFailed = "prepare_failed"
 )
