@@ -65,7 +65,7 @@ func AppLogs(
 	var sources []logSource
 	if req.ShowAppLogs {
 		sources = append(sources, func(ctx context.Context, yield func(LogMessage) bool) {
-			readAppLogFile(ctx, appLogFile(app), req.Tail, req.Follow, yield)
+			readAppLogFile(ctx, app.FullPath, req.Tail, req.Follow, yield)
 		})
 	}
 	if req.ShowServicesLogs {
