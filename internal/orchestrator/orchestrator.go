@@ -377,10 +377,13 @@ func startWithLauncher(
 		}
 	}
 
+	if err == nil {
+		err = launcher.WriteEnvironment(appToStart.FullPath.String(), envs)
+	}
 	var started launcher.StartResponse
 	if err == nil {
 		cb(StreamMessage{data: "Starting the app in the launcher, preparing its dependencies when they changed"})
-		started, err = newLauncherClient(cfg).WithTimeout(launcherStartTimeout).Start(ctx, appToStart.FullPath.String(), envs, ports)
+		started, err = newLauncherClient(cfg).WithTimeout(launcherStartTimeout).Start(ctx, appToStart.FullPath.String(), ports)
 		err = launcherStartError(err)
 	}
 	if err == nil {
