@@ -16,29 +16,33 @@ import (
 	"time"
 
 	"github.com/arduino/go-paths-helper"
-
-	"github.com/arduino/arduino-app-cli/internal/orchestrator/app"
 )
 
 const appLogPollInterval = 250 * time.Millisecond
 
-// appLogFile is where the launcher writes the app output, rotated into app.log.1.
-func appLogFile(a app.ArduinoApp) *paths.Path {
-	return a.ProvisioningStateDir().Join("logs", "app.log")
-}
+// appLogFile is where the launcher writes the app output, within the app folder, rotated into app.log.1.
+const appLogFile = ".cache/logs/app.log"
 
 // readAppLogFile yields the last tail lines of the app log, all of them when tail is nil, then
-// with follow the lines appended later, across rotations, until ctx is done.
-func readAppLogFile(ctx context.Context, logFile *paths.Path, tail *uint64, follow bool, yield func(LogMessage) bool) {
+// with follow the lines appended later, across rotations, until ctx is done. The log lies where
+// the app may plant a link: it is read within the app folder, through which no link leads out.
+func readAppLogFile(ctx context.Context, appDir *paths.Path, tail *uint64, follow bool, yield func(LogMessage) bool) {
 	emit := func(line []byte) bool {
 		return yield(LogMessage{Source: LogSourceMain, ContainerName: mainServiceName, Content: string(line)})
 	}
 
-	follower := &logFollower{path: logFile.String()}
+	root, err := os.OpenRoot(appDir.String())
+	if err != nil {
+		slog.Debug("cannot open the app folder", slog.String("path", appDir.String()), slog.String("error", err.Error()))
+		return
+	}
+	defer root.Close()
+
+	follower := &logFollower{root: root, path: appLogFile}
 	defer follower.close()
 	follower.open()
 	follower.read()
-	rotated, _ := os.ReadFile(logFile.String() + ".1")
+	rotated := readWithin(root, appLogFile+".1")
 	data := slices.Concat(rotated, follower.pending)
 	follower.pending = nil
 	if follow {
@@ -73,8 +77,20 @@ func readAppLogFile(ctx context.Context, logFile *paths.Path, tail *uint64, foll
 	}
 }
 
+// readWithin returns the content of the file at path within the root, nothing when it cannot be read.
+func readWithin(root *os.Root, path string) []byte {
+	file, err := root.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	data, _ := io.ReadAll(file)
+	return data
+}
+
 // logFollower reads what is appended to a log, reopening it when it is rotated or truncated.
 type logFollower struct {
+	root    *os.Root
 	path    string
 	file    *os.File
 	pending []byte
@@ -98,7 +114,7 @@ func (f *logFollower) poll() [][]byte {
 }
 
 func (f *logFollower) open() {
-	file, err := os.Open(f.path)
+	file, err := f.root.Open(f.path)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			slog.Debug("cannot open the app log", slog.String("path", f.path), slog.String("error", err.Error()))
@@ -124,7 +140,7 @@ func (f *logFollower) replaced() bool {
 	if f.file == nil {
 		return false
 	}
-	onPath, err := os.Stat(f.path)
+	onPath, err := f.root.Stat(f.path)
 	if err != nil {
 		return false
 	}
