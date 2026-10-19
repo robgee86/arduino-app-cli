@@ -87,10 +87,10 @@ func TestClientRequests(t *testing.T) {
 		assert.Equal(t, request{Cmd: cmdPing}, <-fake.requests)
 	})
 
-	t.Run("start replaces with the given env", func(t *testing.T) {
-		resp, err := client.Start(ctx, testApp, map[string]string{"FOO": "bar"}, []int{7000, 8080})
+	t.Run("start replaces with the given ports", func(t *testing.T) {
+		resp, err := client.Start(ctx, testApp, []int{7000, 8080})
 		require.NoError(t, err)
-		assert.Equal(t, request{Cmd: cmdStart, App: testApp, Env: map[string]string{"FOO": "bar"}, Mode: "replace", Ports: []int{7000, 8080}}, <-fake.requests)
+		assert.Equal(t, request{Cmd: cmdStart, App: testApp, Mode: "replace", Ports: []int{7000, 8080}}, <-fake.requests)
 		assert.Equal(t, 42, resp.PID)
 		assert.True(t, resp.Warm)
 		assert.Equal(t, "python", resp.Runner)
@@ -132,7 +132,7 @@ func TestClientErrors(t *testing.T) {
 		fake := newFakeLauncher(t, func(string) string {
 			return `{"ok":false,"error":{"code":"unsupported","message":"use mode replace"}}`
 		})
-		_, err := New(fake.socket, time.Second).Start(context.Background(), testApp, nil, nil)
+		_, err := New(fake.socket, time.Second).Start(context.Background(), testApp, nil)
 		var launcherErr *Error
 		require.ErrorAs(t, err, &launcherErr)
 		assert.Equal(t, CodeUnsupported, launcherErr.Code)
@@ -144,7 +144,7 @@ func TestClientErrors(t *testing.T) {
 		fake := newFakeLauncher(t, func(string) string {
 			return `{"ok":false,"error":{"code":"prepare_failed","message":"pip failed\nERROR: no nump"}}`
 		})
-		_, err := New(fake.socket, time.Second).Start(context.Background(), testApp, nil, nil)
+		_, err := New(fake.socket, time.Second).Start(context.Background(), testApp, nil)
 		var launcherErr *Error
 		require.ErrorAs(t, err, &launcherErr)
 		assert.Equal(t, CodePrepareFailed, launcherErr.Code)
