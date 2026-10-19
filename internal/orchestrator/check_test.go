@@ -308,6 +308,28 @@ func TestCheckBricksReturnsMissingRequiredVariableError(t *testing.T) {
 	assert.Equal(t, "arduino:cloud", missing.BrickID)
 }
 
+func TestCheckBricksRefusesReservedVariables(t *testing.T) {
+	index := &bricksindex.BricksIndex{BuiltInBricks: []bricksindex.Brick{
+		{ID: "arduino:web_ui"},
+		{ID: "arduino:local", Variables: []bricksindex.BrickVariable{{Name: "PYTHONPATH", DefaultValue: "/elsewhere"}}},
+	}}
+
+	// Set by the app on any brick, declared or not
+	err := checkBricks(t.Context(), []app.Brick{{ID: "arduino:web_ui", Variables: map[string]string{"LD_PRELOAD": "/x.so", "TOKEN": "t"}}}, index, &modelsindex.ModelsIndex{})
+	var reserved *ReservedVariableError
+	require.ErrorAs(t, err, &reserved)
+	assert.Equal(t, "LD_PRELOAD", reserved.Name)
+	assert.Equal(t, "arduino:web_ui", reserved.BrickID)
+
+	// Declared by a brick of the app's own
+	err = checkBricks(t.Context(), []app.Brick{{ID: "arduino:local"}}, index, &modelsindex.ModelsIndex{})
+	require.ErrorAs(t, err, &reserved)
+	assert.Equal(t, "PYTHONPATH", reserved.Name)
+
+	// Ordinary names pass
+	require.NoError(t, checkBricks(t.Context(), []app.Brick{{ID: "arduino:web_ui", Variables: map[string]string{"TOKEN": "t"}}}, index, &modelsindex.ModelsIndex{}))
+}
+
 func TestValidateVirtualDevice(t *testing.T) {
 	// fail if a camera device is not detected and one of two brick require a physical camera
 
