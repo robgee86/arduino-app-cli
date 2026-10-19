@@ -6,6 +6,7 @@
 package orchestrator
 
 import (
+	"os"
 	"testing"
 
 	"github.com/arduino/go-paths-helper"
@@ -246,4 +247,16 @@ bricks:
 	require.Equal(t, "python-apps-base:latest", main.Image)
 	require.Equal(t, "Hello {{ name }}, reply", *main.Environment["PROMPT"])
 	require.Contains(t, main.DependsOn, "ei-video-obj-detection-runner")
+}
+
+func TestRenderComposeFileStaysWithinTheAppFolder(t *testing.T) {
+	setTestOrchestratorConfig(t)
+	arduinoApp := app.ArduinoApp{FullPath: paths.New(t.TempDir())}
+	outside := paths.New(t.TempDir())
+	require.NoError(t, outside.Join(app.MainTemplateFileName).WriteFile([]byte("services: {}\n")))
+	require.NoError(t, os.Symlink(outside.String(), arduinoApp.ProvisioningStateDir().String()))
+
+	_, err := renderComposeFile(t.Context(), &arduinoApp, types.Mapping{}, types.Mapping{}, "test-app")
+	require.Error(t, err, "a link leading out of the app folder is not followed")
+	require.False(t, outside.Join("app-compose.yaml").Exist())
 }

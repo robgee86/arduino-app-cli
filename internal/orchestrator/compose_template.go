@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"maps"
 	"os"
+	"path"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -158,7 +160,14 @@ func generateComposeTemplate(
 		},
 	}}
 
-	includes, err := frozenComposeIncludes(composeFiles, genPath, cfg, appEnv)
+	// Written within the app folder: a link the app plants under its .cache leads the writes nowhere else
+	state, err := openStateDir(genPath)
+	if err != nil {
+		return err
+	}
+	defer state.Close()
+
+	includes, err := frozenComposeIncludes(composeFiles, state, cfg, appEnv)
 	if err != nil {
 		return err
 	}
@@ -201,7 +210,7 @@ func generateComposeTemplate(
 
 	// A compose file cannot declare a service it also includes, so the overrides of the
 	// included services go in a template of their own.
-	if err := writeOverrideTemplate(genPath, services, appEnv, runtime.cgroupRules, runtime.groupNames); err != nil {
+	if err := writeOverrideTemplate(state, services, appEnv, runtime.cgroupRules, runtime.groupNames); err != nil {
 		return err
 	}
 
@@ -210,8 +219,7 @@ func generateComposeTemplate(
 	if err != nil {
 		return err
 	}
-	mainTemplateFile := genPath.Join(app.MainTemplateFileName)
-	if err := mainTemplateFile.WriteFile(data); err != nil {
+	if err := state.WriteFile(app.MainTemplateFileName, data); err != nil {
 		return err
 	}
 
@@ -322,11 +330,11 @@ func containerLogging() *logging {
 // included by, substituted, and is the include: list of that template. What a copy states
 // no longer depends on the asset dir it came from, nor on the environment of whoever
 // starts the app: only the host facts are left for the render step to answer.
-func frozenComposeIncludes(composeFiles paths.PathList, genPath *paths.Path, cfg config.Configuration, appEnv types.Mapping) ([]string, error) {
-	composesDir := genPath.Join("compose")
+func frozenComposeIncludes(composeFiles paths.PathList, state *stateDir, cfg config.Configuration, appEnv types.Mapping) ([]string, error) {
+	const composesDir = "compose"
 	// A leftover copy from a previous resolve would be included again if a brick that
 	// was removed is added back with a compose of its own.
-	if err := composesDir.RemoveAll(); err != nil {
+	if err := state.RemoveAll(composesDir); err != nil {
 		return nil, fmt.Errorf("failed to remove %s: %w", composesDir, err)
 	}
 
@@ -346,21 +354,14 @@ func frozenComposeIncludes(composeFiles paths.PathList, genPath *paths.Path, cfg
 			return nil, err
 		}
 
-		dst := composesDir.JoinPath(relPath)
-		if err := dst.Parent().MkdirAll(); err != nil {
-			return nil, fmt.Errorf("failed to create %s: %w", dst.Parent(), err)
-		}
-		if err := dst.WriteFile(frozen); err != nil {
+		dst := path.Join(composesDir, filepath.ToSlash(relPath.String()))
+		if err := state.WriteFile(dst, frozen); err != nil {
 			return nil, fmt.Errorf("failed to write %s: %w", dst, err)
 		}
 
 		// Relative: docker compose resolves an include from the project directory, the
 		// one holding the template, so the app folder can be moved or shipped.
-		include, err := dst.RelFrom(genPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve the include path of %s: %w", dst, err)
-		}
-		includes = append(includes, include.String())
+		includes = append(includes, dst)
 	}
 	return includes, nil
 }
@@ -436,16 +437,12 @@ func frozenYAML(content []byte, lookup func(string) (string, bool)) ([]byte, err
 	return data, nil
 }
 
-func writeOverrideTemplate(genPath *paths.Path, services []serviceInfo, appEnv types.Mapping, cgroupRules, groupNames []string) error {
-	overrideTemplateFile := genPath.Join(app.OverrideTemplateFileName)
-
+func writeOverrideTemplate(state *stateDir, services []serviceInfo, appEnv types.Mapping, cgroupRules, groupNames []string) error {
 	// A leftover from a previous resolve would keep overriding services the app no longer has.
 	if len(services) == 0 {
 		slog.Debug("No services to override, skipping override compose template generation")
-		if overrideTemplateFile.Exist() {
-			if err := overrideTemplateFile.Remove(); err != nil {
-				return fmt.Errorf("failed to remove existing override compose template: %w", err)
-			}
+		if err := state.Remove(app.OverrideTemplateFileName); err != nil {
+			return fmt.Errorf("failed to remove existing override compose template: %w", err)
 		}
 		return nil
 	}
@@ -456,7 +453,7 @@ func writeOverrideTemplate(genPath *paths.Path, services []serviceInfo, appEnv t
 	if err != nil {
 		return err
 	}
-	return overrideTemplateFile.WriteFile(data)
+	return state.WriteFile(app.OverrideTemplateFileName, data)
 }
 
 // servicesOverrides is what to apply to the services the brick and service composes
