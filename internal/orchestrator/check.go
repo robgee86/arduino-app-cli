@@ -36,6 +36,25 @@ func (e *MissingRequiredVariableError) Error() string {
 	return fmt.Sprintf("variable %q is required by brick %q", e.Name, e.BrickID)
 }
 
+// ReservedVariableError reports a brick variable named after a setting of the loader or the
+// interpreter, which the app launcher never takes from an app.
+type ReservedVariableError struct {
+	Name    string
+	BrickID string
+}
+
+func (e *ReservedVariableError) Error() string {
+	return fmt.Sprintf("variable %q of brick %q is reserved: it would steer the dynamic loader or the interpreter", e.Name, e.BrickID)
+}
+
+// reservedVariablePrefixes name what the dynamic loader and the interpreter read before any app
+// code runs, and what the launcher decides itself: no brick, built-in or local, may set them.
+var reservedVariablePrefixes = []string{"LD_", "GCONV_PATH", "PATH", "HOME", "PYTHON", "APP_LAUNCHER_"}
+
+func reservedVariable(name string) bool {
+	return slices.ContainsFunc(reservedVariablePrefixes, func(prefix string) bool { return strings.HasPrefix(name, prefix) })
+}
+
 // selectedModelID resolves the model a brick is wired with: the app override, or the brick
 // default when the app names none.
 func selectedModelID(brick app.Brick, definition *bricksindex.Brick) string {
@@ -85,6 +104,18 @@ func checkBricks(ctx context.Context, bricks []app.Brick, index *bricksindex.Bri
 			if !exist {
 				// TODO: we should return warnings
 				slog.Warn("[skip] variable does not exist into the brick definition", "variable", appBrickVariableName, "brick", indexBrick.ID)
+			}
+		}
+
+		// A variable the app sets, or a local brick declares, must not be one the loader or the interpreter reads
+		for name := range appBrick.Variables {
+			if reservedVariable(name) {
+				allErrors = errors.Join(allErrors, &ReservedVariableError{Name: name, BrickID: indexBrick.ID})
+			}
+		}
+		for _, indexBrickVariable := range indexBrick.Variables {
+			if reservedVariable(indexBrickVariable.Name) {
+				allErrors = errors.Join(allErrors, &ReservedVariableError{Name: indexBrickVariable.Name, BrickID: indexBrick.ID})
 			}
 		}
 
