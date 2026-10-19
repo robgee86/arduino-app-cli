@@ -17,7 +17,7 @@ import (
 // EnvironmentFile is where an app finds the environment it runs with, relative to its folder: the
 // app process reads it once confined, after the fork. The launcher process never sees it, so
 // nothing of one app, its secrets included, lingers in the memory the next app is forked from.
-var EnvironmentFile = filepath.Join(".cache", "launcher", "environment.json")
+var EnvironmentFile = filepath.Join(".cache", "environment.json")
 
 // WriteEnvironment writes the environment of the app into its folder, readable by its uid only.
 // Every step stays within the app folder: a link the app planted on the way fails the write.
@@ -32,7 +32,7 @@ func WriteEnvironment(appDir string, env map[string]string) error {
 	}
 	defer root.Close()
 	if err := root.MkdirAll(filepath.Dir(EnvironmentFile), 0o755); err != nil {
-		return fmt.Errorf("cannot create the launcher folder of the app: %w", err)
+		return fmt.Errorf("cannot create the cache folder of the app: %w", err)
 	}
 	if err := fatomic.WriteFileIn(root, EnvironmentFile, data, 0o600); err != nil {
 		return fmt.Errorf("cannot write the app environment: %w", err)
