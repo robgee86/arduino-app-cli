@@ -6,6 +6,7 @@
 package orchestrator
 
 import (
+	"os"
 	"testing"
 
 	"github.com/arduino/go-paths-helper"
@@ -97,7 +98,10 @@ func TestFrozenComposeIncludes(t *testing.T) {
 	genPath := appDir.Join(".cache")
 	require.NoError(t, genPath.MkdirAll())
 
-	includes, err := frozenComposeIncludes(paths.NewPathList(assetCompose.String(), localCompose.String()), genPath, cfg, types.Mapping{})
+	state, err := openStateDir(genPath)
+	require.NoError(t, err)
+	defer state.Close()
+	includes, err := frozenComposeIncludes(paths.NewPathList(assetCompose.String(), localCompose.String()), state, cfg, types.Mapping{})
 	require.NoError(t, err)
 	assert.Equal(t, []string{
 		"compose/compose/arduino/asset_brick/brick_compose.yaml",
@@ -106,4 +110,31 @@ func TestFrozenComposeIncludes(t *testing.T) {
 	for _, include := range includes {
 		assert.FileExists(t, genPath.Join(include).String())
 	}
+}
+
+func TestStateDirStaysWithinTheAppFolder(t *testing.T) {
+	cfg := setTestOrchestratorConfig(t)
+	appDir := paths.New(t.TempDir()).Join("my-app")
+	require.NoError(t, appDir.MkdirAll())
+	outside := paths.New(t.TempDir())
+	// An app, confined or not, can plant a link where the daemon writes
+	require.NoError(t, os.Symlink(outside.String(), appDir.Join(".cache").String()))
+
+	_, err := openStateDir(appDir.Join(".cache"))
+	require.Error(t, err, "a link leading out of the app folder is not followed")
+
+	compose := cfg.AssetDir().Join("compose", "arduino", "asset_brick", "brick_compose.yaml")
+	require.NoError(t, compose.Parent().MkdirAll())
+	require.NoError(t, compose.WriteFile([]byte("services:\n  svc:\n    image: busybox\n")))
+	require.NoError(t, appDir.Join(".cache").Remove())
+	require.NoError(t, appDir.Join(".cache", "compose").Parent().MkdirAll())
+	require.NoError(t, os.Symlink(outside.String(), appDir.Join(".cache", "compose").String()))
+	state, err := openStateDir(appDir.Join(".cache"))
+	require.NoError(t, err)
+	defer state.Close()
+	require.NoError(t, outside.Join("precious").WriteFile([]byte("precious\n")))
+	_, err = frozenComposeIncludes(paths.NewPathList(compose.String()), state, cfg, types.Mapping{})
+	require.NoError(t, err, "a link planted deeper is replaced, not followed")
+	assert.True(t, appDir.Join(".cache", "compose").IsDir())
+	assert.True(t, outside.Join("precious").Exist(), "nothing is removed or written outside the app folder")
 }

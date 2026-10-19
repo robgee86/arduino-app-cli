@@ -133,13 +133,6 @@ func (p *Provision) Resolve(
 		return fmt.Errorf("provisioning failed: arduinoApp is nil")
 	}
 
-	// genPath is the .cache of the app, or the prebuild dir of a release.
-	if genPath.NotExist() {
-		if err := genPath.MkdirAll(); err != nil {
-			return fmt.Errorf("provisioning failed: unable to create %s: %w", genPath, err)
-		}
-	}
-
 	bricksIndex = bricksIndex.WithAppBricks(arduinoApp.LocalBricks)
 
 	return generateComposeTemplate(arduinoApp, genPath, bricksIndex, servicesIndex, p.pythonImage, cfg, appEnv, platform)
@@ -155,10 +148,6 @@ func (p *Provision) Render(
 ) (*types.Project, error) {
 	if arduinoApp == nil {
 		return nil, fmt.Errorf("provisioning failed: arduinoApp is nil")
-	}
-
-	if arduinoApp.AppComposeTemplateFilePath().NotExist() {
-		return nil, fmt.Errorf("provisioning failed: %s not found, the app was not resolved", app.MainTemplateFileName)
 	}
 
 	// The docker project names what docker creates, so it is the app installed here and
