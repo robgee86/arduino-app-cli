@@ -8,6 +8,7 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -79,25 +80,34 @@ var hostFuncs = template.FuncMap{
 // renderComposeFile writes the compose file the app is started with: the template
 // evaluated on this board, with its includes merged in.
 func renderComposeFile(ctx context.Context, arduinoApp *app.ArduinoApp, env, secrets types.Mapping, projectName string) (*types.Project, error) {
+	// Read and written within the app folder: a link the app plants under its .cache leads nowhere else
+	root, err := os.OpenRoot(arduinoApp.FullPath.String())
+	if err != nil {
+		return nil, fmt.Errorf("cannot open the app folder: %w", err)
+	}
+	defer root.Close()
+	stateDir := arduinoApp.ProvisioningStateDir().Base()
 	// The overrides are a second compose file, merged over the main one. It is absent
 	// when no included compose declares a service.
-	templateFiles := paths.PathList{arduinoApp.AppComposeTemplateFilePath()}
-	if override := arduinoApp.AppComposeOverrideTemplateFilePath(); override.Exist() {
-		templateFiles.Add(override)
+	templateFiles := []string{filepath.Join(stateDir, app.MainTemplateFileName)}
+	if override := filepath.Join(stateDir, app.OverrideTemplateFileName); fileExistsIn(root, override) {
+		templateFiles = append(templateFiles, override)
 	}
 
 	renderer := newComposeRenderer()
 	configFiles := make([]types.ConfigFile, 0, len(templateFiles))
 	for _, templateFile := range templateFiles {
-		content, err := templateFile.ReadFile()
-		if err != nil {
+		content, err := root.ReadFile(templateFile)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%s not found, the app was not resolved", templateFile)
+		} else if err != nil {
 			return nil, fmt.Errorf("cannot read %s: %w", templateFile, err)
 		}
 		rendered, err := renderer.template(content)
 		if err != nil {
 			return nil, fmt.Errorf("cannot render %s: %w", templateFile, err)
 		}
-		configFiles = append(configFiles, types.ConfigFile{Filename: templateFile.String(), Content: rendered})
+		configFiles = append(configFiles, types.ConfigFile{Filename: arduinoApp.FullPath.Join(templateFile).String(), Content: rendered})
 	}
 
 	prj, err := loader.LoadWithContext(ctx,
@@ -124,7 +134,7 @@ func renderComposeFile(ctx context.Context, arduinoApp *app.ArduinoApp, env, sec
 	// it writes: a value holding a $ would be substituted a second time.
 	data = bytes.ReplaceAll(data, []byte("$"), []byte("$$"))
 	composeFile := arduinoApp.AppComposeFilePath()
-	if err := fatomic.WriteFile(composeFile.String(), data, 0644); err != nil {
+	if err := fatomic.WriteFileIn(root, filepath.Join(stateDir, composeFile.Base()), data, 0o644); err != nil {
 		return nil, err
 	}
 	// What the containers state they were started from: `docker compose ls` reads it.
@@ -273,4 +283,9 @@ func (r *composeRenderer) value(value string) (any, error) {
 		return mapping, nil
 	}
 	return out, nil
+}
+
+func fileExistsIn(root *os.Root, name string) bool {
+	_, err := root.Stat(name)
+	return err == nil
 }
