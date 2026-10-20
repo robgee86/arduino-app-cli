@@ -153,6 +153,39 @@ func waitContainerRunning(ctx context.Context, docker dockerClient.APIClient, id
 	}
 }
 
+// waitContainerHealthy waits for the healthcheck of a running container to pass, as compose does for
+// a service_healthy dependency. It fails when the container exits or its healthcheck fails.
+func waitContainerHealthy(ctx context.Context, docker dockerClient.APIClient, id string) error {
+	deadline := time.Now().Add(sidecarReadyTimeout)
+	for {
+		inspected, err := docker.ContainerInspect(ctx, id, dockerClient.ContainerInspectOptions{})
+		if err != nil {
+			return err
+		}
+		info := inspected.Container
+		switch {
+		case info.State == nil:
+			return errors.New("the container has no state")
+		case !info.State.Running && !info.State.Restarting && info.State.Status != container.StateCreated:
+			return fmt.Errorf("the container %s with code %d", info.State.Status, info.State.ExitCode)
+		case info.State.Health == nil:
+			return errors.New("the container has no healthcheck")
+		case info.State.Health.Status == container.Healthy:
+			return nil
+		case info.State.Health.Status == container.Unhealthy:
+			return errors.New("the container is unhealthy")
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("still %s after %s", info.State.Health.Status, sidecarReadyTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(readyPollInterval):
+		}
+	}
+}
+
 // waitContainersRunning waits for every container to run, see waitContainerRunning.
 func waitContainersRunning(ctx context.Context, docker dockerClient.APIClient, containers appContainers) error {
 	return forEachContainer(slices.Collect(maps.Values(containers)), func(c container.Summary) error {

@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/arduino/go-paths-helper"
@@ -250,16 +251,64 @@ func ensureAppContainer(
 	if err := waitAppContainerReady(ctx, docker.Client(), c.client(ctx, docker.Client(), cfg), main.ID); err != nil {
 		return 0, false, err
 	}
+	if !park {
+		if err := waitSidecarsReady(ctx, docker.Client(), c, project); err != nil {
+			return 0, false, err
+		}
+	}
 	elapsed := time.Since(started)
 	slog.Info("app container ready", slog.String("project", c.project), slog.Duration("elapsed", elapsed), slog.Bool("changed", !unchanged))
 	return elapsed, true, nil
 }
 
-// startSidecars starts the sidecars of the app that are not running: they stop with the app, the
-// main container does not.
+// startSidecars starts the sidecars of the app that are not running and waits until they are ready:
+// they stop with the app, the main container does not.
 func startSidecars(ctx context.Context, docker dockerClient.APIClient, c appContainer, project appProject) error {
 	sidecars := slices.DeleteFunc(project.services(), func(s string) bool { return s == mainServiceName })
-	return startStoppedContainers(ctx, docker, c, sidecars...)
+	if err := startStoppedContainers(ctx, docker, c, sidecars...); err != nil {
+		return err
+	}
+	return waitSidecarsReady(ctx, docker, c, project)
+}
+
+// waitSidecarsReady waits for the sidecars the way compose waits for the dependencies of the main
+// service: healthy when the brick declares a healthcheck, running otherwise. The app is forked
+// only then, as it was started only then.
+func waitSidecarsReady(ctx context.Context, docker dockerClient.APIClient, c appContainer, project appProject) error {
+	if len(project.services()) == 1 {
+		return nil
+	}
+	containers, err := getAppContainers(ctx, docker, c.project)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for name, svc := range project.prj.Services {
+		if name == mainServiceName {
+			continue
+		}
+		ctr, ok := containers[name]
+		if !ok {
+			return fmt.Errorf("the sidecar %s has no container", name)
+		}
+		wg.Go(func() {
+			var err error
+			if svc.HealthCheck != nil && !svc.HealthCheck.Disable {
+				err = waitContainerHealthy(ctx, docker, ctr.ID)
+			} else {
+				err = waitContainerRunning(ctx, docker, ctr.ID)
+			}
+			if err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Errorf("the sidecar %s is not ready: %w", containerName(ctr), err))
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // startStoppedContainers starts the containers of the services that exist and do not run.

@@ -6,7 +6,9 @@
 package orchestrator
 
 import (
+	"context"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"github.com/compose-spec/compose-go/v2/loader"
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/moby/moby/api/types/container"
+	dockerClient "github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -376,4 +379,70 @@ func TestWantedApp(t *testing.T) {
 
 	require.NoError(t, wantedAppFile(cfg).WriteFile([]byte(first.String())))
 	assert.Nil(t, readWantedApp(cfg), "a record of an older version is none")
+}
+
+// inspectingDocker answers the container list of one project and an inspect per container id, the
+// health of a container improving at each inspect.
+type inspectingDocker struct {
+	*fakeDocker
+	containers []container.Summary
+	health     map[string][]container.HealthStatus
+	mu         sync.Mutex
+}
+
+func (f *inspectingDocker) ContainerList(context.Context, dockerClient.ContainerListOptions) (dockerClient.ContainerListResult, error) {
+	return dockerClient.ContainerListResult{Items: f.containers}, nil
+}
+
+func (f *inspectingDocker) ContainerInspect(_ context.Context, id string, _ dockerClient.ContainerInspectOptions) (dockerClient.ContainerInspectResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	state := &container.State{Running: true, Status: container.StateRunning}
+	if steps := f.health[id]; len(steps) > 0 {
+		state.Health = &container.Health{Status: steps[0]}
+		if len(steps) > 1 {
+			f.health[id] = steps[1:]
+		}
+	}
+	return dockerClient.ContainerInspectResult{Container: container.InspectResponse{State: state}}, nil
+}
+
+func TestWaitSidecarsReady(t *testing.T) {
+	cfg := setTestOrchestratorConfig(t)
+	bricksIndex, servicesIndex := setTestBricks(t, cfg)
+	a := newTestApp(t, cfg, "with-sidecar", "arduino:web_ui", "arduino:object_detection")
+	c := appContainerOf(cfg, a.FullPath)
+	project, err := adaptAppProject(renderTestApp(t, cfg, &a, bricksIndex, servicesIndex, types.Mapping{}), c, cfg, types.Mapping{})
+	require.NoError(t, err)
+	const runner = "ei-obj-detection-runner"
+	require.NotNil(t, project.prj.Services[runner].HealthCheck, "the test sidecar declares a healthcheck")
+	ctr := func(service, id string) container.Summary {
+		return container.Summary{ID: id, Names: []string{"/" + c.project + "-" + service + "-1"}, State: container.StateRunning, Labels: map[string]string{composeProjectLabel: c.project, composeServiceLabel: service}}
+	}
+
+	t.Run("a healthy sidecar is waited for until its healthcheck passes", func(t *testing.T) {
+		docker := &inspectingDocker{fakeDocker: newFakeDocker(t), containers: []container.Summary{ctr(mainServiceName, "main"), ctr(runner, "runner")},
+			health: map[string][]container.HealthStatus{"runner": {container.Starting, container.Starting, container.Healthy}}}
+		require.NoError(t, waitSidecarsReady(t.Context(), docker, c, project))
+		assert.Equal(t, []container.HealthStatus{container.Healthy}, docker.health["runner"], "polled until healthy")
+	})
+
+	t.Run("an unhealthy sidecar fails the start", func(t *testing.T) {
+		docker := &inspectingDocker{fakeDocker: newFakeDocker(t), containers: []container.Summary{ctr(mainServiceName, "main"), ctr(runner, "runner")},
+			health: map[string][]container.HealthStatus{"runner": {container.Unhealthy}}}
+		err := waitSidecarsReady(t.Context(), docker, c, project)
+		require.ErrorContains(t, err, "ei-obj-detection-runner-1 is not ready: the container is unhealthy")
+	})
+
+	t.Run("a missing sidecar container fails the start", func(t *testing.T) {
+		docker := &inspectingDocker{fakeDocker: newFakeDocker(t), containers: []container.Summary{ctr(mainServiceName, "main")}}
+		require.ErrorContains(t, waitSidecarsReady(t.Context(), docker, c, project), "has no container")
+	})
+
+	t.Run("an app without sidecars waits for nothing", func(t *testing.T) {
+		plain := newTestApp(t, cfg, "plain", "arduino:web_ui")
+		project, err := adaptAppProject(renderTestApp(t, cfg, &plain, bricksIndex, servicesIndex, types.Mapping{}), appContainerOf(cfg, plain.FullPath), cfg, types.Mapping{})
+		require.NoError(t, err)
+		require.NoError(t, waitSidecarsReady(t.Context(), newFakeDocker(t), appContainerOf(cfg, plain.FullPath), project))
+	})
 }
