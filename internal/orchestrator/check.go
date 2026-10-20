@@ -47,12 +47,14 @@ func (e *ReservedVariableError) Error() string {
 	return fmt.Sprintf("variable %q of brick %q is reserved: it would steer the dynamic loader or the interpreter", e.Name, e.BrickID)
 }
 
-// reservedVariablePrefixes name what the dynamic loader and the interpreter read before any app
-// code runs, and what the launcher decides itself: no brick, built-in or local, may set them.
-var reservedVariablePrefixes = []string{"LD_", "GCONV_PATH", "PATH", "HOME", "PYTHON", "APP_LAUNCHER_"}
+// reservedVariablePrefixes name what the dynamic loader, the interpreter and the dependency installer read
+// before any app code runs, the proxies every client follows, and what the launcher decides itself: no
+// brick, built-in or local, may set them, in any case.
+var reservedVariablePrefixes = []string{"LD_", "GCONV_PATH", "PATH", "HOME", "PYTHON", "APP_LAUNCHER_", "UV_", "PIP_", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
 
 func reservedVariable(name string) bool {
-	return slices.ContainsFunc(reservedVariablePrefixes, func(prefix string) bool { return strings.HasPrefix(name, prefix) })
+	upper := strings.ToUpper(name)
+	return slices.ContainsFunc(reservedVariablePrefixes, func(prefix string) bool { return strings.HasPrefix(upper, prefix) })
 }
 
 // selectedModelID resolves the model a brick is wired with: the app override, or the brick

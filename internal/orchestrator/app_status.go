@@ -38,7 +38,7 @@ func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker comma
 			_ = yield(AppInfo{}, err)
 			return
 		}
-		last := statusByPath(mergeAppStatus(containers, readAppsView(ctx, cfg)))
+		last := statusByPath(mergeAppStatus(containers, readAppsView(ctx, docker.Client(), cfg)))
 
 		ticker := time.NewTicker(launcherPollInterval)
 		defer ticker.Stop()
@@ -65,7 +65,7 @@ func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker comma
 			case <-ticker.C:
 			}
 
-			current := statusByPath(mergeAppStatus(containers, readAppsView(ctx, cfg)))
+			current := statusByPath(mergeAppStatus(containers, readAppsView(ctx, docker.Client(), cfg)))
 			for _, change := range statusChanges(last, current) {
 				info, err := appInfoFromStatus(cfg, idProvider, change)
 				if err != nil {

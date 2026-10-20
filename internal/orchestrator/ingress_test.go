@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/flags"
 	"github.com/moby/moby/api/types/container"
@@ -186,6 +187,12 @@ func (f *fakeDocker) ContainerKill(_ context.Context, id string, options dockerC
 	return dockerClient.ContainerKillResult{}, nil
 }
 
+// ContainerRestart finds no app container: the tests run none.
+func (f *fakeDocker) ContainerRestart(_ context.Context, id string, _ dockerClient.ContainerRestartOptions) (dockerClient.ContainerRestartResult, error) {
+	f.calls = append(f.calls, "restart "+id)
+	return dockerClient.ContainerRestartResult{}, cerrdefs.ErrNotFound
+}
+
 func (f *fakeDocker) ContainerInspect(context.Context, string, dockerClient.ContainerInspectOptions) (dockerClient.ContainerInspectResult, error) {
 	return dockerClient.ContainerInspectResult{Container: container.InspectResponse{State: &container.State{Running: true}}}, nil
 }
@@ -316,7 +323,7 @@ func TestPullIngressImage(t *testing.T) {
 func TestStopAppProcessesSilencesTheIngressOfItsApp(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
 	require.NoError(t, cfg.RuntimeDir().MkdirAll())
-	// The app container is unreachable: it runs nothing
+	// The app container is unreachable: the stop falls back to a restart, which finds no container
 	stopped := newTestApp(t, cfg, "stopped")
 	stopped.MainPythonFile = stopped.FullPath.Join("python", "main.py")
 	startedAt := time.Now()
@@ -327,7 +334,7 @@ func TestStopAppProcessesSilencesTheIngressOfItsApp(t *testing.T) {
 		docker := newFakeDocker(t, container.StateRunning)
 		require.NoError(t, setWantedApp(cfg, cfg.AppsDir().Join("other"), startedAt))
 		require.NoError(t, stopAppProcesses(t.Context(), docker, stopped, cfg, nil))
-		assert.Empty(t, docker.calls)
+		assert.Equal(t, []string{"restart stopped-main-1"}, docker.calls)
 		assertIngressConf(t, cfg, "other-main-1", []int{7000})
 		assert.NotNil(t, readWantedApp(cfg))
 	})
@@ -338,7 +345,7 @@ func TestStopAppProcessesSilencesTheIngressOfItsApp(t *testing.T) {
 		docker := newFakeDocker(t, container.StateRunning)
 		require.NoError(t, setWantedApp(cfg, stopped.FullPath, startedAt))
 		require.NoError(t, stopAppProcesses(t.Context(), docker, stopped, cfg, nil))
-		assert.Equal(t, []string{"kill HUP " + testIngressID}, docker.calls)
+		assert.Equal(t, []string{"restart stopped-main-1", "kill HUP " + testIngressID}, docker.calls)
 		assert.Nil(t, readWantedApp(cfg))
 		assertIngressConf(t, cfg, "", nil)
 		assert.Equal(t, []int{7000}, publishedIngressPorts(cfg))

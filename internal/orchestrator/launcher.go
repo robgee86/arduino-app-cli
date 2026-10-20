@@ -55,8 +55,8 @@ const (
 	appReadyTimeout = 90 * time.Second
 
 	launcherRequestTimeout = 2 * time.Second
-	// A stop waits a 5 s grace before SIGKILL.
-	launcherStopTimeout = 60 * time.Second
+	// A stop waits a 5 s grace before SIGKILL; a supervisor silent for longer is restarted with its container.
+	launcherStopTimeout = 15 * time.Second
 	// launcherPrepareTimeout bounds the install of the app dependencies, the supervisor is given it.
 	launcherPrepareTimeout = 600 * time.Second
 	// A start stops the running app, prepares the new one and forks it.
@@ -87,10 +87,6 @@ func (c appContainer) composeFile(cfg config.Configuration) *paths.Path {
 // runtimeDir is mounted in the container at appSocketDir.
 func (c appContainer) runtimeDir(cfg config.Configuration) *paths.Path {
 	return cfg.RuntimeDir().Join("apps", c.key())
-}
-
-func (c appContainer) client(cfg config.Configuration) *launcher.Client {
-	return launcher.New(c.runtimeDir(cfg).Join(launcher.SocketName).String(), launcherRequestTimeout)
 }
 
 // containerName is the name compose would give the container.
@@ -285,10 +281,17 @@ func ensureAppContainer(
 		return 0, err
 	}
 	if !changed {
-		if err := c.client(cfg).WithTimeout(pingTimeout).Ping(ctx); err == nil {
+		err := c.client(ctx, docker.Client(), cfg).WithTimeout(pingTimeout).Ping(ctx)
+		if err == nil {
 			elapsed := time.Since(started)
 			slog.Debug("app container answers, up to date", slog.String("project", c.project), slog.Duration("elapsed", elapsed))
 			return elapsed, nil
+		}
+		// Something else answers on the socket path: the container is restarted, its supervisor binds the socket anew
+		if errors.Is(err, launcher.ErrPeer) {
+			if err := restartAppContainer(ctx, docker.Client(), c, err.Error()); err != nil {
+				return 0, err
+			}
 		}
 	}
 
@@ -301,7 +304,7 @@ func ensureAppContainer(
 	if err != nil {
 		return 0, err
 	}
-	if err := waitAppContainerReady(ctx, docker.Client(), c.client(cfg), id); err != nil {
+	if err := waitAppContainerReady(ctx, docker.Client(), c.client(ctx, docker.Client(), cfg), id); err != nil {
 		return 0, err
 	}
 	elapsed := time.Since(started)
@@ -318,8 +321,12 @@ func waitAppContainerReady(ctx context.Context, docker dockerClient.APIClient, c
 	client = client.WithTimeout(pingTimeout)
 	deadline := time.Now().Add(appReadyTimeout)
 	for {
-		if err := client.Ping(ctx); err == nil {
+		err := client.Ping(ctx)
+		if err == nil {
 			return nil
+		}
+		if errors.Is(err, launcher.ErrPeer) {
+			return err
 		}
 		inspected, err := docker.ContainerInspect(ctx, id, dockerClient.ContainerInspectOptions{})
 		if err != nil {
@@ -400,7 +407,7 @@ func StopAllApps(ctx context.Context, docker dockerClient.APIClient, cfg config.
 		return c.State != container.StateRunning || c.Labels[composeProjectLabel] == ""
 	})
 	err = forEachContainer(running, func(c container.Summary) error {
-		return stopAppChild(ctx, cfg, appContainer{project: c.Labels[composeProjectLabel]})
+		return stopAppChild(ctx, docker, cfg, appContainer{project: c.Labels[composeProjectLabel]})
 	})
 	return errors.Join(err, clearWantedApp(cfg, nil), stopSidecars(ctx, docker, func(StreamMessage) {}), removeSharedLauncher(ctx, docker))
 }
@@ -415,19 +422,27 @@ func removeSharedLauncher(ctx context.Context, docker dockerClient.APIClient) er
 	return removeContainers(ctx, docker, shared)
 }
 
-// stopAppChild stops the app the container runs. An unreachable supervisor runs nothing.
-func stopAppChild(ctx context.Context, cfg config.Configuration, c appContainer) error {
-	resp, err := c.client(cfg).WithTimeout(launcherStopTimeout).Stop(ctx)
+// stopAppChild stops the app the container runs. A stop the supervisor does not confirm, or that leaves any
+// process behind, ends with a restart of the container: the app cannot hold on by tampering with its socket.
+func stopAppChild(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration, c appContainer) error {
+	resp, err := c.client(ctx, docker, cfg).WithTimeout(launcherStopTimeout).Stop(ctx)
 	var launcherErr *launcher.Error
 	switch {
 	case errors.As(err, &launcherErr):
 		return fmt.Errorf("failed to stop the app: %w", err)
 	case err != nil:
-		slog.Debug("app container unreachable, nothing to stop", slog.String("project", c.project), slog.String("error", err.Error()))
-	default:
-		for _, s := range resp.Stopped {
-			slog.Debug("app stopped", slog.String("project", c.project), slog.Int("pid", s.PID), slog.Any("exit_code", s.ExitCode), slog.Any("signal", s.Signal))
-		}
+		return restartAppContainer(ctx, docker, c, "the app supervisor did not answer the stop: "+err.Error())
+	}
+	for _, s := range resp.Stopped {
+		slog.Debug("app stopped", slog.String("project", c.project), slog.Int("pid", s.PID), slog.Any("exit_code", s.ExitCode), slog.Any("signal", s.Signal))
+	}
+	leftovers, err := c.leftovers(ctx, docker)
+	if err != nil {
+		slog.Debug("cannot check the app container after the stop", slog.String("project", c.project), slog.String("error", err.Error()))
+		return nil
+	}
+	if leftovers {
+		return restartAppContainer(ctx, docker, c, "processes left in the container after the stop")
 	}
 	return nil
 }

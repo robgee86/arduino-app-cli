@@ -88,9 +88,17 @@ type StatusResponse struct {
 
 // Client talks to the launcher on a Unix socket. Each call bounds the whole exchange by
 // timeout, or by the context deadline when it is earlier.
+// PeerCheck tells whether the process answering the socket, given by its pid as the caller sees it, is the
+// supervisor expected there; the app shares the socket folder with its supervisor, so the path proves nothing.
+type PeerCheck func(pid int) error
+
+// ErrPeer is returned when the socket is answered by a process other than the app supervisor.
+var ErrPeer = errors.New("the socket is not answered by the app supervisor")
+
 type Client struct {
 	socket  string
 	timeout time.Duration
+	peer    PeerCheck
 }
 
 func New(socket string, timeout time.Duration) *Client {
@@ -99,7 +107,12 @@ func New(socket string, timeout time.Duration) *Client {
 
 // WithTimeout returns a client on the same socket with another timeout.
 func (c *Client) WithTimeout(timeout time.Duration) *Client {
-	return &Client{socket: c.socket, timeout: timeout}
+	return &Client{socket: c.socket, timeout: timeout, peer: c.peer}
+}
+
+// WithPeer returns a client that accepts an answer only from a process the check approves.
+func (c *Client) WithPeer(check PeerCheck) *Client {
+	return &Client{socket: c.socket, timeout: c.timeout, peer: check}
 }
 
 func (c *Client) Socket() string {
@@ -156,6 +169,18 @@ func (c *Client) do(ctx context.Context, req request, resp any) error {
 		return fmt.Errorf("cannot reach the app launcher: %w", err)
 	}
 	defer conn.Close()
+	if c.peer != nil {
+		pid, err := peerPID(conn)
+		if err != nil {
+			return fmt.Errorf("cannot tell who answers the app launcher socket: %w", err)
+		}
+		// An unknown pid is a platform without peer credentials, development only
+		if pid != 0 {
+			if err := c.peer(pid); err != nil {
+				return fmt.Errorf("%w: %v", ErrPeer, err)
+			}
+		}
+	}
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
 			return err
@@ -195,6 +220,9 @@ func (c *Client) do(ctx context.Context, req request, resp any) error {
 	}
 	return nil
 }
+
+// peerPID gives the pid of the process on the other end of a connected unix socket, 0 when the platform cannot tell.
+var peerPID = socketPeerPID
 
 func readLine(conn net.Conn) ([]byte, error) {
 	scanner := bufio.NewScanner(conn)

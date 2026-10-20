@@ -76,7 +76,7 @@ type appsView struct {
 }
 
 // readAppsView asks the container of the wanted app for its child. An unreachable container runs nothing.
-func readAppsView(ctx context.Context, cfg config.Configuration) appsView {
+func readAppsView(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration) appsView {
 	var view appsView
 	if record := readSidecarsRecord(cfg); record != nil {
 		view.sidecars = slices.Collect(maps.Keys(record))
@@ -86,7 +86,7 @@ func readAppsView(ctx context.Context, cfg config.Configuration) appsView {
 		return view
 	}
 	view.wanted = wanted.App
-	status, err := appContainerOf(cfg, wanted.App).client(cfg).Status(ctx)
+	status, err := appContainerOf(cfg, wanted.App).client(ctx, docker, cfg).Status(ctx)
 	if err != nil {
 		slog.Debug("app container status unavailable", slog.String("error", err.Error()))
 		return view
@@ -161,7 +161,7 @@ func getAppsStatus(
 	if err != nil {
 		return nil, err
 	}
-	return mergeAppStatus(containers, readAppsView(ctx, cfg)), nil
+	return mergeAppStatus(containers, readAppsView(ctx, docker, cfg)), nil
 }
 
 func getAppStatus(

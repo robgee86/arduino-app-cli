@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -177,4 +178,22 @@ func TestClientErrors(t *testing.T) {
 		fake := newFakeLauncher(t, func(string) string { return "not json" })
 		require.ErrorContains(t, New(fake.socket, time.Second).Ping(context.Background()), "invalid answer")
 	})
+}
+
+func TestClientAcceptsOnlyTheApprovedPeer(t *testing.T) {
+	fake := newFakeLauncher(t, func(string) string { return `{"ok":true}` })
+	previous := peerPID
+	peerPID = func(net.Conn) (int, error) { return 4242, nil }
+	t.Cleanup(func() { peerPID = previous })
+
+	var seen int
+	approve := func(pid int) error { seen = pid; return nil }
+	require.NoError(t, New(fake.socket, time.Second).WithPeer(approve).Ping(context.Background()))
+	assert.Equal(t, 4242, seen, "the check sees the peer pid")
+	<-fake.requests
+
+	refuse := func(int) error { return errors.New("not the supervisor") }
+	err := New(fake.socket, time.Second).WithPeer(refuse).WithTimeout(time.Second).Ping(context.Background())
+	require.ErrorIs(t, err, ErrPeer)
+	assert.Equal(t, 0, len(fake.requests), "a refused peer is sent nothing")
 }

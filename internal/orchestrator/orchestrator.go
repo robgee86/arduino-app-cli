@@ -243,7 +243,7 @@ func startApp(
 	}
 
 	if appToStart.MainPythonFile == nil {
-		if err := errors.Join(stopWantedApp(ctx, cfg), silenceIngress(ctx, docker.Client(), cfg), stopSidecars(ctx, docker.Client(), cb)); err != nil {
+		if err := errors.Join(stopWantedApp(ctx, docker.Client(), cfg), silenceIngress(ctx, docker.Client(), cfg), stopSidecars(ctx, docker.Client(), cb)); err != nil {
 			return err
 		}
 		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
@@ -356,7 +356,7 @@ func startInAppContainer(
 	reload := wanted != nil && wanted.App.EqualsTo(appToStart.FullPath)
 	if wanted != nil && !reload {
 		wg.Go(func() {
-			previousStopErr = stopWantedApp(ctx, cfg)
+			previousStopErr = stopWantedApp(ctx, docker.Client(), cfg)
 			stopped = time.Since(stopping)
 		})
 	}
@@ -395,7 +395,7 @@ func startInAppContainer(
 		)
 		ingress.Go(func() { ingressErr = routeIngress(ctx, docker, cfg, bricksIndex, target, ports, cb) })
 		startedAt = time.Now()
-		started, err = target.client(cfg).WithTimeout(launcherStartTimeout).Start(ctx, appMountDir, envs)
+		started, err = target.client(ctx, docker.Client(), cfg).WithTimeout(launcherStartTimeout).Start(ctx, appMountDir, envs)
 		ingress.Wait()
 		err = launcherStartError(err)
 		if ingressErr != nil {
@@ -504,7 +504,7 @@ func stopAppProcesses(ctx context.Context, docker dockerClient.APIClient, app ap
 	}
 	// Read before the stop, which forgets it
 	wanted := readWantedApp(cfg)
-	if err := stopAppChild(ctx, cfg, appContainerOf(cfg, app.FullPath)); err != nil {
+	if err := stopAppChild(ctx, docker, cfg, appContainerOf(cfg, app.FullPath)); err != nil {
 		return err
 	}
 	if err := clearWantedApp(cfg, app.FullPath); err != nil {
@@ -518,12 +518,12 @@ func stopAppProcesses(ctx context.Context, docker dockerClient.APIClient, app ap
 }
 
 // stopWantedApp stops the app that should be running, and forgets it.
-func stopWantedApp(ctx context.Context, cfg config.Configuration) error {
+func stopWantedApp(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration) error {
 	wanted := readWantedApp(cfg)
 	if wanted == nil {
 		return nil
 	}
-	if err := stopAppChild(ctx, cfg, appContainerOf(cfg, wanted.App)); err != nil {
+	if err := stopAppChild(ctx, docker, cfg, appContainerOf(cfg, wanted.App)); err != nil {
 		return err
 	}
 	return clearWantedApp(cfg, wanted.App)
