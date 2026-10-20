@@ -134,8 +134,8 @@ func downloadSupportedImages(ctx context.Context, cfg config.Configuration, bric
 	}
 	handlerImages := modelsIndex.Handlers.GetDockerImages()
 
-	imagesToPreinstall := make([]string, 0, 2+len(brickImages)+len(handlerImages))
-	imagesToPreinstall = append(imagesToPreinstall, cfg.PythonImage, IngressImage)
+	imagesToPreinstall := make([]string, 0, 1+len(brickImages)+len(handlerImages))
+	imagesToPreinstall = append(imagesToPreinstall, cfg.PythonImage)
 	imagesToPreinstall = append(imagesToPreinstall, brickImages...)
 	imagesToPreinstall = append(imagesToPreinstall, handlerImages...)
 
@@ -217,8 +217,6 @@ func isOurImage(image string) bool {
 		"ghcr.io/arduino/",
 		"influxdb",
 		"artifacts.codelinaro.org/iot-solutions-microservices/",
-		// The exact image: a broader prefix would let the cleanup remove nginx images it did not pull
-		IngressImage,
 	}
 	return slices.ContainsFunc(prefixes, func(p string) bool { return strings.HasPrefix(image, p) })
 }
@@ -331,8 +329,8 @@ func getRequiredImages(cfg config.Configuration, bricksindex *bricksindex.Bricks
 
 	handlerImages := modelsIndex.Handlers.GetDockerImages()
 
-	requiredImages := make([]string, 0, 2+len(bricksContainers)+len(handlerImages))
-	requiredImages = append(requiredImages, cfg.PythonImage, IngressImage)
+	requiredImages := make([]string, 0, 1+len(bricksContainers)+len(handlerImages))
+	requiredImages = append(requiredImages, cfg.PythonImage)
 	requiredImages = append(requiredImages, bricksContainers...)
 	requiredImages = append(requiredImages, handlerImages...)
 

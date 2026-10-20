@@ -34,7 +34,7 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 		Run: func(cmd *cobra.Command, args []string) {
 			daemonPort, _ := cmd.Flags().GetString("port")
 
-			// The launcher and the ingress survive the cleanup: they carry no app label, the launcher app stops below
+			// The launcher survives the cleanup: it carries no app label and stops its app below
 			err := orchestrator.StopAllAppContainers(cmd.Context(), servicelocator.GetDockerClient().Client())
 			if err != nil {
 				slog.Warn("Failed to stop containers", slog.String("error", err.Error()))
@@ -50,10 +50,11 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 
 			// start the default app in the background
 			go func() {
-				// It also pulls the ingress image, so that no start has to, and closes the ports until the default app starts
+				// It publishes the ports of every app on the board and stops the launcher app until the default app starts
 				elapsed, err := orchestrator.EnsureLauncher(
 					cmd.Context(),
 					servicelocator.GetDockerClient(),
+					servicelocator.GetBricksIndex(),
 					cfg,
 					servicelocator.GetPlatform(),
 					true,

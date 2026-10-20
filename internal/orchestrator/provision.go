@@ -65,11 +65,6 @@ type service struct {
 	Logging           *logging                      `yaml:"logging,omitempty"`
 	Restart           string                        `yaml:"restart,omitempty"`
 	StopGracePeriod   string                        `yaml:"stop_grace_period,omitempty"`
-	StopSignal        string                        `yaml:"stop_signal,omitempty"`
-	ReadOnly          bool                          `yaml:"read_only,omitempty"`
-	Tmpfs             []string                      `yaml:"tmpfs,omitempty"`
-	CapDrop           []string                      `yaml:"cap_drop,omitempty"`
-	SecurityOpt       []string                      `yaml:"security_opt,omitempty"`
 	Healthcheck       *healthcheck                  `yaml:"healthcheck,omitempty"`
 }
 

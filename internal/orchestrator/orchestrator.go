@@ -164,10 +164,9 @@ func checkApp(
 	return nil
 }
 
-// startApp runs the app Python code in the launcher, which replaces the app it ran, brings the
-// sidecars zone to the sidecars of the app and opens its public ports in the ingress. An app with
-// only a sketch stops the zone and closes the ports. bricksIndex and modelsIndex are the ones the
-// app is wired with.
+// startApp runs the app Python code in the launcher, which replaces the app it ran and publishes
+// its public ports, and brings the sidecars zone to the sidecars of the app. An app with only a
+// sketch stops the zone. bricksIndex and modelsIndex are the ones the app is wired with.
 func startApp(
 	ctx context.Context,
 	docker command.Cli,
@@ -185,7 +184,7 @@ func startApp(
 	var ports []int
 	if appToStart.MainPythonFile != nil {
 		ports = appPorts(appToStart, bricksIndex)
-		if err := prepareLauncher(ctx, docker, appToStart, ports, cfg, platform, cb); err != nil {
+		if err := prepareLauncher(ctx, docker, bricksIndex, appToStart, ports, cfg, platform, cb); err != nil {
 			return err
 		}
 	}
@@ -243,7 +242,7 @@ func startApp(
 	}
 
 	if appToStart.MainPythonFile == nil {
-		if err := errors.Join(stopLauncherApp(ctx, cfg, nil), closeAppPorts(ctx, docker.Client()), stopSidecars(ctx, docker.Client(), cb)); err != nil {
+		if err := errors.Join(stopLauncherApp(ctx, cfg, nil), stopSidecars(ctx, docker.Client(), cb)); err != nil {
 			return err
 		}
 		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
@@ -330,7 +329,7 @@ func pullAppImages(ctx context.Context, docker command.Cli, prj *types.Project, 
 }
 
 // startWithLauncher brings the sidecars zone to running, when Docker resolves their names, then has
-// the launcher start the app on its ports, which the ingress then forwards; the bricks retry until
+// the launcher start the app on its ports, which the launcher publishes; the bricks retry until
 // the sidecars accept connections. A previous, different app stops meanwhile; the app itself, when
 // it is the one running, is left to the launcher, which stops it right before the fork: no separate
 // round trip, and its /app alias stays in place.
@@ -386,14 +385,9 @@ func startWithLauncher(
 		started, err = newLauncherClient(cfg).WithTimeout(launcherStartTimeout).Start(ctx, appToStart.FullPath.String(), ports)
 		err = launcherStartError(err)
 	}
-	if err == nil {
-		if err = openAppPorts(ctx, docker, cfg, ports, cb); err != nil {
-			err = fmt.Errorf("failed to open the app ports: %w", err)
-		}
-	}
 	if err != nil {
 		waitOrphans()
-		// Half an app is of no use: stop what started, which closes the ports
+		// Half an app is of no use: stop what started
 		if stopErr := stopAppProcesses(ctx, docker.Client(), appToStart, cfg, nil); stopErr != nil {
 			slog.Warn("failed to stop the app after a failed start", slog.String("error", stopErr.Error()))
 		}
@@ -481,8 +475,8 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 	return nil
 }
 
-// stopAppProcesses stops the app launcher child, then closes the app ports and stops the sidecars
-// zone unless they belong to another app. The zone stays: the next start of the same app is a plain start.
+// stopAppProcesses stops the app launcher child, then the sidecars zone unless it runs the
+// sidecars of another app. The zone stays: the next start of the same app is a plain start.
 func stopAppProcesses(ctx context.Context, docker dockerClient.APIClient, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
 	if cb == nil {
 		cb = func(StreamMessage) {}
@@ -496,10 +490,10 @@ func stopAppProcesses(ctx context.Context, docker dockerClient.APIClient, app ap
 		return err
 	}
 	if wanted != nil && !wanted.EqualsTo(app.FullPath) {
-		slog.Debug("the sidecars zone and the ports belong to another app, left open", slog.String("app", wanted.String()))
+		slog.Debug("the sidecars zone runs another app, left running", slog.String("app", wanted.String()))
 		return nil
 	}
-	return errors.Join(closeAppPorts(ctx, docker), stopSidecars(ctx, docker, cb))
+	return stopSidecars(ctx, docker, cb)
 }
 
 // stopLauncherApp stops the app if the launcher runs it, every app when appPath is nil. An

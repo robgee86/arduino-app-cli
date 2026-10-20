@@ -6,6 +6,7 @@
 package orchestrator
 
 import (
+	"fmt"
 	"maps"
 	"os"
 	"slices"
@@ -95,6 +96,14 @@ services:
 	bricksIndex, err := bricksindex.Load(platform.GetPlatform(nil), cfg.AssetDir())
 	require.NoError(t, err)
 	return bricksIndex, servicesIndex
+}
+
+// writeTestApp writes an app the launcher can run in dir.
+func writeTestApp(t *testing.T, dir *paths.Path, descriptor string) {
+	t.Helper()
+	require.NoError(t, dir.Join("python").MkdirAll())
+	require.NoError(t, dir.Join("python", "main.py").WriteFile([]byte("print('hi')\n")))
+	require.NoError(t, dir.Join("app.yaml").WriteFile([]byte(descriptor)))
 }
 
 func newTestApp(t *testing.T, cfg config.Configuration, name string, bricks ...string) app.ArduinoApp {
@@ -283,7 +292,7 @@ func TestGenerateLauncherComposeFile(t *testing.T) {
 	require.NoError(t, cfg.RuntimeDir().MkdirAll())
 	boardEnvs := types.Mapping{"BOARD_NAME": "unoq", "HOST_IP": "10.0.0.2"}
 
-	changed, err := generateLauncherComposeFile(testPythonImage, cfg, boardEnvs, platform.Platform{})
+	changed, err := generateLauncherComposeFile([]int{8000, 7100, 8000}, testPythonImage, cfg, boardEnvs, platform.Platform{})
 	require.NoError(t, err)
 	assert.True(t, changed)
 
@@ -305,7 +314,14 @@ func TestGenerateLauncherComposeFile(t *testing.T) {
 	assert.Equal(t, types.Duration(60*time.Second), *svc.HealthCheck.StartPeriod)
 	assert.Equal(t, types.Duration(500*time.Millisecond), *svc.HealthCheck.StartInterval)
 
-	assert.Empty(t, svc.Ports, "the ingress publishes the app ports")
+	t.Run("publishes the app ports, sorted once each", func(t *testing.T) {
+		published := make([]string, 0, len(svc.Ports))
+		for _, p := range svc.Ports {
+			published = append(published, fmt.Sprintf("%s:%d", p.Published, p.Target))
+		}
+		assert.Equal(t, []string{"7100:7100", "8000:8000"}, published)
+		assert.Empty(t, svc.Ports[0].HostIP, "on every address, IPv6 included")
+	})
 
 	assert.Equal(t, types.MappingWithEquals{
 		"BOARD_NAME":          new("unoq"),
@@ -330,26 +346,68 @@ func TestGenerateLauncherComposeFile(t *testing.T) {
 	assert.False(t, bool(network.External))
 
 	t.Run("a second generation changes nothing", func(t *testing.T) {
-		changed, err := generateLauncherComposeFile(testPythonImage, cfg, boardEnvs, platform.Platform{})
+		changed, err := generateLauncherComposeFile([]int{7100, 8000}, testPythonImage, cfg, boardEnvs, platform.Platform{})
+		require.NoError(t, err)
+		assert.False(t, changed)
+	})
+
+	t.Run("the same ports in another order change nothing", func(t *testing.T) {
+		changed, err := generateLauncherComposeFile([]int{8000, 7100}, testPythonImage, cfg, boardEnvs, platform.Platform{})
 		require.NoError(t, err)
 		assert.False(t, changed)
 	})
 
 	t.Run("another board environment changes it", func(t *testing.T) {
-		changed, err := generateLauncherComposeFile(testPythonImage, cfg, types.Mapping{"HOST_IP": "10.0.0.3"}, platform.Platform{})
+		changed, err := generateLauncherComposeFile([]int{7100, 8000}, testPythonImage, cfg, types.Mapping{"HOST_IP": "10.0.0.3"}, platform.Platform{})
 		require.NoError(t, err)
 		assert.True(t, changed)
 	})
 
+	t.Run("a new app port changes it", func(t *testing.T) {
+		changed, err := generateLauncherComposeFile([]int{7100, 8000, 9000}, testPythonImage, cfg, types.Mapping{"HOST_IP": "10.0.0.3"}, platform.Platform{})
+		require.NoError(t, err)
+		assert.True(t, changed)
+		svc := loadCompose(t, launcherComposeFile(cfg)).Services[launcherServiceName]
+		require.Len(t, svc.Ports, 3)
+		assert.Equal(t, uint32(9000), svc.Ports[2].Target)
+	})
+
+	t.Run("no ports, nothing published", func(t *testing.T) {
+		changed, err := generateLauncherComposeFile(nil, testPythonImage, cfg, boardEnvs, platform.Platform{})
+		require.NoError(t, err)
+		assert.True(t, changed)
+		data, err := launcherComposeFile(cfg).ReadFile()
+		require.NoError(t, err)
+		assert.NotContains(t, string(data), "ports:")
+		assert.Empty(t, loadCompose(t, launcherComposeFile(cfg)).Services[launcherServiceName].Ports)
+	})
+
 	t.Run("a preload override reaches the launcher and changes the file", func(t *testing.T) {
 		cfg.LauncherPreload = "arduino.app_utils,arduino.app_peripherals.camera"
-		changed, err := generateLauncherComposeFile(testPythonImage, cfg, boardEnvs, platform.Platform{})
+		changed, err := generateLauncherComposeFile(nil, testPythonImage, cfg, boardEnvs, platform.Platform{})
 		require.NoError(t, err)
 		assert.True(t, changed)
 		svc := loadCompose(t, launcherComposeFile(cfg)).Services[launcherServiceName]
 		assert.Equal(t, new("arduino.app_utils,arduino.app_peripherals.camera"), svc.Environment["APP_LAUNCHER_PRELOAD"])
 	})
+}
 
+func TestLauncherPorts(t *testing.T) {
+	cfg := setTestOrchestratorConfig(t)
+	bricksIndex, _ := setTestBricks(t, cfg)
+
+	t.Run("no app, no port", func(t *testing.T) {
+		assert.Empty(t, launcherPorts(cfg, bricksIndex))
+	})
+
+	writeTestApp(t, cfg.AppsDir().Join("with-web-ui"), "name: With Web UI\nbricks:\n- arduino:web_ui: {}\n")
+	writeTestApp(t, cfg.ExamplesBaseDir().Join("inspirational", "common", "custom-ui"), "name: Custom UI\nbricks:\n- arduino:custom_ui: {}\n")
+	writeTestApp(t, cfg.ReleasesDir().Join("own-port"), "name: Own Port\nports:\n- 9000\nbricks:\n- arduino:plain: {}\n")
+	writeTestApp(t, cfg.AppsDir().Join("broken"), "name: [\n")
+	writeTestApp(t, cfg.AppsDir().Join("no-tcp-port"), "name: No TCP Port\nports:\n- 70000\n- 7000\n")
+
+	// The union of the apps in every root, sorted once each, without 9100 of the brick no app uses
+	assert.Equal(t, []int{7000, 7100, 8000, 9000}, launcherPorts(cfg, bricksIndex))
 }
 
 func TestLauncherAppPorts(t *testing.T) {
@@ -397,16 +455,17 @@ func TestComposeUpReason(t *testing.T) {
 
 func TestPrepareLauncherRejectsWhatItCannotRun(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
+	bricksIndex, _ := setTestBricks(t, cfg)
 	noop := func(StreamMessage) {}
 
 	elsewhere := app.ArduinoApp{Name: "elsewhere", FullPath: paths.New(t.TempDir())}
-	err := prepareLauncher(t.Context(), nil, elsewhere, nil, cfg, platform.Platform{}, noop)
+	err := prepareLauncher(t.Context(), nil, bricksIndex, elsewhere, nil, cfg, platform.Platform{}, noop)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), cfg.AppsDir().String())
 
 	// Not a TCP port
 	high := newTestApp(t, cfg, "high")
-	err = prepareLauncher(t.Context(), nil, high, []int{8000, 70000}, cfg, platform.Platform{}, noop)
+	err = prepareLauncher(t.Context(), nil, bricksIndex, high, []int{8000, 70000}, cfg, platform.Platform{}, noop)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot publish port 70000")
 }

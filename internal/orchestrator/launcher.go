@@ -66,6 +66,41 @@ func newLauncherClient(cfg config.Configuration) *launcher.Client {
 	return launcher.New(cfg.RuntimeDir().Join(launcher.SocketName).String(), launcherRequestTimeout)
 }
 
+// maxPort is the last TCP port, the app ports go from 1 to it.
+const maxPort = 65535
+
+// launcherPorts are the public ports the launcher publishes: the sorted union of the ports of the
+// apps on the board, so that no app start has to recreate it. An app that fails to load or a port
+// that is no TCP port is left out: it fails its own start, not the launcher.
+func launcherPorts(cfg config.Configuration, bricksIndex *bricksindex.BricksIndex) []int {
+	appPaths, err := app.FindAppsInFolders(launcherAppRoots(cfg))
+	if err != nil {
+		slog.Warn("some apps were not listed for the launcher ports", slog.String("error", err.Error()))
+	}
+	var ports []int
+	for _, appPath := range appPaths {
+		a, err := app.Load(appPath)
+		if err != nil {
+			slog.Debug("skipping the ports of an invalid app", slog.String("path", appPath.String()), slog.String("error", err.Error()))
+			continue
+		}
+		for _, p := range appPorts(a, bricksIndex) {
+			if p < 1 || p > maxPort {
+				slog.Debug("skipping an invalid app port", slog.String("path", appPath.String()), slog.Int("port", p))
+				continue
+			}
+			ports = append(ports, p)
+		}
+	}
+	return sortedPorts(ports)
+}
+
+// sortedPorts returns the ports sorted, once each.
+func sortedPorts(ports []int) []int {
+	slices.Sort(ports)
+	return slices.Compact(ports)
+}
+
 // appPorts are the public ports of an app: the defaults of its bricks, then the ports of app.yaml.
 func appPorts(a app.ArduinoApp, bricksIndex *bricksindex.BricksIndex) []int {
 	// A copy: WithAppBricks would change the index shared by the callers
@@ -86,14 +121,16 @@ func appPorts(a app.ArduinoApp, bricksIndex *bricksindex.BricksIndex) []int {
 		}
 	}
 	ports = append(ports, a.Descriptor.Ports...)
-	slices.Sort(ports)
-	return slices.Compact(ports)
+	return sortedPorts(ports)
 }
 
-// prepareLauncher checks that the launcher can run the app on its public ports, then brings it up.
+// prepareLauncher checks that the launcher can run the app on its public ports, then brings it up
+// publishing the ports of every app on the board, those of the app included: an app changed after
+// the others were collected still recreates the launcher on its new ports.
 func prepareLauncher(
 	ctx context.Context,
 	docker command.Cli,
+	bricksIndex *bricksindex.BricksIndex,
 	appToStart app.ArduinoApp,
 	ports []int,
 	cfg config.Configuration,
@@ -103,13 +140,13 @@ func prepareLauncher(
 	if roots := launcherAppRoots(cfg); !isInsideLauncherRoots(appToStart.FullPath, cfg) {
 		return fmt.Errorf("the app launcher runs only the apps inside %s", strings.Join(roots.AsStrings(), " or "))
 	}
-	const maxPort = 65535
 	for _, p := range ports {
 		if p < 1 || p > maxPort {
-			return fmt.Errorf("the ingress cannot publish port %d: the app ports go from 1 to %d", p, maxPort)
+			return fmt.Errorf("the app launcher cannot publish port %d: the app ports go from 1 to %d", p, maxPort)
 		}
 	}
-	elapsed, err := ensureLauncher(ctx, docker, cfg, platform, false, cb)
+	published := sortedPorts(append(launcherPorts(cfg, bricksIndex), ports...))
+	elapsed, err := ensureLauncher(ctx, docker, published, cfg, platform, false, cb)
 	if err != nil {
 		return fmt.Errorf("the app launcher is unavailable: %w", err)
 	}
@@ -132,14 +169,22 @@ func isInsideLauncherRoots(appPath *paths.Path, cfg config.Configuration) bool {
 	return false
 }
 
-// generateLauncherComposeFile writes the launcher compose project, rendered on this board, and
-// tells whether it changed.
+// generateLauncherComposeFile writes the launcher compose project, rendered on this board and
+// publishing the ports, and tells whether it changed. Docker fixes the published ports at
+// container creation: a new port changes the file, which recreates the launcher.
 func generateLauncherComposeFile(
+	ports []int,
 	pythonImage string,
 	cfg config.Configuration,
 	boardEnvs types.Mapping,
 	platform platform.Platform,
 ) (bool, error) {
+	ports = sortedPorts(slices.Clone(ports))
+	published := make([]string, 0, len(ports))
+	for _, p := range ports {
+		published = append(published, fmt.Sprintf("%d:%d", p, p))
+	}
+
 	envs := boardEnvs.Clone()
 	envs["APP_LAUNCHER_SOCKET"] = launcherSocketDir + "/" + launcher.SocketName
 	envs["APP_LAUNCHER_PREPARE_TIMEOUT_S"] = strconv.Itoa(int(launcherPrepareTimeout.Seconds()))
@@ -161,6 +206,7 @@ func generateLauncherComposeFile(
 		return false, err
 	}
 	svc := runtime.service(pythonImage, volumes...)
+	svc.Ports = published
 	svc.Entrypoint = "/run.sh serve"
 	svc.Restart = "unless-stopped"
 	svc.StopGracePeriod = "10s"
@@ -223,12 +269,13 @@ func boardEnvironment(ctx context.Context, plat platform.Platform, cfg config.Co
 	return envs
 }
 
-// ensureLauncher brings the launcher up to date and running, and waits until it answers. forceUp
-// runs compose up even when nothing changed here, so that a new image under the same tag is picked
-// up: compose recreates the container only when its configuration or image differ.
+// ensureLauncher brings the launcher up to date, publishing the ports, and running, and waits until
+// it answers. forceUp runs compose up even when nothing changed here, so that a new image under the
+// same tag is picked up: compose recreates the container only when its configuration or image differ.
 func ensureLauncher(
 	ctx context.Context,
 	docker command.Cli,
+	ports []int,
 	cfg config.Configuration,
 	platform platform.Platform,
 	forceUp bool,
@@ -238,7 +285,7 @@ func ensureLauncher(
 	if err := cfg.RuntimeDir().MkdirAll(); err != nil {
 		return 0, fmt.Errorf("failed to create the runtime folder: %w", err)
 	}
-	changed, err := generateLauncherComposeFile(cfg.PythonImage, cfg, boardEnvironment(ctx, platform, cfg), platform)
+	changed, err := generateLauncherComposeFile(ports, cfg.PythonImage, cfg, boardEnvironment(ctx, platform, cfg), platform)
 	if err != nil {
 		return 0, err
 	}
@@ -280,7 +327,7 @@ func ensureLauncher(
 	}
 	// A new or restarted launcher runs no app
 	if recreated {
-		if err := errors.Join(clearLauncherWantedApp(cfg, nil), closeAppPorts(ctx, docker.Client())); err != nil {
+		if err := clearLauncherWantedApp(cfg, nil); err != nil {
 			return 0, err
 		}
 	}
@@ -356,21 +403,7 @@ func getContainerWithLabel(ctx context.Context, docker dockerClient.APIClient, l
 	return &containers[0], nil
 }
 
-// stopContainerWithLabel stops the container carrying the label, which publishes ports even in a restart loop.
-func stopContainerWithLabel(ctx context.Context, docker dockerClient.APIClient, label string) error {
-	current, err := getContainerWithLabel(ctx, docker, label)
-	if err != nil || current == nil || (current.State != container.StateRunning && current.State != container.StateRestarting) {
-		return err
-	}
-	slog.Debug("stopping container", slog.String("label", label), slog.String("id", current.ID))
-	if _, err := docker.ContainerStop(ctx, current.ID, dockerClient.ContainerStopOptions{}); err != nil {
-		return fmt.Errorf("failed to stop %s: %w", containerName(*current), err)
-	}
-	return nil
-}
-
-// StopAllAppContainers stops every running app container, sidecars included, leaving the launcher
-// and the ingress up: the ingress carries no app label.
+// StopAllAppContainers stops every running app container, sidecars included, leaving the launcher up.
 func StopAllAppContainers(ctx context.Context, docker dockerClient.APIClient) error {
 	containers, err := docker.ContainerList(ctx, dockerClient.ContainerListOptions{
 		Filters: make(dockerClient.Filters).Add("label", DockerAppLabel+"=true"),
@@ -417,28 +450,25 @@ func clearLauncherWantedApp(cfg config.Configuration, appPath *paths.Path) error
 	return nil
 }
 
-// EnsureLauncher brings the launcher up, recreating it on a new image, and pulls the ingress image.
-// When stopApps, as the daemon does at boot, it stops what the launcher runs and closes its ports.
+// EnsureLauncher brings the launcher up on the ports of the apps on the board, recreating it on a
+// new image or port. When stopApps, as the daemon does at boot, it stops what the launcher runs.
 func EnsureLauncher(
 	ctx context.Context,
 	docker command.Cli,
+	bricksIndex *bricksindex.BricksIndex,
 	cfg config.Configuration,
 	platform platform.Platform,
 	stopApps bool,
 ) (time.Duration, error) {
 	started := time.Now()
 	err := withAppsLock(ctx, cfg, func() error {
-		if _, err := ensureLauncher(ctx, docker, cfg, platform, true, func(StreamMessage) {}); err != nil {
+		if _, err := ensureLauncher(ctx, docker, launcherPorts(cfg, bricksIndex), cfg, platform, true, func(StreamMessage) {}); err != nil {
 			return err
-		}
-		// Pulled here so that no start has to: an app without ports runs without it
-		if err := pullIngressImage(ctx, docker.Client(), func(StreamMessage) {}); err != nil {
-			slog.Warn("the ingress image is unavailable, the apps with ports cannot start", slog.String("error", err.Error()))
 		}
 		if !stopApps {
 			return nil
 		}
-		return errors.Join(stopLauncherApp(ctx, cfg, nil), closeAppPorts(ctx, docker.Client()))
+		return stopLauncherApp(ctx, cfg, nil)
 	})
 	return time.Since(started), err
 }
