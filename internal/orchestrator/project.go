@@ -52,6 +52,8 @@ func adaptAppProject(prj *types.Project, c appContainer, cfg config.Configuratio
 	}
 
 	envs := boardEnvs.Clone()
+	// The app of the container: run.sh serves from its venv when it has one
+	envs["APP_DIR"] = appMountDir
 	envs["APP_LAUNCHER_PREPARE_TIMEOUT_S"] = strconv.Itoa(int(launcherPrepareTimeout.Seconds()))
 	if cfg.LauncherPreload != "" {
 		envs["APP_LAUNCHER_PRELOAD"] = cfg.LauncherPreload

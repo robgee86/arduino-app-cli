@@ -160,6 +160,7 @@ func TestAdaptAppProject(t *testing.T) {
 	assert.Equal(t, types.MappingWithEquals{
 		"BOARD_NAME": new("unoq"),
 		"HOST_IP":    new("10.0.0.2"),
+		"APP_DIR":    new("/app"),
 		// The CLI waits for a start as long as the supervisor may prepare it
 		"APP_LAUNCHER_PREPARE_TIMEOUT_S": new("600"),
 	}, main.Environment, "nothing of the app: its environment goes with each start")
