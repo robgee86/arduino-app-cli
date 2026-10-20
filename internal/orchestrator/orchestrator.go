@@ -411,7 +411,7 @@ func startInAppContainer(
 		return err
 	}
 
-	if err := errors.Join(setWantedApp(cfg, appToStart.FullPath, startedAt), updateRecentApps(cfg, appToStart.FullPath, true)); err != nil {
+	if err := setWantedApp(cfg, appToStart.FullPath, startedAt); err != nil {
 		slog.Warn("failed to record the started app", slog.String("error", err.Error()))
 	}
 	if reload {
@@ -428,13 +428,6 @@ func startInAppContainer(
 	// The app runs: the start is over for the caller, the lock is held until the orphans are gone
 	cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
 	waitOrphans()
-	// After the reply, under the lock of its own: what it removes is read again once it holds it
-	go func() {
-		ctx := context.WithoutCancel(ctx)
-		if err := withAppsLock(ctx, cfg, func() error { return evictAppContainers(ctx, docker.Client(), cfg) }); err != nil {
-			slog.Warn("failed to remove the idle app containers, retried at the next start", slog.String("error", err.Error()))
-		}
-	}()
 	return nil
 }
 

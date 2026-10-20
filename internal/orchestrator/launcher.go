@@ -62,10 +62,6 @@ const (
 	// A start stops the running app, prepares the new one and forks it.
 	launcherStartTimeout = launcherStopTimeout + launcherPrepareTimeout
 
-	// warmIdleApps is how many idle app containers a start keeps besides the running one.
-	warmIdleApps = 2
-	// recentAppsLimit bounds the list of the apps started last.
-	recentAppsLimit = 16
 	// maxKeyLength keeps the host name a DNS label and the socket path within the Unix limit.
 	maxKeyLength = 56
 )
@@ -462,7 +458,7 @@ func destroyAppContainer(ctx context.Context, docker dockerClient.APIClient, cfg
 			return err
 		}
 	}
-	return errors.Join(c.runtimeDir(cfg).RemoveAll(), c.dir(cfg).RemoveAll(), updateRecentApps(cfg, appPath, false))
+	return errors.Join(c.runtimeDir(cfg).RemoveAll(), c.dir(cfg).RemoveAll())
 }
 
 // wantedApp is the app that should be running, and when it was started: a missing child means it died.
@@ -515,89 +511,6 @@ func clearWantedApp(cfg config.Configuration, appPath *paths.Path) error {
 	return nil
 }
 
-// recentAppsFile lists the paths of the apps started last, the most recent first.
-func recentAppsFile(cfg config.Configuration) *paths.Path {
-	return appsStateDir(cfg).Join("recent.json")
-}
-
-func readRecentApps(cfg config.Configuration) []string {
-	data, err := recentAppsFile(cfg).ReadFile()
-	if err != nil {
-		return nil
-	}
-	var apps []string
-	if err := json.Unmarshal(data, &apps); err != nil {
-		return nil
-	}
-	return apps
-}
-
-// updateRecentApps puts the app first when started, removes it when not.
-func updateRecentApps(cfg config.Configuration, appPath *paths.Path, started bool) error {
-	apps := slices.DeleteFunc(readRecentApps(cfg), func(p string) bool { return p == appPath.String() })
-	if started {
-		apps = slices.Insert(apps, 0, appPath.String())
-	}
-	apps = apps[:min(len(apps), recentAppsLimit)]
-	data, err := json.Marshal(apps)
-	if err != nil {
-		return err
-	}
-	file := recentAppsFile(cfg)
-	if err := file.Parent().MkdirAll(); err != nil {
-		return err
-	}
-	return fatomic.WriteFile(file.String(), data, 0o644)
-}
-
-// planEvictions picks the app containers to remove: all but the running one and the warmIdleApps
-// idle ones started last. A container missing from the recent list goes, one without project stays.
-func planEvictions(containers []container.Summary, recent []string, running string) []container.Summary {
-	present := make(map[string]bool, len(containers))
-	for _, c := range containers {
-		present[c.Labels[composeProjectLabel]] = true
-	}
-	keep := map[string]bool{running: true}
-	idle := 0
-	for _, project := range recent {
-		if idle == warmIdleApps {
-			break
-		}
-		if !keep[project] && present[project] {
-			keep[project] = true
-			idle++
-		}
-	}
-	var evicted []container.Summary
-	for _, c := range containers {
-		if project := c.Labels[composeProjectLabel]; project != "" && !keep[project] {
-			evicted = append(evicted, c)
-		}
-	}
-	return evicted
-}
-
-// evictAppContainers removes the app containers beyond the warm ones, see planEvictions.
-func evictAppContainers(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration) error {
-	containers, err := listAppMainContainers(ctx, docker)
-	if err != nil {
-		return err
-	}
-	var running string
-	if wanted := readWantedApp(cfg); wanted != nil {
-		running = appContainerOf(cfg, wanted.App).project
-	}
-	var recent []string
-	for _, appPath := range readRecentApps(cfg) {
-		recent = append(recent, appContainerOf(cfg, paths.New(appPath)).project)
-	}
-	evicted := planEvictions(containers, recent, running)
-	for _, ctr := range evicted {
-		slog.Info("removing an idle app container", slog.String("container", containerName(ctr)))
-	}
-	return removeAppContainers(ctx, docker, cfg, evicted)
-}
-
 // removeStaleAppContainers removes the app containers of another image than the one of the
 // python image tag, so that the next start creates them again on the new one.
 func removeStaleAppContainers(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration) error {
@@ -620,31 +533,50 @@ func removeStaleAppContainers(ctx context.Context, docker dockerClient.APIClient
 	return removeAppContainers(ctx, docker, cfg, stale)
 }
 
-// prewarmCandidates are the warmIdleApps apps started last whose folder is still there, the running one left out.
-func prewarmCandidates(recent []string, running *paths.Path) paths.PathList {
-	var candidates paths.PathList
-	for _, appPath := range recent {
-		p := paths.New(appPath)
-		if len(candidates) == warmIdleApps {
-			break
-		}
-		if running != nil && running.EqualsTo(p) {
-			continue
-		}
-		if isDir, _ := p.IsDirCheck(); isDir && p.IsAbs() {
-			candidates = append(candidates, p)
-		}
+// warmApps are the apps kept warm from boot: every user app and installed release, not the examples.
+func warmApps(cfg config.Configuration) paths.PathList {
+	appPaths, err := app.FindAppsInFolders(paths.PathList{cfg.AppsDir(), cfg.ReleasesDir()})
+	if err != nil {
+		slog.Warn("some apps were not listed for the warm-up", slog.String("error", err.Error()))
 	}
-	return candidates
+	return appPaths
 }
 
-// PrewarmApps brings up the containers of the apps started last, without starting them, one at a time.
+// orphanAppContainers are the app containers whose app folder is gone; one without path label is left alone.
+func orphanAppContainers(containers []container.Summary) []container.Summary {
+	return slices.DeleteFunc(slices.Clone(containers), func(c container.Summary) bool {
+		appPath := c.Labels[DockerAppPathLabel]
+		if appPath == "" {
+			return true
+		}
+		isDir, _ := paths.New(appPath).IsDirCheck()
+		return isDir
+	})
+}
+
+// removeOrphanAppContainers removes the containers of the apps deleted outside the daemon.
+func removeOrphanAppContainers(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration) error {
+	containers, err := listAppMainContainers(ctx, docker)
+	if err != nil {
+		return err
+	}
+	orphans := orphanAppContainers(containers)
+	for _, c := range orphans {
+		slog.Info("removing the container of a deleted app", slog.String("container", containerName(c)))
+	}
+	return removeAppContainers(ctx, docker, cfg, orphans)
+}
+
+// PrewarmApps brings up the container of every app of the board, without starting them, one at a time.
 func PrewarmApps(ctx context.Context, docker command.Cli, cfg config.Configuration, platform platform.Platform) {
 	var running *paths.Path
 	if wanted := readWantedApp(cfg); wanted != nil {
 		running = wanted.App
 	}
-	for _, appPath := range prewarmCandidates(readRecentApps(cfg), running) {
+	for _, appPath := range warmApps(cfg) {
+		if running != nil && running.EqualsTo(appPath) {
+			continue
+		}
 		err := withAppsLock(ctx, cfg, func() error {
 			elapsed, err := ensureAppContainer(ctx, docker, cfg, platform, appContainerOf(cfg, appPath), appPath, func(StreamMessage) {})
 			slog.Debug("app container warmed up", slog.String("app", appPath.String()), slog.Duration("elapsed", elapsed))
@@ -656,7 +588,7 @@ func PrewarmApps(ctx context.Context, docker command.Cli, cfg config.Configurati
 	}
 }
 
-// EnsureRuntime removes the app containers of an older image, pulls the ingress image and makes the
+// EnsureRuntime removes the app containers of an older image or of a deleted app, pulls the ingress image and makes the
 // ingress publish the ports of every app of the board, listening on none until an app starts.
 func EnsureRuntime(
 	ctx context.Context,
@@ -668,6 +600,9 @@ func EnsureRuntime(
 	err := withAppsLock(ctx, cfg, func() error {
 		if err := removeStaleAppContainers(ctx, docker.Client(), cfg); err != nil {
 			slog.Warn("failed to remove the app containers of an older image", slog.String("error", err.Error()))
+		}
+		if err := removeOrphanAppContainers(ctx, docker.Client(), cfg); err != nil {
+			slog.Warn("failed to remove the containers of deleted apps", slog.String("error", err.Error()))
 		}
 		if err := ensureAppsNetwork(ctx, docker.Client()); err != nil {
 			return err

@@ -6,7 +6,6 @@
 package orchestrator
 
 import (
-	"fmt"
 	"maps"
 	"os"
 	"slices"
@@ -392,68 +391,31 @@ func TestBoardAppPorts(t *testing.T) {
 	assert.Equal(t, []int{7100, 8000, 9000, 9200}, boardAppPorts(cfg, bricksIndex))
 }
 
-func TestPlanEvictions(t *testing.T) {
-	appContainer := func(project string) container.Summary {
-		return container.Summary{ID: project, Labels: map[string]string{DockerAppMainLabel: "true", composeProjectLabel: project}}
-	}
-	projects := func(containers []container.Summary) []string {
-		result := make([]string, 0, len(containers))
-		for _, c := range containers {
-			result = append(result, c.Labels[composeProjectLabel])
-		}
-		return result
-	}
-	all := []container.Summary{appContainer("a"), appContainer("b"), appContainer("c"), appContainer("d"), appContainer("e")}
-
-	for _, tc := range []struct {
-		name    string
-		recent  []string
-		running string
-		want    []string
-	}{
-		{name: "the running app and the two started last stay", recent: []string{"d", "b", "a", "c"}, running: "d", want: []string{"c", "e"}},
-		{name: "the running app stays even if not recent", recent: []string{"a", "b", "c"}, running: "e", want: []string{"c", "d"}},
-		{name: "a recent app without container takes no place", recent: []string{"a", "gone", "b", "c"}, running: "a", want: []string{"d", "e"}},
-		{name: "no running app keeps two idle ones", recent: []string{"c", "a"}, want: []string{"b", "d", "e"}},
-		{name: "no record keeps the running one", running: "b", want: []string{"a", "c", "d", "e"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, projects(planEvictions(all, tc.recent, tc.running)))
-		})
-	}
-	assert.Empty(t, planEvictions(all[:3], []string{"a", "b", "c"}, "a"), "three containers fit")
-	unnamed := container.Summary{ID: "unnamed", Labels: map[string]string{DockerAppMainLabel: "true"}}
-	assert.Empty(t, planEvictions([]container.Summary{unnamed}, nil, "a"), "a container without project is left alone")
-}
-
-func TestRecentApps(t *testing.T) {
+func TestWarmApps(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
-	app := func(name string) *paths.Path { return cfg.AppsDir().Join(name) }
-	assert.Empty(t, readRecentApps(cfg))
-	for _, name := range []string{"a", "b", "c", "a"} {
-		require.NoError(t, updateRecentApps(cfg, app(name), true))
+	a, b := newTestApp(t, cfg, "a"), newTestApp(t, cfg, "b")
+	for _, p := range []*paths.Path{a.FullPath, b.FullPath} {
+		require.NoError(t, p.Join("app.yaml").WriteFile([]byte("name: app\n")))
 	}
-	assert.Equal(t, []string{app("a").String(), app("c").String(), app("b").String()}, readRecentApps(cfg))
-	require.NoError(t, updateRecentApps(cfg, app("c"), false))
-	assert.Equal(t, []string{app("a").String(), app("b").String()}, readRecentApps(cfg))
-
-	for i := range recentAppsLimit + 5 {
-		require.NoError(t, updateRecentApps(cfg, app(fmt.Sprintf("p%d", i)), true))
-	}
-	assert.Len(t, readRecentApps(cfg), recentAppsLimit)
+	require.NoError(t, cfg.AppsDir().Join("not-an-app").MkdirAll())
+	warm := warmApps(cfg)
+	assert.ElementsMatch(t, []string{a.FullPath.String(), b.FullPath.String()}, warm.AsStrings(), "every user app, nothing else")
 }
 
-func TestPrewarmCandidates(t *testing.T) {
-	root := paths.New(t.TempDir())
-	a, b, c, gone := root.Join("a"), root.Join("b"), root.Join("c"), root.Join("gone")
-	for _, p := range []*paths.Path{a, b, c} {
-		require.NoError(t, p.MkdirAll())
+func TestOrphanAppContainers(t *testing.T) {
+	cfg := setTestOrchestratorConfig(t)
+	kept := newTestApp(t, cfg, "kept")
+	appContainer := func(id, appPath string) container.Summary {
+		return container.Summary{ID: id, Labels: map[string]string{DockerAppMainLabel: "true", DockerAppPathLabel: appPath}}
 	}
-	recent := []string{a.String(), gone.String(), "an-old-project-name", b.String(), c.String()}
-
-	assert.Equal(t, paths.PathList{b, c}, prewarmCandidates(recent, a), "the running app and the missing folders are left out")
-	assert.Equal(t, paths.PathList{a, b}, prewarmCandidates(recent, nil))
-	assert.Empty(t, prewarmCandidates(nil, a))
+	containers := []container.Summary{
+		appContainer("kept", kept.FullPath.String()),
+		appContainer("gone", cfg.AppsDir().Join("gone").String()),
+		{ID: "unlabelled", Labels: map[string]string{DockerAppMainLabel: "true"}},
+	}
+	orphans := orphanAppContainers(containers)
+	require.Len(t, orphans, 1)
+	assert.Equal(t, "gone", orphans[0].ID)
 }
 
 func TestLauncherAppPorts(t *testing.T) {
