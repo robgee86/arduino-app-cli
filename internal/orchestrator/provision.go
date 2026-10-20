@@ -41,13 +41,6 @@ type logging struct {
 	Options map[string]string `yaml:"options,omitempty"`
 }
 
-type healthcheck struct {
-	Test          []string `yaml:"test"`
-	Interval      string   `yaml:"interval,omitempty"`
-	StartPeriod   string   `yaml:"start_period,omitempty"`
-	StartInterval string   `yaml:"start_interval,omitempty"`
-}
-
 // A field holding an expression is a string here: what it renders to is a list.
 type service struct {
 	Image             string                        `yaml:"image"`
@@ -59,6 +52,7 @@ type service struct {
 	GroupAdd          []string                      `yaml:"group_add,omitempty"`
 	DeviceCgroupRules []string                      `yaml:"device_cgroup_rules,omitempty"`
 	Entrypoint        string                        `yaml:"entrypoint,omitempty"`
+	WorkingDir        string                        `yaml:"working_dir,omitempty"`
 	ExtraHosts        []string                      `yaml:"extra_hosts,omitempty"`
 	Labels            map[string]string             `yaml:"labels,omitempty"`
 	Environment       map[string]string             `yaml:"environment,omitempty"`
@@ -70,7 +64,11 @@ type service struct {
 	Tmpfs             []string                      `yaml:"tmpfs,omitempty"`
 	CapDrop           []string                      `yaml:"cap_drop,omitempty"`
 	SecurityOpt       []string                      `yaml:"security_opt,omitempty"`
-	Healthcheck       *healthcheck                  `yaml:"healthcheck,omitempty"`
+	Networks          map[string]serviceNetwork     `yaml:"networks,omitempty"`
+}
+
+type serviceNetwork struct {
+	Aliases []string `yaml:"aliases,omitempty"`
 }
 
 type composeNetwork struct {

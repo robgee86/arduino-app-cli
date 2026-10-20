@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/flags"
@@ -23,7 +24,7 @@ import (
 )
 
 func TestGenerateIngressConf(t *testing.T) {
-	t.Run("one server per port, to the launcher by name", func(t *testing.T) {
+	t.Run("one server per port, to the app container by name", func(t *testing.T) {
 		assert.Equal(t, `worker_processes 1;
 error_log /dev/stderr warn;
 pid /tmp/nginx.pid;
@@ -32,29 +33,30 @@ stream {
     resolver 127.0.0.11 valid=5s ipv6=off;
     server {
         listen 7000;
-        set $launcher launcher;
-        proxy_pass $launcher:7000;
+        set $app my-app-main-1;
+        proxy_pass $app:7000;
     }
     server {
         listen 8080;
-        set $launcher launcher;
-        proxy_pass $launcher:8080;
+        set $app my-app-main-1;
+        proxy_pass $app:8080;
     }
 }
-`, string(generateIngressConf([]int{7000, 8080})))
+`, string(generateIngressConf("my-app-main-1", []int{7000, 8080})))
 	})
 
 	t.Run("no ports, an empty stream", func(t *testing.T) {
-		assert.Equal(t, "worker_processes 1;\nerror_log /dev/stderr warn;\npid /tmp/nginx.pid;\nevents {}\nstream {}\n", string(generateIngressConf(nil)))
+		assert.Equal(t, "worker_processes 1;\nerror_log /dev/stderr warn;\npid /tmp/nginx.pid;\nevents {}\nstream {}\n", string(generateIngressConf("my-app-main-1", nil)))
 	})
 }
 
 func TestWriteIngressFiles(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
 
-	changed, err := writeIngressFiles(cfg, []int{8080, 7000, 8080})
+	changed, err := writeIngressFiles(cfg, []int{8080, 7000, 9000, 8080}, "my-app-main-1", []int{8080, 7000})
 	require.NoError(t, err)
 	assert.Equal(t, ingressFiles{Conf: true, Compose: true}, changed)
+	assert.Equal(t, []int{7000, 8080, 9000}, publishedIngressPorts(cfg))
 
 	project := loadCompose(t, ingressComposeFile(cfg))
 	assert.Equal(t, ingressProject, project.Name)
@@ -83,13 +85,13 @@ func TestWriteIngressFiles(t *testing.T) {
 		for _, p := range svc.Ports {
 			published = append(published, fmt.Sprintf("%s:%d", p.Published, p.Target))
 		}
-		assert.Equal(t, []string{"7000:7000", "8080:8080"}, published)
+		assert.Equal(t, []string{"7000:7000", "8080:8080", "9000:9000"}, published)
 		assert.Empty(t, svc.Ports[0].HostIP, "on every address, IPv6 included")
 	})
 
-	t.Run("on the launcher network, the conf mounted read-only", func(t *testing.T) {
+	t.Run("on the apps network, the conf mounted read-only", func(t *testing.T) {
 		network := project.Networks["default"]
-		assert.Equal(t, launcherNetwork, network.Name)
+		assert.Equal(t, appsNetwork, network.Name)
 		assert.True(t, bool(network.External))
 
 		require.Len(t, svc.Volumes, 1)
@@ -99,32 +101,41 @@ func TestWriteIngressFiles(t *testing.T) {
 
 		conf, err := ingressConfFile(cfg).ReadFile()
 		require.NoError(t, err)
-		assert.Equal(t, generateIngressConf([]int{7000, 8080}), conf)
+		assert.Equal(t, generateIngressConf("my-app-main-1", []int{7000, 8080}), conf)
 	})
 
 	t.Run("the same ports change nothing", func(t *testing.T) {
-		changed, err := writeIngressFiles(cfg, []int{7000, 8080})
+		changed, err := writeIngressFiles(cfg, []int{7000, 8080, 9000}, "my-app-main-1", []int{7000, 8080})
 		require.NoError(t, err)
 		assert.Equal(t, ingressFiles{}, changed)
 	})
 
-	t.Run("a conf written by hand is noticed on its own", func(t *testing.T) {
-		require.NoError(t, ingressConfFile(cfg).WriteFile([]byte("events {}\n")))
-		changed, err := writeIngressFiles(cfg, []int{7000, 8080})
+	t.Run("another app changes the conf only", func(t *testing.T) {
+		changed, err := writeIngressFiles(cfg, []int{7000, 8080, 9000}, "other-main-1", []int{9000})
 		require.NoError(t, err)
 		assert.Equal(t, ingressFiles{Conf: true}, changed)
+		assertIngressConf(t, cfg, "other-main-1", []int{9000})
 	})
 
 	t.Run("no ports, nothing published", func(t *testing.T) {
-		changed, err := writeIngressFiles(cfg, nil)
+		changed, err := writeIngressFiles(cfg, nil, "", nil)
 		require.NoError(t, err)
 		assert.Equal(t, ingressFiles{Conf: true, Compose: true}, changed)
 		data, err := ingressComposeFile(cfg).ReadFile()
 		require.NoError(t, err)
 		assert.NotContains(t, string(data), "ports:")
 		assert.Empty(t, loadCompose(t, ingressComposeFile(cfg)).Services[ingressServiceName].Ports)
-		assertIngressConf(t, cfg, nil)
+		assert.Empty(t, publishedIngressPorts(cfg))
+		assertIngressConf(t, cfg, "", nil)
 	})
+}
+
+func TestPublishedIngressPorts(t *testing.T) {
+	cfg := setTestOrchestratorConfig(t)
+	assert.Empty(t, publishedIngressPorts(cfg), "no ingress yet")
+	require.NoError(t, ingressComposeFile(cfg).Parent().MkdirAll())
+	require.NoError(t, ingressComposeFile(cfg).WriteFile([]byte("not: [yaml")))
+	assert.Empty(t, publishedIngressPorts(cfg), "an unreadable file publishes nothing")
 }
 
 const testIngressID = "ingress-id"
@@ -192,55 +203,87 @@ func (f *fakeDocker) cli(t *testing.T) command.Cli {
 	return cli
 }
 
-func TestOpenAppPorts(t *testing.T) {
+func TestRouteIngress(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
+	bricksIndex, _ := setTestBricks(t, cfg)
 	noop := func(StreamMessage) {}
-	_, err := writeIngressFiles(cfg, []int{7000})
+	target := appContainer{project: "my-app"}
+	_, err := writeIngressFiles(cfg, []int{7000, 7100}, "", nil)
 	require.NoError(t, err)
 
-	t.Run("the same ports start the stopped ingress", func(t *testing.T) {
+	t.Run("published ports start the stopped ingress", func(t *testing.T) {
 		docker := newFakeDocker(t, container.StateExited)
-		require.NoError(t, openAppPorts(t.Context(), docker.cli(t), cfg, []int{7000}, noop))
+		require.NoError(t, routeIngress(t.Context(), docker.cli(t), cfg, bricksIndex, target, []int{7000}, noop))
 		assert.Equal(t, []string{"start " + testIngressID}, docker.calls)
+		assertIngressConf(t, cfg, "my-app-main-1", []int{7000})
 	})
 
-	t.Run("the same ports leave the running ingress as is", func(t *testing.T) {
+	t.Run("the same app leaves the running ingress as is", func(t *testing.T) {
 		docker := newFakeDocker(t, container.StateRunning)
-		require.NoError(t, openAppPorts(t.Context(), docker.cli(t), cfg, []int{7000}, noop))
+		require.NoError(t, routeIngress(t.Context(), docker.cli(t), cfg, bricksIndex, target, []int{7000}, noop))
 		assert.Empty(t, docker.calls)
 	})
 
-	t.Run("a conf that changed under the running ingress reloads it", func(t *testing.T) {
-		// What an upgrade leaves behind: the same ports, a conf written by an older daemon
-		require.NoError(t, ingressConfFile(cfg).WriteFile([]byte("events {}\n")))
+	t.Run("a switch between apps reloads the running ingress", func(t *testing.T) {
 		docker := newFakeDocker(t, container.StateRunning)
-		require.NoError(t, openAppPorts(t.Context(), docker.cli(t), cfg, []int{7000}, noop))
+		require.NoError(t, routeIngress(t.Context(), docker.cli(t), cfg, bricksIndex, appContainer{project: "other"}, []int{7100}, noop))
 		assert.Equal(t, []string{"kill HUP " + testIngressID}, docker.calls)
-		assertIngressConf(t, cfg, []int{7000})
+		assertIngressConf(t, cfg, "other-main-1", []int{7100})
+		assert.Equal(t, []int{7000, 7100}, publishedIngressPorts(cfg), "the published ports stay")
 	})
 
-	t.Run("other ports recreate it with compose", func(t *testing.T) {
-		docker := newFakeDocker(t, container.StateExited)
-		require.ErrorContains(t, openAppPorts(t.Context(), docker.cli(t), cfg, []int{7000, 8080}, noop), "failed to start the ingress")
+	t.Run("a port outside the published ones grows them with the board apps and recreates it", func(t *testing.T) {
+		ui := cfg.AppsDir().Join("custom")
+		require.NoError(t, ui.Join("python").MkdirAll())
+		require.NoError(t, ui.Join("python", "main.py").WriteFile(nil))
+		require.NoError(t, ui.Join("app.yaml").WriteFile([]byte("name: Custom\nbricks:\n- arduino:custom_ui: {}\n")))
+		docker := newFakeDocker(t, container.StateRunning)
+		require.ErrorContains(t, routeIngress(t.Context(), docker.cli(t), cfg, bricksIndex, target, []int{9500}, noop), "failed to start the ingress")
 		assert.Empty(t, docker.calls)
-		assertIngressConf(t, cfg, []int{7000, 8080})
+		assert.Equal(t, []int{7000, 7100, 8000, 9500}, publishedIngressPorts(cfg))
+		assertIngressConf(t, cfg, "my-app-main-1", []int{9500})
 	})
 
 	t.Run("no ingress yet creates it with compose", func(t *testing.T) {
 		docker := newEmptyFakeDocker(t)
-		require.ErrorContains(t, openAppPorts(t.Context(), docker.cli(t), cfg, []int{7000, 8080}, noop), "failed to start the ingress")
+		require.ErrorContains(t, routeIngress(t.Context(), docker.cli(t), cfg, bricksIndex, target, []int{7000}, noop), "failed to start the ingress")
 		assert.Empty(t, docker.calls)
 	})
 
-	t.Run("no ports stop it, its file keeps the last ports", func(t *testing.T) {
-		docker := newFakeDocker(t, container.StateRunning)
-		require.NoError(t, openAppPorts(t.Context(), docker.cli(t), cfg, nil, noop))
-		assert.Equal(t, []string{"stop " + testIngressID}, docker.calls)
-		assertIngressConf(t, cfg, []int{7000, 8080})
+	t.Run("no ports on the board, no ingress", func(t *testing.T) {
+		cfg := setTestOrchestratorConfig(t)
+		docker := newEmptyFakeDocker(t)
+		require.NoError(t, routeIngress(t.Context(), docker.cli(t), cfg, bricksIndex, target, nil, noop))
+		assert.Empty(t, docker.calls)
 	})
 }
 
-func TestCloseAppPorts(t *testing.T) {
+func TestSyncIngress(t *testing.T) {
+	cfg := setTestOrchestratorConfig(t)
+	_, err := writeIngressFiles(cfg, []int{7000, 8000}, "my-app-main-1", []int{7000})
+	require.NoError(t, err)
+
+	t.Run("the same ports reload it on no listener", func(t *testing.T) {
+		docker := newFakeDocker(t, container.StateRunning)
+		require.NoError(t, syncIngress(t.Context(), docker.cli(t), cfg, []int{7000, 8000}))
+		assert.Equal(t, []string{"kill HUP " + testIngressID}, docker.calls)
+		assertIngressConf(t, cfg, "", nil)
+	})
+
+	t.Run("fewer ports recreate it", func(t *testing.T) {
+		docker := newFakeDocker(t, container.StateRunning)
+		require.ErrorContains(t, syncIngress(t.Context(), docker.cli(t), cfg, []int{7000}), "failed to start the ingress")
+		assert.Equal(t, []int{7000}, publishedIngressPorts(cfg))
+	})
+
+	t.Run("no ports stop it", func(t *testing.T) {
+		docker := newFakeDocker(t, container.StateRunning)
+		require.NoError(t, syncIngress(t.Context(), docker.cli(t), cfg, nil))
+		assert.Equal(t, []string{"stop " + testIngressID}, docker.calls)
+	})
+}
+
+func TestStopIngress(t *testing.T) {
 	for _, tc := range []struct {
 		state     container.ContainerState
 		wantCalls []string
@@ -252,14 +295,14 @@ func TestCloseAppPorts(t *testing.T) {
 	} {
 		t.Run(string(tc.state), func(t *testing.T) {
 			docker := newFakeDocker(t, tc.state)
-			require.NoError(t, closeAppPorts(t.Context(), docker))
+			require.NoError(t, stopIngress(t.Context(), docker))
 			assert.Equal(t, tc.wantCalls, docker.calls)
 		})
 	}
 
 	t.Run("no ingress", func(t *testing.T) {
 		docker := newEmptyFakeDocker(t)
-		require.NoError(t, closeAppPorts(t.Context(), docker))
+		require.NoError(t, stopIngress(t.Context(), docker))
 		assert.Empty(t, docker.calls)
 	})
 }
@@ -270,36 +313,42 @@ func TestPullIngressImage(t *testing.T) {
 	assert.Empty(t, present.calls, "an image the board has is not pulled")
 }
 
-func TestStopAppProcessesClosesThePortsOfItsApp(t *testing.T) {
+func TestStopAppProcessesSilencesTheIngressOfItsApp(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
 	require.NoError(t, cfg.RuntimeDir().MkdirAll())
-	_, err := writeIngressFiles(cfg, []int{7000})
-	require.NoError(t, err)
-	// The launcher is unreachable: it runs nothing
+	// The app container is unreachable: it runs nothing
 	stopped := newTestApp(t, cfg, "stopped")
 	stopped.MainPythonFile = stopped.FullPath.Join("python", "main.py")
+	startedAt := time.Now()
 
 	t.Run("another app keeps its ports", func(t *testing.T) {
+		_, err := writeIngressFiles(cfg, []int{7000}, "other-main-1", []int{7000})
+		require.NoError(t, err)
 		docker := newFakeDocker(t, container.StateRunning)
-		require.NoError(t, setLauncherWantedApp(cfg, cfg.AppsDir().Join("other")))
+		require.NoError(t, setWantedApp(cfg, cfg.AppsDir().Join("other"), startedAt))
 		require.NoError(t, stopAppProcesses(t.Context(), docker, stopped, cfg, nil))
 		assert.Empty(t, docker.calls)
+		assertIngressConf(t, cfg, "other-main-1", []int{7000})
+		assert.NotNil(t, readWantedApp(cfg))
 	})
 
-	t.Run("its own ports close", func(t *testing.T) {
+	t.Run("its own ports stop forwarding, the ingress stays up", func(t *testing.T) {
+		_, err := writeIngressFiles(cfg, []int{7000}, "stopped-main-1", []int{7000})
+		require.NoError(t, err)
 		docker := newFakeDocker(t, container.StateRunning)
-		require.NoError(t, setLauncherWantedApp(cfg, stopped.FullPath))
+		require.NoError(t, setWantedApp(cfg, stopped.FullPath, startedAt))
 		require.NoError(t, stopAppProcesses(t.Context(), docker, stopped, cfg, nil))
-		assert.Equal(t, []string{"stop " + testIngressID}, docker.calls)
-		assert.Nil(t, readLauncherWantedApp(cfg))
-		assertIngressConf(t, cfg, []int{7000})
+		assert.Equal(t, []string{"kill HUP " + testIngressID}, docker.calls)
+		assert.Nil(t, readWantedApp(cfg))
+		assertIngressConf(t, cfg, "", nil)
+		assert.Equal(t, []int{7000}, publishedIngressPorts(cfg))
 	})
 }
 
-// assertIngressConf checks that the ingress conf forwards the ports.
-func assertIngressConf(t *testing.T, cfg config.Configuration, ports []int) {
+// assertIngressConf checks that the ingress conf forwards the ports to the host.
+func assertIngressConf(t *testing.T, cfg config.Configuration, host string, ports []int) {
 	t.Helper()
 	conf, err := ingressConfFile(cfg).ReadFile()
 	require.NoError(t, err)
-	assert.Equal(t, string(generateIngressConf(ports)), string(conf))
+	assert.Equal(t, string(generateIngressConf(host, ports)), string(conf))
 }

@@ -32,7 +32,7 @@ import (
 // The sidecars zone is the one compose project of the board sidecars. Each start writes it from
 // the sidecars of the app being started, and compose up reconciles the containers with it: a
 // service whose configuration is unchanged keeps running, a changed one is recreated, the services
-// no longer in it are removed. The zone runs the sidecars of the wanted app, see launcherWantedAppFile.
+// no longer in it are removed. The zone runs the sidecars of the wanted app, see wantedAppFile.
 const sidecarsProject = "arduino-sidecars"
 
 func sidecarsDir(cfg config.Configuration) *paths.Path {
@@ -58,7 +58,7 @@ type sidecarsZone struct {
 }
 
 // generateSidecarsZone turns the rendered app project, its main service split off, into the zone:
-// on the network shared with the launcher, and naming no app so that two apps with the same
+// on the network shared with the app containers, and naming no app so that two apps with the same
 // sidecars get the same containers. It writes the zone compose file, and removes it without sidecars.
 func generateSidecarsZone(prj *types.Project, cfg config.Configuration) (sidecarsZone, error) {
 	slog.Debug("Generating the sidecars zone", slog.String("app", prj.Name))
@@ -72,8 +72,8 @@ func generateSidecarsZone(prj *types.Project, cfg config.Configuration) (sidecar
 
 	zone := prj.WithoutUnnecessaryResources()
 	zone.Name = sidecarsProject
-	// The launcher reaches the sidecars by service name
-	zone.Networks = types.Networks{"default": types.NetworkConfig{Name: launcherNetwork, External: true}}
+	// The app containers reach the sidecars by service name
+	zone.Networks = types.Networks{"default": types.NetworkConfig{Name: appsNetwork, External: true}}
 	for name, svc := range zone.Services {
 		// The app folder reaches a sidecar only through its compose file, as ${APP_HOME}
 		delete(svc.Labels, DockerAppPathLabel)
@@ -161,13 +161,16 @@ func removeSidecarsZoneFiles(cfg config.Configuration) error {
 	return nil
 }
 
-// splitAppContainers separates the zone containers from the ones of the per-app projects of the older versions.
+// splitAppContainers separates the zone containers from the sidecars of the per-app projects of the
+// older versions. The app containers are neither.
 func splitAppContainers(containers []container.Summary) (zone appContainers, legacy []container.Summary) {
 	zone = make(appContainers)
 	for _, c := range containers {
-		if c.Labels[composeProjectLabel] == sidecarsProject {
+		switch {
+		case c.Labels[DockerAppMainLabel] == "true":
+		case c.Labels[composeProjectLabel] == sidecarsProject:
 			zone[c.Labels[composeServiceLabel]] = c
-		} else {
+		default:
 			legacy = append(legacy, c)
 		}
 	}
@@ -250,7 +253,7 @@ func reconcileSidecars(ctx context.Context, docker command.Cli, cfg config.Confi
 		return nil, upSidecars(ctx, docker, cfg, zone, cb)
 	case sidecarsStart:
 		if err := startAppContainers(ctx, docker.Client(), containers.only(zone.services).notRunning(), cb); err != nil {
-			// e.g. the shared network was recreated with the launcher
+			// e.g. the shared network was recreated
 			slog.Warn("failed to start the existing sidecars, recreating them", slog.String("error", err.Error()))
 			if err := removeContainers(ctx, docker.Client(), slices.Collect(maps.Values(containers.only(zone.services)))); err != nil {
 				return nil, err
@@ -278,6 +281,9 @@ func upSidecars(ctx context.Context, docker command.Cli, cfg config.Configuratio
 		return err
 	}
 	slog.Debug("starting the sidecars", slog.Any("services", zone.services))
+	if err := ensureAppsNetwork(ctx, docker.Client()); err != nil {
+		return err
+	}
 	if err := dockerhelper.ComposeUp(ctx, docker, zone.project, func(line string) { cb(StreamMessage{data: line}) }); err != nil {
 		return err
 	}

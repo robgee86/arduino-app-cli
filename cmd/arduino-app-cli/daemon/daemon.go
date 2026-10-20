@@ -34,10 +34,10 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 		Run: func(cmd *cobra.Command, args []string) {
 			daemonPort, _ := cmd.Flags().GetString("port")
 
-			// The launcher and the ingress survive the cleanup: they carry no app label, the launcher app stops below
-			err := orchestrator.StopAllAppContainers(cmd.Context(), servicelocator.GetDockerClient().Client())
+			// The app containers stay warm for the next start, only the apps stop
+			err := orchestrator.StopAllApps(cmd.Context(), servicelocator.GetDockerClient().Client(), cfg)
 			if err != nil {
-				slog.Warn("Failed to stop containers", slog.String("error", err.Error()))
+				slog.Warn("Failed to stop the apps", slog.String("error", err.Error()))
 			}
 
 			app, err := orchestrator.GetDefaultApp(cfg)
@@ -50,20 +50,19 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 
 			// start the default app in the background
 			go func() {
-				// It also pulls the ingress image, so that no start has to, and closes the ports until the default app starts
-				elapsed, err := orchestrator.EnsureLauncher(
+				// The app containers of an older image go, the ingress publishes the ports of every app and forwards none yet
+				elapsed, err := orchestrator.EnsureRuntime(
 					cmd.Context(),
 					servicelocator.GetDockerClient(),
 					cfg,
-					servicelocator.GetPlatform(),
-					true,
+					servicelocator.GetBricksIndex(),
 				)
 				if err != nil {
-					// The default app would fail on the same error
-					slog.Error("App launcher unavailable, the default app is not started", slog.String("error", err.Error()))
-					return
+					// An app without ports runs without the ingress
+					slog.Warn("Ingress unavailable, the apps with ports cannot start", slog.String("error", err.Error()))
+				} else {
+					slog.Info("Ingress ready", slog.Duration("elapsed", elapsed))
 				}
-				slog.Info("App launcher ready", slog.Duration("elapsed", elapsed))
 
 				slog.Info("Starting default app")
 				err = orchestrator.StartDefaultApp(
@@ -82,6 +81,9 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 				} else {
 					slog.Info("Default app started")
 				}
+
+				// The apps opened last start warm after a reboot too
+				orchestrator.PrewarmApps(cmd.Context(), servicelocator.GetDockerClient(), cfg, servicelocator.GetPlatform())
 			}()
 
 			httpHandler(cmd.Context(), cfg, daemonPort, version)

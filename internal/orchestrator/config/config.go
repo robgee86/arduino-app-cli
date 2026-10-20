@@ -217,7 +217,7 @@ func (c *Configuration) ReleasesDir() *paths.Path {
 	return c.releasesDir
 }
 
-// RuntimeDir holds the sockets shared with the containers, like the app launcher control socket.
+// RuntimeDir holds the sockets shared with the containers, like the control sockets of the app containers.
 func (c *Configuration) RuntimeDir() *paths.Path {
 	return c.runtimeDir
 }

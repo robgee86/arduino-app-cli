@@ -67,71 +67,64 @@ func sidecarsStatus(containers []container.Summary, services []string) Status {
 	}
 }
 
-// launcherView is what the launcher runs, the app it should be running, and the zone services
-// that are its sidecars: nil without record, then every zone container counts.
-type launcherView struct {
-	children []launcher.Child
+// appsView is the app that should be running with the child its container runs, and the zone
+// services that are its sidecars: nil without record, then every zone container counts.
+type appsView struct {
 	wanted   *paths.Path
+	child    *launcher.Child
 	sidecars []string
 }
 
-// readLauncherView asks the launcher for its children. An unreachable launcher runs nothing.
-func readLauncherView(ctx context.Context, cfg config.Configuration) launcherView {
-	view := launcherView{wanted: readLauncherWantedApp(cfg)}
+// readAppsView asks the container of the wanted app for its child. An unreachable container runs nothing.
+func readAppsView(ctx context.Context, cfg config.Configuration) appsView {
+	var view appsView
 	if record := readSidecarsRecord(cfg); record != nil {
 		view.sidecars = slices.Collect(maps.Keys(record))
 	}
-	status, err := newLauncherClient(cfg).Status(ctx)
-	if err != nil {
-		slog.Debug("app launcher status unavailable", slog.String("error", err.Error()))
+	wanted := readWantedApp(cfg)
+	if wanted == nil {
 		return view
 	}
-	view.children = status.Children
+	view.wanted = wanted.App
+	status, err := appContainerOf(cfg, wanted.App).client(cfg).Status(ctx)
+	if err != nil {
+		slog.Debug("app container status unavailable", slog.String("error", err.Error()))
+		return view
+	}
+	view.child = status.Child
 	return view
 }
 
-// mergeAppStatus combines the sidecars zone with the launcher children: the zone runs the sidecars
-// of the wanted app. An app neither run nor wanted is idle: its sidecar exit codes come from the
-// stop, and a runner may exit 0 on SIGTERM.
-func mergeAppStatus(containers []container.Summary, view launcherView) []AppStatusInfo {
+// mergeAppStatus combines the sidecars zone with the child of the wanted app: the zone runs its
+// sidecars. Every other app with a container is idle: its sidecar exit codes come from the stop,
+// and a runner may exit 0 on SIGTERM.
+func mergeAppStatus(containers []container.Summary, view appsView) []AppStatusInfo {
 	// The orphans being removed alongside a start are no sidecars of the app
 	zone := sidecarsStatus(containers, view.sidecars)
-	children := make(map[string]launcher.Child, len(view.children))
-	for _, c := range view.children {
-		children[filepath.Clean(c.App)] = c
-	}
-
-	appPaths := slices.Collect(maps.Keys(children))
-	if view.wanted != nil {
-		appPaths = append(appPaths, view.wanted.String())
-	}
-	slices.Sort(appPaths)
-
-	result := make([]AppStatusInfo, 0, len(appPaths))
-	for _, appPath := range slices.Compact(appPaths) {
-		p := paths.New(appPath)
-		child, running := children[appPath]
-		wanted := view.wanted != nil && view.wanted.EqualsTo(p)
-		status := idleAppStatus(p)
-		if running || wanted {
-			var sidecars Status
-			if wanted {
-				sidecars = zone
-			}
-			status = launcherAppStatus(sidecars, child, running)
+	statuses := make(map[string]Status)
+	for _, c := range containers {
+		if appPath := c.Labels[DockerAppPathLabel]; c.Labels[DockerAppMainLabel] == "true" && appPath != "" {
+			statuses[filepath.Clean(appPath)] = idleAppStatus(paths.New(appPath))
 		}
-		result = append(result, AppStatusInfo{AppPath: p, Status: status})
+	}
+	if view.wanted != nil {
+		statuses[view.wanted.String()] = wantedAppStatus(zone, view.child)
+	}
+
+	result := make([]AppStatusInfo, 0, len(statuses))
+	for _, appPath := range slices.Sorted(maps.Keys(statuses)) {
+		result = append(result, AppStatusInfo{AppPath: paths.New(appPath), Status: statuses[appPath]})
 	}
 	return result
 }
 
-// launcherAppStatus is the status of an app the launcher runs or should run; sidecars is empty without sidecars.
-func launcherAppStatus(sidecars Status, child launcher.Child, hasChild bool) Status {
+// wantedAppStatus is the status of the app that should be running; sidecars is empty without sidecars.
+func wantedAppStatus(sidecars Status, child *launcher.Child) Status {
 	switch {
 	// A failed sidecar, or a wanted app whose child is gone
-	case sidecars == StatusFailed, !hasChild:
+	case sidecars == StatusFailed, child == nil:
 		return StatusFailed
-	case child.State == launcher.StateStopping:
+	case child.Stopping:
 		return StatusStopping
 	case sidecars == StatusStarting:
 		return StatusStarting
@@ -149,7 +142,8 @@ func idleAppStatus(appPath *paths.Path) Status {
 	return StatusUninitialized
 }
 
-// listAppContainers lists the app containers, running or not: the sidecars zone and the per-app projects of the older versions.
+// listAppContainers lists the app containers, running or not: the containers of the apps, the
+// sidecars zone and the sidecars of the per-app projects of the older versions.
 func listAppContainers(ctx context.Context, docker dockerClient.APIClient) ([]container.Summary, error) {
 	containers, err := dockerhelper.Containers(ctx, docker, DockerAppLabel+"=true")
 	if err != nil {
@@ -167,7 +161,7 @@ func getAppsStatus(
 	if err != nil {
 		return nil, err
 	}
-	return mergeAppStatus(containers, readLauncherView(ctx, cfg)), nil
+	return mergeAppStatus(containers, readAppsView(ctx, cfg)), nil
 }
 
 func getAppStatus(

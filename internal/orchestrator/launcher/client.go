@@ -3,8 +3,8 @@
 // SPDX-FileCopyrightText: Arduino s.r.l. and/or its affiliated companies
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Package launcher is the client of the app launcher control socket: one JSON request per
-// connection, answered by one JSON line.
+// Package launcher is the client of the control socket of the warm supervisor in an app
+// container: one JSON request per connection, answered by one JSON line.
 package launcher
 
 import (
@@ -17,20 +17,17 @@ import (
 	"time"
 )
 
-// SocketName is the control socket file name inside the runtime directory.
+// SocketName is the control socket file name inside the runtime directory of an app.
 const SocketName = "app-launcher.sock"
 
 const maxResponseBytes = 1024 * 1024
 
 // Error codes of the launcher protocol.
 const (
-	CodeBadRequest  = "bad_request"
-	CodeNotFound    = "not_found"
-	CodeUnsupported = "unsupported"
-	// CodeForbidden is a request from a process of an app, which the launcher refuses.
-	CodeForbidden = "forbidden"
-	CodeBusy      = "busy"
-	CodeInternal  = "internal"
+	CodeBadRequest = "bad_request"
+	CodeNotFound   = "not_found"
+	CodeBusy       = "busy"
+	CodeInternal   = "internal"
 	// CodePrepareFailed is a start whose dependencies failed to install: the message ends with the install output.
 	CodePrepareFailed = "prepare_failed"
 )
@@ -56,8 +53,6 @@ type StartResponse struct {
 	StartedAt time.Time `json:"started_at"`
 	Warm      bool      `json:"warm"`
 	Runner    string    `json:"runner"`
-	// Confined tells the app runs confined to its folder.
-	Confined bool `json:"confined"`
 	// Prepared tells the launcher installed the app dependencies before the start.
 	Prepared bool    `json:"prepared"`
 	Timings  Timings `json:"timings"`
@@ -74,26 +69,21 @@ type StopResponse struct {
 	Stopped []StoppedChild `json:"stopped"`
 }
 
-// Child states reported by the launcher.
-const (
-	StateRunning  = "running"
-	StateStopping = "stopping"
-)
-
 type Child struct {
 	App       string    `json:"app"`
 	PID       int       `json:"pid"`
-	State     string    `json:"state"`
 	StartedAt time.Time `json:"started_at"`
 	Runner    string    `json:"runner"`
 	Warm      bool      `json:"warm"`
+	Stopping  bool      `json:"stopping"`
 }
 
 type StatusResponse struct {
-	Children []Child        `json:"children"`
-	Preload  map[string]any `json:"preload"`
-	Version  string         `json:"version"`
-	UptimeS  float64        `json:"uptime_s"`
+	// Child is the app the supervisor runs, nil when none.
+	Child   *Child         `json:"child"`
+	Preload map[string]any `json:"preload"`
+	Version string         `json:"version"`
+	UptimeS float64        `json:"uptime_s"`
 }
 
 // Client talks to the launcher on a Unix socket. Each call bounds the whole exchange by
@@ -125,32 +115,28 @@ const (
 )
 
 type request struct {
-	Cmd  string `json:"cmd"`
-	App  string `json:"app,omitempty"`
-	Mode string `json:"mode,omitempty"`
-	// Ports are the TCP ports the app may bind, the ones it declares; sent on every start, even when empty.
-	Ports []int `json:"ports,omitzero"`
+	Cmd string `json:"cmd"`
+	App string `json:"app,omitempty"`
+	// Env is the app environment, which the child runs with over the container one.
+	Env map[string]string `json:"env,omitempty"`
 }
 
 func (c *Client) Ping(ctx context.Context) error {
 	return c.do(ctx, request{Cmd: cmdPing}, nil)
 }
 
-// Start runs the app in place of every other running app, installing its dependencies first when
-// they changed. The app may bind only its ports; its environment is the file WriteEnvironment wrote.
-func (c *Client) Start(ctx context.Context, app string, ports []int) (StartResponse, error) {
-	if ports == nil {
-		ports = []int{}
-	}
+// Start runs the app with its environment in place of the running one, installing its
+// dependencies first when they changed.
+func (c *Client) Start(ctx context.Context, app string, env map[string]string) (StartResponse, error) {
 	var resp StartResponse
-	err := c.do(ctx, request{Cmd: cmdStart, App: app, Mode: "replace", Ports: ports}, &resp)
+	err := c.do(ctx, request{Cmd: cmdStart, App: app, Env: env}, &resp)
 	return resp, err
 }
 
-// Stop stops one app, or every app when app is empty. A non-running app is not an error.
-func (c *Client) Stop(ctx context.Context, app string) (StopResponse, error) {
+// Stop stops the running app. No running app is not an error.
+func (c *Client) Stop(ctx context.Context) (StopResponse, error) {
 	var resp StopResponse
-	err := c.do(ctx, request{Cmd: cmdStop, App: app}, &resp)
+	err := c.do(ctx, request{Cmd: cmdStop}, &resp)
 	return resp, err
 }
 

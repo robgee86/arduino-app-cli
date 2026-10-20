@@ -227,7 +227,7 @@ func generateComposeTemplate(
 	return nil
 }
 
-// pythonRuntime is what the app main service and the launcher share of the python container:
+// pythonRuntime is what the app main service and the app container share of the python container:
 // the host devices and sockets, as expressions rendered on the board, and the groups to access them.
 type pythonRuntime struct {
 	volumes     []any

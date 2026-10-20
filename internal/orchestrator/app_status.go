@@ -23,11 +23,11 @@ import (
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
 )
 
-// The launcher has no events: its children are polled while someone listens.
+// The supervisor of an app container has no events: its child is polled while someone listens.
 const launcherPollInterval = time.Second
 
 // AppStatusEvents yields an app each time its status changes. Container events refresh the
-// sidecars, a ticker refreshes the launcher children.
+// containers, a ticker refreshes the child of the wanted app.
 func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker command.Cli, idProvider *appid.Provider) iter.Seq2[AppInfo, error] {
 	chanMsg, chanError := dockerhelper.ContainerEvents(ctx, docker.Client(), DockerAppLabel+"=true",
 		"create", "start", "stop", "die", "restart", "destroy", "delete")
@@ -38,7 +38,7 @@ func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker comma
 			_ = yield(AppInfo{}, err)
 			return
 		}
-		last := statusByPath(mergeAppStatus(containers, readLauncherView(ctx, cfg)))
+		last := statusByPath(mergeAppStatus(containers, readAppsView(ctx, cfg)))
 
 		ticker := time.NewTicker(launcherPollInterval)
 		defer ticker.Stop()
@@ -65,7 +65,7 @@ func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker comma
 			case <-ticker.C:
 			}
 
-			current := statusByPath(mergeAppStatus(containers, readLauncherView(ctx, cfg)))
+			current := statusByPath(mergeAppStatus(containers, readAppsView(ctx, cfg)))
 			for _, change := range statusChanges(last, current) {
 				info, err := appInfoFromStatus(cfg, idProvider, change)
 				if err != nil {

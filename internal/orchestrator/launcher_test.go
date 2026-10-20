@@ -6,6 +6,7 @@
 package orchestrator
 
 import (
+	"fmt"
 	"maps"
 	"os"
 	"slices"
@@ -15,6 +16,7 @@ import (
 	"github.com/arduino/go-paths-helper"
 	"github.com/compose-spec/compose-go/v2/loader"
 	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/docker/compose/v5/pkg/api"
 	"github.com/moby/moby/api/types/container"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -178,7 +180,7 @@ func TestGenerateSidecarsZone(t *testing.T) {
 		assert.NotContains(t, sidecar.Environment, "APP_HOME")
 
 		network := project.Networks["default"]
-		assert.Equal(t, launcherNetwork, network.Name)
+		assert.Equal(t, appsNetwork, network.Name)
 		assert.True(t, bool(network.External))
 	})
 
@@ -265,8 +267,9 @@ func TestAppContainers(t *testing.T) {
 		return container.Summary{ID: service, State: state, Labels: map[string]string{DockerAppLabel: "true", composeProjectLabel: sidecarsProject, composeServiceLabel: service}}
 	}
 	legacyContainer := container.Summary{ID: "old", State: container.StateRunning, Labels: map[string]string{DockerAppLabel: "true", composeProjectLabel: "my-app", composeServiceLabel: "runner"}}
+	appContainer := container.Summary{ID: "app", State: container.StateRunning, Labels: map[string]string{DockerAppLabel: "true", DockerAppMainLabel: "true", composeProjectLabel: "my-app", composeServiceLabel: mainServiceName}}
 
-	zone, legacy := splitAppContainers([]container.Summary{zoneContainer("runner", container.StateRunning), zoneContainer("db", container.StateExited), legacyContainer})
+	zone, legacy := splitAppContainers([]container.Summary{zoneContainer("runner", container.StateRunning), zoneContainer("db", container.StateExited), legacyContainer, appContainer})
 	assert.Equal(t, []container.Summary{legacyContainer}, legacy)
 	assert.True(t, zone.cover([]string{"runner", "db"}))
 	assert.False(t, zone.cover([]string{"runner", "other"}))
@@ -275,81 +278,182 @@ func TestAppContainers(t *testing.T) {
 	assert.Equal(t, []container.Summary{zone["db"]}, zone.orphans([]string{"runner"}))
 }
 
-func TestGenerateLauncherComposeFile(t *testing.T) {
+func TestGenerateAppComposeFile(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
-	require.NoError(t, cfg.AppsDir().MkdirAll())
-	require.NoError(t, cfg.ExamplesBaseDir().MkdirAll())
-	require.NoError(t, cfg.ReleasesDir().MkdirAll())
-	require.NoError(t, cfg.RuntimeDir().MkdirAll())
+	a := newTestApp(t, cfg, "my-app", "arduino:web_ui")
+	c := appContainerOf(cfg, a.FullPath)
 	boardEnvs := types.Mapping{"BOARD_NAME": "unoq", "HOST_IP": "10.0.0.2"}
 
-	changed, err := generateLauncherComposeFile(testPythonImage, cfg, boardEnvs, platform.Platform{})
+	changed, err := generateAppComposeFile(c, a.FullPath, testPythonImage, cfg, boardEnvs, platform.Platform{})
 	require.NoError(t, err)
 	assert.True(t, changed)
+	assert.Equal(t, cfg.DataDir().Join("apps", "my-app", "compose.yaml").String(), c.composeFile(cfg).String())
 
-	project := loadCompose(t, launcherComposeFile(cfg))
-	assert.Equal(t, launcherProject, project.Name)
-	assert.Equal(t, []string{launcherServiceName}, project.ServiceNames())
-	svc := project.Services[launcherServiceName]
+	project := loadCompose(t, c.composeFile(cfg))
+	assert.Equal(t, "my-app", project.Name)
+	assert.Equal(t, []string{mainServiceName}, project.ServiceNames())
+	svc := project.Services[mainServiceName]
 
 	assert.Equal(t, testPythonImage, svc.Image)
 	assert.Equal(t, types.ShellCommand{"/run.sh", "serve"}, svc.Entrypoint)
+	assert.Equal(t, "/app", svc.WorkingDir)
 	assert.True(t, *svc.Init)
-	assert.Equal(t, "unless-stopped", svc.Restart)
+	assert.Equal(t, "no", svc.Restart)
 	assert.Equal(t, types.Duration(10*time.Second), *svc.StopGracePeriod)
-	assert.Equal(t, map[string]string{DockerLauncherLabel: "true"}, map[string]string(svc.Labels))
-
-	require.NotNil(t, svc.HealthCheck)
-	assert.Equal(t, types.HealthCheckTest{"CMD", "arduino-app-launcher", "ping"}, svc.HealthCheck.Test)
-	assert.Equal(t, types.Duration(2*time.Second), *svc.HealthCheck.Interval)
-	assert.Equal(t, types.Duration(60*time.Second), *svc.HealthCheck.StartPeriod)
-	assert.Equal(t, types.Duration(500*time.Millisecond), *svc.HealthCheck.StartInterval)
-
+	assert.Equal(t, map[string]string{DockerAppLabel: "true", DockerAppMainLabel: "true", DockerAppPathLabel: a.FullPath.String()}, map[string]string(svc.Labels))
+	assert.Nil(t, svc.HealthCheck, "a healthcheck would run a python in every warm container")
 	assert.Empty(t, svc.Ports, "the ingress publishes the app ports")
 
 	assert.Equal(t, types.MappingWithEquals{
-		"BOARD_NAME":          new("unoq"),
-		"HOST_IP":             new("10.0.0.2"),
-		"APP_LAUNCHER_SOCKET": new("/run/arduino-app-cli/app-launcher.sock"),
-		// The CLI waits for a start as long as the launcher may prepare it
+		"BOARD_NAME": new("unoq"),
+		"HOST_IP":    new("10.0.0.2"),
+		// The CLI waits for a start as long as the supervisor may prepare it
 		"APP_LAUNCHER_PREPARE_TIMEOUT_S": new("600"),
-	}, svc.Environment)
+	}, svc.Environment, "nothing of the app: its environment goes with each start")
 
 	targets := make(map[string]string, len(svc.Volumes))
 	for _, v := range svc.Volumes {
 		targets[v.Target] = v.Source
 	}
-	assert.Equal(t, cfg.AppsDir().String(), targets[cfg.AppsDir().String()])
-	assert.Equal(t, cfg.ExamplesBaseDir().String(), targets[cfg.ExamplesBaseDir().String()])
-	assert.Equal(t, cfg.ReleasesDir().String(), targets[cfg.ReleasesDir().String()], "the installed releases run in place too")
-	assert.Equal(t, cfg.RuntimeDir().String(), targets[launcherSocketDir])
-	assert.NotContains(t, targets, "/app")
+	assert.Equal(t, a.FullPath.String(), targets["/app"])
+	assert.Equal(t, cfg.RuntimeDir().Join("apps", "my-app").String(), targets["/run/arduino-app-cli"])
+	assert.Equal(t, "/dev", targets["/dev"])
 
 	network := project.Networks["default"]
-	assert.Equal(t, launcherNetwork, network.Name)
-	assert.False(t, bool(network.External))
+	assert.Equal(t, appsNetwork, network.Name)
+	assert.True(t, bool(network.External))
+	assert.Equal(t, []string{"my-app-main-1"}, svc.Networks["default"].Aliases)
 
 	t.Run("a second generation changes nothing", func(t *testing.T) {
-		changed, err := generateLauncherComposeFile(testPythonImage, cfg, boardEnvs, platform.Platform{})
+		changed, err := generateAppComposeFile(c, a.FullPath, testPythonImage, cfg, boardEnvs, platform.Platform{})
 		require.NoError(t, err)
 		assert.False(t, changed)
 	})
 
 	t.Run("another board environment changes it", func(t *testing.T) {
-		changed, err := generateLauncherComposeFile(testPythonImage, cfg, types.Mapping{"HOST_IP": "10.0.0.3"}, platform.Platform{})
+		changed, err := generateAppComposeFile(c, a.FullPath, testPythonImage, cfg, types.Mapping{"HOST_IP": "10.0.0.3"}, platform.Platform{})
 		require.NoError(t, err)
 		assert.True(t, changed)
 	})
 
-	t.Run("a preload override reaches the launcher and changes the file", func(t *testing.T) {
+	t.Run("a preload override reaches the container and changes the file", func(t *testing.T) {
+		cfg := cfg
 		cfg.LauncherPreload = "arduino.app_utils,arduino.app_peripherals.camera"
-		changed, err := generateLauncherComposeFile(testPythonImage, cfg, boardEnvs, platform.Platform{})
+		changed, err := generateAppComposeFile(c, a.FullPath, testPythonImage, cfg, boardEnvs, platform.Platform{})
 		require.NoError(t, err)
 		assert.True(t, changed)
-		svc := loadCompose(t, launcherComposeFile(cfg)).Services[launcherServiceName]
+		svc := loadCompose(t, c.composeFile(cfg)).Services[mainServiceName]
 		assert.Equal(t, new("arduino.app_utils,arduino.app_peripherals.camera"), svc.Environment["APP_LAUNCHER_PRELOAD"])
 	})
 
+	t.Run("a $ in the app path is kept", func(t *testing.T) {
+		odd := app.ArduinoApp{FullPath: paths.New(t.TempDir(), "price$tag")}
+		c := appContainerOf(cfg, odd.FullPath)
+		_, err := generateAppComposeFile(c, odd.FullPath, testPythonImage, cfg, boardEnvs, platform.Platform{})
+		require.NoError(t, err)
+		svc := loadCompose(t, c.composeFile(cfg)).Services[mainServiceName]
+		assert.Equal(t, odd.FullPath.String(), svc.Labels[DockerAppPathLabel])
+	})
+}
+
+func TestAppContainerNames(t *testing.T) {
+	short := appContainer{project: "my-app"}
+	assert.Equal(t, "my-app-main-1", short.host(), "the compose name of the container")
+	assert.Equal(t, "my-app", short.key())
+
+	// An example of the board, named after its path from the apps folder
+	long := appContainer{project: composeProjectName(
+		paths.New("/var/lib/arduino-app-cli/examples/inspirational/common/a-rather-long-example-name"),
+		paths.New("/home/arduino/ArduinoApps"),
+	)}
+	host := long.host()
+	assert.LessOrEqual(t, len(host), 63, "a DNS label")
+	assert.Regexp(t, `^[a-z0-9-]+[a-z0-9]$`, host)
+	assert.NotEqual(t, host, appContainer{project: long.project + "x"}.host(), "unique per project")
+	assert.Equal(t, host, long.host())
+	socket := "/run/arduino-app-cli/apps/" + long.key() + "/app-launcher.sock"
+	assert.Less(t, len(socket), 108, "a Unix socket path")
+}
+
+func TestBoardAppPorts(t *testing.T) {
+	cfg := setTestOrchestratorConfig(t)
+	bricksIndex, _ := setTestBricks(t, cfg)
+	writeApp := func(dir *paths.Path, descriptor string) {
+		require.NoError(t, dir.MkdirAll())
+		require.NoError(t, dir.Join("app.yaml").WriteFile([]byte(descriptor)))
+		require.NoError(t, dir.Join("python").MkdirAll())
+		require.NoError(t, dir.Join("python", "main.py").WriteFile(nil))
+	}
+	writeApp(cfg.AppsDir().Join("ui"), "name: UI\nbricks:\n- arduino:web_ui: {}\n")
+	writeApp(cfg.AppsDir().Join("custom"), "name: Custom\nports: [9000]\nbricks:\n- arduino:custom_ui: {}\n")
+	writeApp(cfg.ReleasesDir().Join("release"), "name: Release\nports: [9200]\n")
+	writeApp(cfg.AppsDir().Join("broken"), "name: [not, a, name\n")
+
+	assert.Equal(t, []int{7100, 8000, 9000, 9200}, boardAppPorts(cfg, bricksIndex))
+}
+
+func TestPlanEvictions(t *testing.T) {
+	appContainer := func(project string) container.Summary {
+		return container.Summary{ID: project, Labels: map[string]string{DockerAppMainLabel: "true", composeProjectLabel: project}}
+	}
+	projects := func(containers []container.Summary) []string {
+		result := make([]string, 0, len(containers))
+		for _, c := range containers {
+			result = append(result, c.Labels[composeProjectLabel])
+		}
+		return result
+	}
+	all := []container.Summary{appContainer("a"), appContainer("b"), appContainer("c"), appContainer("d"), appContainer("e")}
+
+	for _, tc := range []struct {
+		name    string
+		recent  []string
+		running string
+		want    []string
+	}{
+		{name: "the running app and the two started last stay", recent: []string{"d", "b", "a", "c"}, running: "d", want: []string{"c", "e"}},
+		{name: "the running app stays even if not recent", recent: []string{"a", "b", "c"}, running: "e", want: []string{"c", "d"}},
+		{name: "a recent app without container takes no place", recent: []string{"a", "gone", "b", "c"}, running: "a", want: []string{"d", "e"}},
+		{name: "no running app keeps two idle ones", recent: []string{"c", "a"}, want: []string{"b", "d", "e"}},
+		{name: "no record keeps the running one", running: "b", want: []string{"a", "c", "d", "e"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, projects(planEvictions(all, tc.recent, tc.running)))
+		})
+	}
+	assert.Empty(t, planEvictions(all[:3], []string{"a", "b", "c"}, "a"), "three containers fit")
+	unnamed := container.Summary{ID: "unnamed", Labels: map[string]string{DockerAppMainLabel: "true"}}
+	assert.Empty(t, planEvictions([]container.Summary{unnamed}, nil, "a"), "a container without project is left alone")
+}
+
+func TestRecentApps(t *testing.T) {
+	cfg := setTestOrchestratorConfig(t)
+	app := func(name string) *paths.Path { return cfg.AppsDir().Join(name) }
+	assert.Empty(t, readRecentApps(cfg))
+	for _, name := range []string{"a", "b", "c", "a"} {
+		require.NoError(t, updateRecentApps(cfg, app(name), true))
+	}
+	assert.Equal(t, []string{app("a").String(), app("c").String(), app("b").String()}, readRecentApps(cfg))
+	require.NoError(t, updateRecentApps(cfg, app("c"), false))
+	assert.Equal(t, []string{app("a").String(), app("b").String()}, readRecentApps(cfg))
+
+	for i := range recentAppsLimit + 5 {
+		require.NoError(t, updateRecentApps(cfg, app(fmt.Sprintf("p%d", i)), true))
+	}
+	assert.Len(t, readRecentApps(cfg), recentAppsLimit)
+}
+
+func TestPrewarmCandidates(t *testing.T) {
+	root := paths.New(t.TempDir())
+	a, b, c, gone := root.Join("a"), root.Join("b"), root.Join("c"), root.Join("gone")
+	for _, p := range []*paths.Path{a, b, c} {
+		require.NoError(t, p.MkdirAll())
+	}
+	recent := []string{a.String(), gone.String(), "an-old-project-name", b.String(), c.String()}
+
+	assert.Equal(t, paths.PathList{b, c}, prewarmCandidates(recent, a), "the running app and the missing folders are left out")
+	assert.Equal(t, paths.PathList{a, b}, prewarmCandidates(recent, nil))
+	assert.Empty(t, prewarmCandidates(nil, a))
 }
 
 func TestLauncherAppPorts(t *testing.T) {
@@ -376,39 +480,10 @@ func TestLauncherAppPorts(t *testing.T) {
 	})
 }
 
-func TestComposeUpReason(t *testing.T) {
-	for _, tc := range []struct {
-		name                      string
-		forceUp, changed, running bool
-		wantUp                    bool
-	}{
-		{name: "boot or up, to follow the image", forceUp: true, running: true, wantUp: true},
-		{name: "compose file changed", changed: true, running: true, wantUp: true},
-		{name: "container not running", wantUp: true},
-		{name: "start with nothing changed", running: true, wantUp: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			reason, up := composeUpReason(tc.forceUp, tc.changed, tc.running)
-			assert.Equal(t, tc.wantUp, up)
-			assert.Equal(t, tc.wantUp, reason != "")
-		})
-	}
-}
-
-func TestPrepareLauncherRejectsWhatItCannotRun(t *testing.T) {
-	cfg := setTestOrchestratorConfig(t)
-	noop := func(StreamMessage) {}
-
-	elsewhere := app.ArduinoApp{Name: "elsewhere", FullPath: paths.New(t.TempDir())}
-	err := prepareLauncher(t.Context(), nil, elsewhere, nil, cfg, platform.Platform{}, noop)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), cfg.AppsDir().String())
-
-	// Not a TCP port
-	high := newTestApp(t, cfg, "high")
-	err = prepareLauncher(t.Context(), nil, high, []int{8000, 70000}, cfg, platform.Platform{}, noop)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "cannot publish port 70000")
+func TestCheckAppPorts(t *testing.T) {
+	require.NoError(t, checkAppPorts([]int{1, 7000, 65535}))
+	require.ErrorContains(t, checkAppPorts([]int{8000, 70000}), "cannot publish port 70000")
+	require.ErrorContains(t, checkAppPorts([]int{0}), "cannot publish port 0")
 }
 
 func TestLauncherStartError(t *testing.T) {
@@ -423,14 +498,6 @@ func TestLauncherStartError(t *testing.T) {
 	assert.NoError(t, launcherStartError(nil))
 }
 
-func TestIsInsideLauncherRoots(t *testing.T) {
-	cfg := setTestOrchestratorConfig(t)
-	assert.True(t, isInsideLauncherRoots(cfg.AppsDir().Join("my-app"), cfg))
-	assert.True(t, isInsideLauncherRoots(cfg.ExamplesBaseDir().Join("inspirational", "common", "blink"), cfg))
-	assert.True(t, isInsideLauncherRoots(cfg.ReleasesDir().Join("my-release"), cfg))
-	assert.False(t, isInsideLauncherRoots(paths.New("/somewhere/else/my-app"), cfg))
-}
-
 func TestBoardEnvironment(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
 	board := boardEnvironment(t.Context(), platform.Platform{BoardName: "unoq"}, cfg)
@@ -441,21 +508,75 @@ func TestBoardEnvironment(t *testing.T) {
 	assert.NotContains(t, board, "VIDEO_DEVICE")
 }
 
-func TestLauncherWantedApp(t *testing.T) {
+func TestWantedApp(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
 	first, second := cfg.AppsDir().Join("first"), cfg.AppsDir().Join("second")
+	startedAt := time.Date(2026, 10, 20, 10, 0, 0, 123456789, time.UTC)
 
-	assert.Nil(t, readLauncherWantedApp(cfg))
-	require.NoError(t, setLauncherWantedApp(cfg, first))
-	assert.Equal(t, first.String(), readLauncherWantedApp(cfg).String())
+	assert.Nil(t, readWantedApp(cfg))
+	require.NoError(t, setWantedApp(cfg, first, startedAt))
+	wanted := readWantedApp(cfg)
+	require.NotNil(t, wanted)
+	assert.Equal(t, first.String(), wanted.App.String())
+	assert.True(t, startedAt.Equal(wanted.StartedAt), "the start time keeps its nanoseconds")
 
-	require.NoError(t, clearLauncherWantedApp(cfg, second))
-	assert.Equal(t, first.String(), readLauncherWantedApp(cfg).String(), "another app keeps it")
+	require.NoError(t, clearWantedApp(cfg, second))
+	assert.Equal(t, first.String(), readWantedApp(cfg).App.String(), "another app keeps it")
 
-	require.NoError(t, clearLauncherWantedApp(cfg, first))
-	assert.Nil(t, readLauncherWantedApp(cfg))
+	require.NoError(t, clearWantedApp(cfg, first))
+	assert.Nil(t, readWantedApp(cfg))
 
-	require.NoError(t, setLauncherWantedApp(cfg, second))
-	require.NoError(t, clearLauncherWantedApp(cfg, nil))
-	assert.Nil(t, readLauncherWantedApp(cfg))
+	require.NoError(t, setWantedApp(cfg, second, startedAt))
+	require.NoError(t, clearWantedApp(cfg, nil))
+	assert.Nil(t, readWantedApp(cfg))
+
+	require.NoError(t, wantedAppFile(cfg).WriteFile([]byte(first.String())))
+	assert.Nil(t, readWantedApp(cfg), "a record of an older version is none")
+}
+
+func TestLoadAppContainerSpec(t *testing.T) {
+	cfg := setTestOrchestratorConfig(t)
+	a := newTestApp(t, cfg, "my-app")
+	c := appContainerOf(cfg, a.FullPath)
+	_, err := generateAppComposeFile(c, a.FullPath, testPythonImage, cfg, types.Mapping{"BOARD_NAME": "unoq"}, platform.Platform{})
+	require.NoError(t, err)
+
+	spec, err := loadAppContainerSpec(t.Context(), cfg, c, "abc")
+	require.NoError(t, err)
+	assert.Equal(t, "my-app-main-1", c.containerName())
+
+	assert.Equal(t, testPythonImage, spec.config.Image)
+	assert.Equal(t, []string{"/run.sh", "serve"}, spec.config.Entrypoint)
+	assert.Equal(t, "/app", spec.config.WorkingDir)
+	assert.Equal(t, 10, *spec.config.StopTimeout)
+	assert.ElementsMatch(t, []string{"BOARD_NAME=unoq", "APP_LAUNCHER_PREPARE_TIMEOUT_S=600"}, spec.config.Env)
+	assert.Equal(t, map[string]string{
+		DockerAppLabel:     "true",
+		DockerAppMainLabel: "true",
+		DockerAppPathLabel: a.FullPath.String(),
+		appDefinitionLabel: "abc",
+		// What compose stamps, so that compose and the sidecars split find the container
+		composeProjectLabel:                       "my-app",
+		composeServiceLabel:                       mainServiceName,
+		"com.docker.compose.config-hash":          "abc",
+		"com.docker.compose.version":              api.ComposeVersion,
+		"com.docker.compose.container-number":     "1",
+		"com.docker.compose.oneoff":               "False",
+		"com.docker.compose.project.working_dir":  c.dir(cfg).String(),
+		"com.docker.compose.project.config_files": c.composeFile(cfg).String(),
+	}, spec.config.Labels)
+
+	assert.True(t, *spec.host.Init)
+	assert.Equal(t, container.RestartPolicyDisabled, spec.host.RestartPolicy.Name)
+	assert.Equal(t, container.NetworkMode(appsNetwork), spec.host.NetworkMode)
+	assert.Equal(t, []string{"msgpack-rpc-router:host-gateway"}, spec.host.ExtraHosts)
+	assert.Equal(t, "json-file", spec.host.LogConfig.Type)
+	assert.Empty(t, spec.host.PortBindings)
+	targets := map[string]string{}
+	for _, m := range spec.host.Mounts {
+		targets[m.Target] = m.Source
+	}
+	assert.Equal(t, a.FullPath.String(), targets["/app"])
+	assert.Equal(t, c.runtimeDir(cfg).String(), targets["/run/arduino-app-cli"])
+	assert.Equal(t, []string{"my-app-main-1"}, spec.networking.EndpointsConfig[appsNetwork].Aliases)
 }

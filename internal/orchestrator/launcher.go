@@ -8,6 +8,9 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,9 +23,11 @@ import (
 	"github.com/arduino/go-paths-helper"
 	"github.com/compose-spec/compose-go/v2/loader"
 	"github.com/compose-spec/compose-go/v2/types"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/command"
 	yaml "github.com/goccy/go-yaml"
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
 	dockerClient "github.com/moby/moby/client"
 
 	"github.com/arduino/arduino-app-cli/internal/dockerhelper"
@@ -34,36 +39,87 @@ import (
 	"github.com/arduino/arduino-app-cli/internal/platform"
 )
 
+// Each app runs in a warm container of its own, the compose project of the app with one service,
+// main, whose supervisor forks the app on request. The container stays once the app stops: the
+// next start of the app skips its warm-up.
 const (
-	DockerLauncherLabel = "cc.arduino.app.launcher"
+	// launcherLabel marks the launcher shared by every app in the previous versions.
+	launcherLabel = "cc.arduino.app.launcher"
 
-	launcherProject     = "arduino-app-launcher"
-	launcherServiceName = "launcher"
-	// launcherNetwork is shared by the launcher and the app sidecars, which reach each other by service name.
-	launcherNetwork      = "arduino-apps"
-	launcherSocketDir    = "/run/arduino-app-cli"
-	launcherReadyTimeout = 90 * time.Second
+	// appsNetwork is shared by the app containers, the sidecars and the ingress, which reach each other by name.
+	appsNetwork = "arduino-apps"
+	// appSocketDir is where an app container sees its runtime folder, which holds the control socket.
+	appSocketDir = "/run/arduino-app-cli"
+	// appMountDir is where an app container sees the app folder.
+	appMountDir     = "/app"
+	appReadyTimeout = 90 * time.Second
 
 	launcherRequestTimeout = 2 * time.Second
 	// A stop waits a 5 s grace before SIGKILL.
 	launcherStopTimeout = 60 * time.Second
-	// launcherPrepareTimeout bounds the install of the app dependencies, the launcher is given it.
+	// launcherPrepareTimeout bounds the install of the app dependencies, the supervisor is given it.
 	launcherPrepareTimeout = 600 * time.Second
 	// A start stops the running app, prepares the new one and forks it.
 	launcherStartTimeout = launcherStopTimeout + launcherPrepareTimeout
+
+	// warmIdleApps is how many idle app containers a start keeps besides the running one.
+	warmIdleApps = 2
+	// recentAppsLimit bounds the list of the apps started last.
+	recentAppsLimit = 16
+	// maxKeyLength keeps the host name a DNS label and the socket path within the Unix limit.
+	maxKeyLength = 56
 )
 
-func launcherComposeFile(cfg config.Configuration) *paths.Path {
-	return cfg.DataDir().Join("launcher", "compose.yaml")
+// appContainer is the warm container of an app, named after its compose project.
+type appContainer struct {
+	project string
 }
 
-// launcherWantedAppFile holds the app the launcher should be running: a missing child means the app died.
-func launcherWantedAppFile(cfg config.Configuration) *paths.Path {
-	return cfg.DataDir().Join("launcher", "wanted-app")
+func appContainerOf(cfg config.Configuration, appPath *paths.Path) appContainer {
+	return appContainer{project: composeProjectName(appPath, cfg.AppsDir())}
 }
 
-func newLauncherClient(cfg config.Configuration) *launcher.Client {
-	return launcher.New(cfg.RuntimeDir().Join(launcher.SocketName).String(), launcherRequestTimeout)
+// dir holds the compose file of the container.
+func (c appContainer) dir(cfg config.Configuration) *paths.Path {
+	return appsStateDir(cfg).Join(c.project)
+}
+
+func (c appContainer) composeFile(cfg config.Configuration) *paths.Path {
+	return c.dir(cfg).Join("compose.yaml")
+}
+
+// runtimeDir is mounted in the container at appSocketDir.
+func (c appContainer) runtimeDir(cfg config.Configuration) *paths.Path {
+	return cfg.RuntimeDir().Join("apps", c.key())
+}
+
+func (c appContainer) client(cfg config.Configuration) *launcher.Client {
+	return launcher.New(c.runtimeDir(cfg).Join(launcher.SocketName).String(), launcherRequestTimeout)
+}
+
+// containerName is the name compose would give the container.
+func (c appContainer) containerName() string {
+	return c.project + "-" + mainServiceName + "-1"
+}
+
+// host is the name the ingress reaches the container by, its compose name for a short project.
+func (c appContainer) host() string {
+	return c.key() + "-" + mainServiceName + "-1"
+}
+
+// key is the project, cut and told apart by a hash when longer than maxKeyLength.
+func (c appContainer) key() string {
+	if len(c.project) <= maxKeyLength {
+		return c.project
+	}
+	sum := sha256.Sum256([]byte(c.project))
+	suffix := hex.EncodeToString(sum[:6])
+	return strings.TrimRight(c.project[:maxKeyLength-len(suffix)-1], "-") + "-" + suffix
+}
+
+// appsStateDir holds the compose file of each app container and the records of the apps that run.
+func appsStateDir(cfg config.Configuration) *paths.Path {
+	return cfg.DataDir().Join("apps")
 }
 
 // appPorts are the public ports of an app: the defaults of its bricks, then the ports of app.yaml.
@@ -90,111 +146,101 @@ func appPorts(a app.ArduinoApp, bricksIndex *bricksindex.BricksIndex) []int {
 	return slices.Compact(ports)
 }
 
-// prepareLauncher checks that the launcher can run the app on its public ports, then brings it up.
-func prepareLauncher(
-	ctx context.Context,
-	docker command.Cli,
-	appToStart app.ArduinoApp,
-	ports []int,
-	cfg config.Configuration,
-	platform platform.Platform,
-	cb func(StreamMessage),
-) error {
-	if roots := launcherAppRoots(cfg); !isInsideLauncherRoots(appToStart.FullPath, cfg) {
-		return fmt.Errorf("the app launcher runs only the apps inside %s", strings.Join(roots.AsStrings(), " or "))
-	}
+// checkAppPorts tells whether the ingress can publish the ports.
+func checkAppPorts(ports []int) error {
 	const maxPort = 65535
 	for _, p := range ports {
 		if p < 1 || p > maxPort {
 			return fmt.Errorf("the ingress cannot publish port %d: the app ports go from 1 to %d", p, maxPort)
 		}
 	}
-	elapsed, err := ensureLauncher(ctx, docker, cfg, platform, false, cb)
-	if err != nil {
-		return fmt.Errorf("the app launcher is unavailable: %w", err)
-	}
-	cb(StreamMessage{data: fmt.Sprintf("App launcher ready in %s", elapsed.Round(time.Millisecond))})
 	return nil
 }
 
-// launcherAppRoots are the folders mounted in the launcher at their host path: the apps run in place,
-// the installed releases included.
-func launcherAppRoots(cfg config.Configuration) paths.PathList {
+// boardAppRoots are the folders holding the apps of the board, the installed releases included.
+func boardAppRoots(cfg config.Configuration) paths.PathList {
 	return paths.PathList{cfg.AppsDir(), cfg.ExamplesBaseDir(), cfg.ReleasesDir()}
 }
 
-func isInsideLauncherRoots(appPath *paths.Path, cfg config.Configuration) bool {
-	for _, root := range launcherAppRoots(cfg) {
-		if inside, err := appPath.IsInsideDir(root); err == nil && inside {
-			return true
-		}
+// boardAppPorts are the public ports of every app of the board. An app that fails to load has none.
+func boardAppPorts(cfg config.Configuration, bricksIndex *bricksindex.BricksIndex) []int {
+	appPaths, err := app.FindAppsInFolders(boardAppRoots(cfg))
+	if err != nil {
+		slog.Warn("some apps were not listed for the ingress ports", slog.String("error", err.Error()))
 	}
-	return false
+	var ports []int
+	for _, appPath := range appPaths {
+		a, err := app.Load(appPath)
+		if err != nil {
+			slog.Debug("skipping the ports of an invalid app", slog.String("path", appPath.String()), slog.String("error", err.Error()))
+			continue
+		}
+		ports = append(ports, appPorts(a, bricksIndex)...)
+	}
+	slices.Sort(ports)
+	return slices.Compact(ports)
 }
 
-// generateLauncherComposeFile writes the launcher compose project, rendered on this board, and
-// tells whether it changed.
-func generateLauncherComposeFile(
+// generateAppComposeFile writes the compose project of the app container, rendered on this board,
+// and tells whether it changed. It holds nothing an app edits: the app environment goes with each start.
+func generateAppComposeFile(
+	c appContainer,
+	appPath *paths.Path,
 	pythonImage string,
 	cfg config.Configuration,
 	boardEnvs types.Mapping,
 	platform platform.Platform,
 ) (bool, error) {
 	envs := boardEnvs.Clone()
-	envs["APP_LAUNCHER_SOCKET"] = launcherSocketDir + "/" + launcher.SocketName
 	envs["APP_LAUNCHER_PREPARE_TIMEOUT_S"] = strconv.Itoa(int(launcherPrepareTimeout.Seconds()))
 	if cfg.LauncherPreload != "" {
-		envs["APP_LAUNCHER_PRELOAD"] = cfg.LauncherPreload // Part of the compose file: changing it recreates the launcher
+		envs["APP_LAUNCHER_PRELOAD"] = cfg.LauncherPreload // Part of the compose file: changing it recreates the container
 	}
 
-	// The launcher is given host paths
-	volumes := []any{volume{Type: "bind", Source: cfg.RuntimeDir().String(), Target: launcherSocketDir}}
-	for _, root := range launcherAppRoots(cfg) {
-		expr, err := mountExpr(root.String())
-		if err != nil {
-			return false, err
-		}
-		volumes = append(volumes, expr)
-	}
 	runtime, err := newPythonRuntime(cfg, platform)
 	if err != nil {
 		return false, err
 	}
-	svc := runtime.service(pythonImage, volumes...)
+	svc := runtime.service(pythonImage,
+		volume{Type: "bind", Source: appPath.String(), Target: appMountDir},
+		volume{Type: "bind", Source: c.runtimeDir(cfg).String(), Target: appSocketDir},
+	)
 	svc.Entrypoint = "/run.sh serve"
-	svc.Restart = "unless-stopped"
+	svc.WorkingDir = appMountDir
+	svc.Restart = "no"
 	svc.StopGracePeriod = "10s"
-	svc.Healthcheck = &healthcheck{
-		Test:          []string{"CMD", "arduino-app-launcher", "ping"},
-		Interval:      "2s",
-		StartPeriod:   "60s",
-		StartInterval: "500ms",
+	svc.Labels = map[string]string{
+		DockerAppLabel:     "true",
+		DockerAppMainLabel: "true",
+		DockerAppPathLabel: appPath.String(),
 	}
-	svc.Labels = map[string]string{DockerLauncherLabel: "true"}
 	svc.Environment = envs
+	svc.Networks = map[string]serviceNetwork{"default": {Aliases: []string{c.host()}}}
 
 	compose := struct {
 		Name     string                    `yaml:"name"`
 		Services map[string]service        `yaml:"services"`
 		Networks map[string]composeNetwork `yaml:"networks"`
 	}{
-		Name:     launcherProject,
-		Services: map[string]service{launcherServiceName: svc},
-		Networks: map[string]composeNetwork{"default": {Name: launcherNetwork}},
+		Name:     c.project,
+		Services: map[string]service{mainServiceName: svc},
+		Networks: map[string]composeNetwork{"default": {Name: appsNetwork, External: true}},
 	}
 	template, err := yaml.Marshal(compose)
 	if err != nil {
 		return false, err
 	}
-	// The host devices and groups are answered here, the board the launcher runs on
+	// The host devices and groups are answered here, the board the container runs on
 	data, err := renderComposeTemplate(template)
 	if err != nil {
-		return false, fmt.Errorf("failed to render the launcher compose file: %w", err)
+		return false, fmt.Errorf("failed to render the app container compose file: %w", err)
 	}
+	// compose interpolates the file: a $ of an app path or of the board environment is escaped
+	data = bytes.ReplaceAll(data, []byte("$"), []byte("$$"))
 
-	changed, err := writeFileIfChanged(launcherComposeFile(cfg), data)
+	changed, err := writeFileIfChanged(c.composeFile(cfg), data)
 	if err != nil {
-		return false, fmt.Errorf("failed to write the launcher compose file: %w", err)
+		return false, fmt.Errorf("failed to write the app container compose file: %w", err)
 	}
 	return changed, nil
 }
@@ -213,8 +259,8 @@ func writeFileIfChanged(file *paths.Path, data []byte) (bool, error) {
 	return true, nil
 }
 
-// boardEnvironment is what the launcher container is given: the host facts that hold for every app.
-// The camera is a fact of the app start: a plugged camera must not recreate the launcher.
+// boardEnvironment is what every app container is given: the host facts that hold for every app.
+// The camera is a fact of the app start: a plugged camera must not recreate the container.
 func boardEnvironment(ctx context.Context, plat platform.Platform, cfg config.Configuration) types.Mapping {
 	envs := hostEnvironment(ctx, cfg.AppsDir(), cfg)
 	delete(envs, "APP_HOME")
@@ -223,118 +269,72 @@ func boardEnvironment(ctx context.Context, plat platform.Platform, cfg config.Co
 	return envs
 }
 
-// ensureLauncher brings the launcher up to date and running, and waits until it answers. forceUp
-// runs compose up even when nothing changed here, so that a new image under the same tag is picked
-// up: compose recreates the container only when its configuration or image differ.
-func ensureLauncher(
+// ensureAppContainer brings the container of the app up to date and running, and waits until its
+// supervisor answers. An unchanged compose file and an answer on the socket need no Docker round trip.
+func ensureAppContainer(
 	ctx context.Context,
 	docker command.Cli,
 	cfg config.Configuration,
 	platform platform.Platform,
-	forceUp bool,
+	c appContainer,
+	appPath *paths.Path,
 	cb func(StreamMessage),
 ) (time.Duration, error) {
 	started := time.Now()
-	if err := cfg.RuntimeDir().MkdirAll(); err != nil {
-		return 0, fmt.Errorf("failed to create the runtime folder: %w", err)
+	if err := c.runtimeDir(cfg).MkdirAll(); err != nil {
+		return 0, fmt.Errorf("failed to create the app runtime folder: %w", err)
 	}
-	changed, err := generateLauncherComposeFile(cfg.PythonImage, cfg, boardEnvironment(ctx, platform, cfg), platform)
+	changed, err := generateAppComposeFile(c, appPath, cfg.PythonImage, cfg, boardEnvironment(ctx, platform, cfg), platform)
 	if err != nil {
 		return 0, err
 	}
-	rendered := time.Since(started)
-	// An unchanged compose file and a launcher answering on its socket: up to date and running,
-	// the Docker round trips below have nothing to add
-	if !forceUp && !changed {
-		if err := newLauncherClient(cfg).WithTimeout(pingTimeout).Ping(ctx); err == nil {
+	if !changed {
+		if err := c.client(cfg).WithTimeout(pingTimeout).Ping(ctx); err == nil {
 			elapsed := time.Since(started)
-			slog.Debug("app launcher answers, up to date", slog.Duration("elapsed", elapsed), slog.Duration("render", rendered))
+			slog.Debug("app container answers, up to date", slog.String("project", c.project), slog.Duration("elapsed", elapsed))
 			return elapsed, nil
 		}
 	}
 
-	current, err := getContainerWithLabel(ctx, docker.Client(), DockerLauncherLabel)
+	slog.Debug("bringing the app container up", slog.String("project", c.project), slog.Bool("changed", changed))
+	cb(StreamMessage{data: "Starting the app container"})
+	if err := ensureAppsNetwork(ctx, docker.Client()); err != nil {
+		return 0, err
+	}
+	id, err := upAppContainer(ctx, docker.Client(), cfg, c, cb)
 	if err != nil {
 		return 0, err
 	}
-	listed := time.Since(started) - rendered
-	running := current != nil && current.State == container.StateRunning
-	recreated := false
-	if reason, up := composeUpReason(forceUp, changed, running); up {
-		slog.Debug("running compose up for the app launcher", slog.String("reason", reason))
-		cb(StreamMessage{data: "Starting the app launcher"})
-		if err := composeUpFile(ctx, docker, launcherComposeFile(cfg), cb); err != nil {
-			return 0, fmt.Errorf("failed to start the app launcher: %w", err)
-		}
-		previous := current
-		if current, err = getContainerWithLabel(ctx, docker.Client(), DockerLauncherLabel); err != nil {
-			return 0, err
-		}
-		if current == nil {
-			return 0, errors.New("the app launcher container was not created")
-		}
-		recreated = previous == nil || previous.ID != current.ID || !running
-		slog.Debug("app launcher compose up done", slog.Bool("recreated", recreated))
-	} else {
-		slog.Debug("app launcher up to date and running, compose up skipped")
-	}
-	// A new or restarted launcher runs no app
-	if recreated {
-		if err := errors.Join(clearLauncherWantedApp(cfg, nil), closeAppPorts(ctx, docker.Client())); err != nil {
-			return 0, err
-		}
-	}
-
-	if err := waitLauncherReady(ctx, docker.Client(), newLauncherClient(cfg), current.ID); err != nil {
+	if err := waitAppContainerReady(ctx, docker.Client(), c.client(cfg), id); err != nil {
 		return 0, err
 	}
 	elapsed := time.Since(started)
-	slog.Info("app launcher ready", slog.Duration("elapsed", elapsed), slog.Bool("recreated", recreated),
-		slog.Duration("render", rendered), slog.Duration("list", listed))
+	slog.Info("app container ready", slog.String("project", c.project), slog.Duration("elapsed", elapsed), slog.Bool("changed", changed))
 	return elapsed, nil
 }
 
-// composeUpReason tells whether compose up has to run for the launcher, and why.
-func composeUpReason(forceUp, changed, running bool) (string, bool) {
-	switch {
-	case changed:
-		return "compose file changed", true
-	case !running:
-		return "container not running", true
-	case forceUp:
-		return "forced, to follow the image", true
-	default:
-		return "", false
-	}
-}
-
-// pingTimeout bounds one ping of the launcher, a local socket round trip.
+// pingTimeout bounds one ping of a supervisor, a local socket round trip.
 const pingTimeout = 500 * time.Millisecond
 
-// waitLauncherReady polls ping until the preload is over. It fails early when the container stops
-// or restarts, as an image without the serve mode does.
-func waitLauncherReady(ctx context.Context, docker dockerClient.APIClient, client *launcher.Client, id string) error {
-	inspected, err := docker.ContainerInspect(ctx, id, dockerClient.ContainerInspectOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to inspect the app launcher: %w", err)
-	}
-	restarts := inspected.Container.RestartCount
+// waitAppContainerReady polls ping until the preload is over. It fails early when the container
+// stops, as an image without the serve mode does.
+func waitAppContainerReady(ctx context.Context, docker dockerClient.APIClient, client *launcher.Client, id string) error {
 	client = client.WithTimeout(pingTimeout)
-	deadline := time.Now().Add(launcherReadyTimeout)
+	deadline := time.Now().Add(appReadyTimeout)
 	for {
 		if err := client.Ping(ctx); err == nil {
 			return nil
 		}
 		inspected, err := docker.ContainerInspect(ctx, id, dockerClient.ContainerInspectOptions{})
 		if err != nil {
-			return fmt.Errorf("failed to inspect the app launcher: %w", err)
+			return fmt.Errorf("failed to inspect the app container: %w", err)
 		}
 		info := inspected.Container
-		if info.State == nil || !info.State.Running || info.State.Restarting || info.RestartCount > restarts {
-			return fmt.Errorf("the app launcher container stopped, see `docker logs %s`", strings.TrimPrefix(info.Name, "/"))
+		if info.State == nil || !info.State.Running || info.State.Restarting {
+			return fmt.Errorf("the app container stopped, see `docker logs %s`", strings.TrimPrefix(info.Name, "/"))
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("the app launcher did not answer within %s", launcherReadyTimeout)
+			return fmt.Errorf("the app container did not answer within %s", appReadyTimeout)
 		}
 		select {
 		case <-ctx.Done():
@@ -342,6 +342,25 @@ func waitLauncherReady(ctx context.Context, docker dockerClient.APIClient, clien
 		case <-time.After(readyPollInterval):
 		}
 	}
+}
+
+// ensureAppsNetwork creates the network shared by the apps, the sidecars and the ingress when missing.
+func ensureAppsNetwork(ctx context.Context, docker dockerClient.APIClient) error {
+	networks, err := docker.NetworkList(ctx, dockerClient.NetworkListOptions{
+		Filters: make(dockerClient.Filters).Add("name", appsNetwork),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list the networks: %w", err)
+	}
+	// The name filter matches a part of the name
+	if slices.ContainsFunc(networks.Items, func(n network.Summary) bool { return n.Name == appsNetwork }) {
+		return nil
+	}
+	slog.Info("creating the apps network", slog.String("name", appsNetwork))
+	if _, err := docker.NetworkCreate(ctx, appsNetwork, dockerClient.NetworkCreateOptions{Driver: "bridge"}); err != nil {
+		return fmt.Errorf("failed to create the %s network: %w", appsNetwork, err)
+	}
+	return nil
 }
 
 // getContainerWithLabel returns the container carrying the label, running or not, nil without one.
@@ -369,76 +388,291 @@ func stopContainerWithLabel(ctx context.Context, docker dockerClient.APIClient, 
 	return nil
 }
 
-// StopAllAppContainers stops every running app container, sidecars included, leaving the launcher
-// and the ingress up: the ingress carries no app label.
-func StopAllAppContainers(ctx context.Context, docker dockerClient.APIClient) error {
-	containers, err := docker.ContainerList(ctx, dockerClient.ContainerListOptions{
-		Filters: make(dockerClient.Filters).Add("label", DockerAppLabel+"=true"),
-	})
+// listAppMainContainers lists the app containers, running or not, the sidecars left out.
+func listAppMainContainers(ctx context.Context, docker dockerClient.APIClient) ([]container.Summary, error) {
+	return dockerhelper.Containers(ctx, docker, DockerAppMainLabel+"=true")
+}
+
+// StopAllApps stops the app of every running app container and the sidecars, leaving the containers
+// warm. It removes the launcher an older version shared between the apps.
+func StopAllApps(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration) error {
+	containers, err := listAppMainContainers(ctx, docker)
 	if err != nil {
-		return fmt.Errorf("failed to list containers: %w", err)
+		return err
 	}
-	for _, c := range containers.Items {
-		if c.Labels[DockerLauncherLabel] == "true" {
-			continue
-		}
-		slog.Debug("Stopping container", slog.String("ID", c.ID))
-		if _, err := docker.ContainerStop(ctx, c.ID, dockerClient.ContainerStopOptions{}); err != nil {
-			slog.Warn("Failed to stop container", "ID", c.ID, "error", err.Error())
+	running := slices.DeleteFunc(containers, func(c container.Summary) bool {
+		return c.State != container.StateRunning || c.Labels[composeProjectLabel] == ""
+	})
+	err = forEachContainer(running, func(c container.Summary) error {
+		return stopAppChild(ctx, cfg, appContainer{project: c.Labels[composeProjectLabel]})
+	})
+	return errors.Join(err, clearWantedApp(cfg, nil), stopSidecars(ctx, docker, func(StreamMessage) {}), removeSharedLauncher(ctx, docker))
+}
+
+// removeSharedLauncher removes the launcher of the previous versions, which would keep its socket and mounts.
+func removeSharedLauncher(ctx context.Context, docker dockerClient.APIClient) error {
+	shared, err := dockerhelper.Containers(ctx, docker, launcherLabel+"=true")
+	if err != nil || len(shared) == 0 {
+		return err
+	}
+	slog.Info("removing the launcher shared by the apps in the previous versions")
+	return removeContainers(ctx, docker, shared)
+}
+
+// stopAppChild stops the app the container runs. An unreachable supervisor runs nothing.
+func stopAppChild(ctx context.Context, cfg config.Configuration, c appContainer) error {
+	resp, err := c.client(cfg).WithTimeout(launcherStopTimeout).Stop(ctx)
+	var launcherErr *launcher.Error
+	switch {
+	case errors.As(err, &launcherErr):
+		return fmt.Errorf("failed to stop the app: %w", err)
+	case err != nil:
+		slog.Debug("app container unreachable, nothing to stop", slog.String("project", c.project), slog.String("error", err.Error()))
+	default:
+		for _, s := range resp.Stopped {
+			slog.Debug("app stopped", slog.String("project", c.project), slog.Int("pid", s.PID), slog.Any("exit_code", s.ExitCode), slog.Any("signal", s.Signal))
 		}
 	}
 	return nil
 }
 
-func readLauncherWantedApp(cfg config.Configuration) *paths.Path {
-	data, err := launcherWantedAppFile(cfg).ReadFile()
-	if err != nil || len(data) == 0 {
+// removeAppContainers removes app containers, running or not, and their runtime folders.
+func removeAppContainers(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration, containers []container.Summary) error {
+	return forEachContainer(containers, func(ctr container.Summary) error {
+		if err := removeContainers(ctx, docker, []container.Summary{ctr}); err != nil {
+			return err
+		}
+		// Without project there is no runtime folder of its own: the parent holds every other one
+		if project := ctr.Labels[composeProjectLabel]; project != "" {
+			return appContainer{project: project}.runtimeDir(cfg).RemoveAll()
+		}
 		return nil
-	}
-	return paths.New(string(data))
+	})
 }
 
-func setLauncherWantedApp(cfg config.Configuration, appPath *paths.Path) error {
-	file := launcherWantedAppFile(cfg)
+// destroyAppContainer removes the container of the app with its runtime folder and its compose file.
+func destroyAppContainer(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration, appPath *paths.Path) error {
+	c := appContainerOf(cfg, appPath)
+	containers, err := getAppContainers(ctx, docker, c.project)
+	if err != nil {
+		return err
+	}
+	if main, ok := containers[mainServiceName]; ok {
+		if err := removeContainers(ctx, docker, []container.Summary{main}); err != nil {
+			return err
+		}
+	}
+	return errors.Join(c.runtimeDir(cfg).RemoveAll(), c.dir(cfg).RemoveAll(), updateRecentApps(cfg, appPath, false))
+}
+
+// wantedApp is the app that should be running, and when it was started: a missing child means it died.
+type wantedApp struct {
+	App       *paths.Path
+	StartedAt time.Time
+}
+
+type wantedAppRecord struct {
+	App       string    `json:"app"`
+	StartedAt time.Time `json:"started_at"`
+}
+
+func wantedAppFile(cfg config.Configuration) *paths.Path {
+	return appsStateDir(cfg).Join("wanted.json")
+}
+
+func readWantedApp(cfg config.Configuration) *wantedApp {
+	data, err := wantedAppFile(cfg).ReadFile()
+	if err != nil {
+		return nil
+	}
+	var record wantedAppRecord
+	if err := json.Unmarshal(data, &record); err != nil || record.App == "" {
+		return nil
+	}
+	return &wantedApp{App: paths.New(record.App), StartedAt: record.StartedAt}
+}
+
+func setWantedApp(cfg config.Configuration, appPath *paths.Path, startedAt time.Time) error {
+	data, err := json.Marshal(wantedAppRecord{App: appPath.String(), StartedAt: startedAt})
+	if err != nil {
+		return err
+	}
+	file := wantedAppFile(cfg)
 	if err := file.Parent().MkdirAll(); err != nil {
 		return err
 	}
-	return fatomic.WriteFile(file.String(), []byte(appPath.String()), 0o644)
+	return fatomic.WriteFile(file.String(), data, 0o644)
 }
 
-// clearLauncherWantedApp forgets the wanted app when it is appPath, or whatever it is when nil.
-func clearLauncherWantedApp(cfg config.Configuration, appPath *paths.Path) error {
-	if wanted := readLauncherWantedApp(cfg); wanted == nil || (appPath != nil && !wanted.EqualsTo(appPath)) {
+// clearWantedApp forgets the wanted app when it is appPath, or whatever it is when nil.
+func clearWantedApp(cfg config.Configuration, appPath *paths.Path) error {
+	if wanted := readWantedApp(cfg); wanted == nil || (appPath != nil && !wanted.App.EqualsTo(appPath)) {
 		return nil
 	}
-	if err := launcherWantedAppFile(cfg).Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := wantedAppFile(cfg).Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
 }
 
-// EnsureLauncher brings the launcher up, recreating it on a new image, and pulls the ingress image.
-// When stopApps, as the daemon does at boot, it stops what the launcher runs and closes its ports.
-func EnsureLauncher(
+// recentAppsFile lists the paths of the apps started last, the most recent first.
+func recentAppsFile(cfg config.Configuration) *paths.Path {
+	return appsStateDir(cfg).Join("recent.json")
+}
+
+func readRecentApps(cfg config.Configuration) []string {
+	data, err := recentAppsFile(cfg).ReadFile()
+	if err != nil {
+		return nil
+	}
+	var apps []string
+	if err := json.Unmarshal(data, &apps); err != nil {
+		return nil
+	}
+	return apps
+}
+
+// updateRecentApps puts the app first when started, removes it when not.
+func updateRecentApps(cfg config.Configuration, appPath *paths.Path, started bool) error {
+	apps := slices.DeleteFunc(readRecentApps(cfg), func(p string) bool { return p == appPath.String() })
+	if started {
+		apps = slices.Insert(apps, 0, appPath.String())
+	}
+	apps = apps[:min(len(apps), recentAppsLimit)]
+	data, err := json.Marshal(apps)
+	if err != nil {
+		return err
+	}
+	file := recentAppsFile(cfg)
+	if err := file.Parent().MkdirAll(); err != nil {
+		return err
+	}
+	return fatomic.WriteFile(file.String(), data, 0o644)
+}
+
+// planEvictions picks the app containers to remove: all but the running one and the warmIdleApps
+// idle ones started last. A container missing from the recent list goes, one without project stays.
+func planEvictions(containers []container.Summary, recent []string, running string) []container.Summary {
+	present := make(map[string]bool, len(containers))
+	for _, c := range containers {
+		present[c.Labels[composeProjectLabel]] = true
+	}
+	keep := map[string]bool{running: true}
+	idle := 0
+	for _, project := range recent {
+		if idle == warmIdleApps {
+			break
+		}
+		if !keep[project] && present[project] {
+			keep[project] = true
+			idle++
+		}
+	}
+	var evicted []container.Summary
+	for _, c := range containers {
+		if project := c.Labels[composeProjectLabel]; project != "" && !keep[project] {
+			evicted = append(evicted, c)
+		}
+	}
+	return evicted
+}
+
+// evictAppContainers removes the app containers beyond the warm ones, see planEvictions.
+func evictAppContainers(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration) error {
+	containers, err := listAppMainContainers(ctx, docker)
+	if err != nil {
+		return err
+	}
+	var running string
+	if wanted := readWantedApp(cfg); wanted != nil {
+		running = appContainerOf(cfg, wanted.App).project
+	}
+	var recent []string
+	for _, appPath := range readRecentApps(cfg) {
+		recent = append(recent, appContainerOf(cfg, paths.New(appPath)).project)
+	}
+	evicted := planEvictions(containers, recent, running)
+	for _, ctr := range evicted {
+		slog.Info("removing an idle app container", slog.String("container", containerName(ctr)))
+	}
+	return removeAppContainers(ctx, docker, cfg, evicted)
+}
+
+// removeStaleAppContainers removes the app containers of another image than the one of the
+// python image tag, so that the next start creates them again on the new one.
+func removeStaleAppContainers(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration) error {
+	current, err := docker.ImageInspect(ctx, cfg.PythonImage)
+	if cerrdefs.IsNotFound(err) {
+		slog.Debug("the python image is missing, the app containers are left as they are", slog.String("image", cfg.PythonImage))
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to inspect the python image: %w", err)
+	}
+	containers, err := listAppMainContainers(ctx, docker)
+	if err != nil {
+		return err
+	}
+	stale := slices.DeleteFunc(containers, func(c container.Summary) bool { return c.ImageID == current.ID })
+	for _, c := range stale {
+		slog.Info("removing an app container of an older image", slog.String("container", containerName(c)))
+	}
+	return removeAppContainers(ctx, docker, cfg, stale)
+}
+
+// prewarmCandidates are the warmIdleApps apps started last whose folder is still there, the running one left out.
+func prewarmCandidates(recent []string, running *paths.Path) paths.PathList {
+	var candidates paths.PathList
+	for _, appPath := range recent {
+		p := paths.New(appPath)
+		if len(candidates) == warmIdleApps {
+			break
+		}
+		if running != nil && running.EqualsTo(p) {
+			continue
+		}
+		if isDir, _ := p.IsDirCheck(); isDir && p.IsAbs() {
+			candidates = append(candidates, p)
+		}
+	}
+	return candidates
+}
+
+// PrewarmApps brings up the containers of the apps started last, without starting them, one at a time.
+func PrewarmApps(ctx context.Context, docker command.Cli, cfg config.Configuration, platform platform.Platform) {
+	var running *paths.Path
+	if wanted := readWantedApp(cfg); wanted != nil {
+		running = wanted.App
+	}
+	for _, appPath := range prewarmCandidates(readRecentApps(cfg), running) {
+		err := withAppsLock(ctx, cfg, func() error {
+			elapsed, err := ensureAppContainer(ctx, docker, cfg, platform, appContainerOf(cfg, appPath), appPath, func(StreamMessage) {})
+			slog.Debug("app container warmed up", slog.String("app", appPath.String()), slog.Duration("elapsed", elapsed))
+			return err
+		})
+		if err != nil {
+			slog.Debug("failed to warm up an app container", slog.String("app", appPath.String()), slog.String("error", err.Error()))
+		}
+	}
+}
+
+// EnsureRuntime removes the app containers of an older image, pulls the ingress image and makes the
+// ingress publish the ports of every app of the board, listening on none until an app starts.
+func EnsureRuntime(
 	ctx context.Context,
 	docker command.Cli,
 	cfg config.Configuration,
-	platform platform.Platform,
-	stopApps bool,
+	bricksIndex *bricksindex.BricksIndex,
 ) (time.Duration, error) {
 	started := time.Now()
 	err := withAppsLock(ctx, cfg, func() error {
-		if _, err := ensureLauncher(ctx, docker, cfg, platform, true, func(StreamMessage) {}); err != nil {
+		if err := removeStaleAppContainers(ctx, docker.Client(), cfg); err != nil {
+			slog.Warn("failed to remove the app containers of an older image", slog.String("error", err.Error()))
+		}
+		if err := ensureAppsNetwork(ctx, docker.Client()); err != nil {
 			return err
 		}
-		// Pulled here so that no start has to: an app without ports runs without it
-		if err := pullIngressImage(ctx, docker.Client(), func(StreamMessage) {}); err != nil {
-			slog.Warn("the ingress image is unavailable, the apps with ports cannot start", slog.String("error", err.Error()))
-		}
-		if !stopApps {
-			return nil
-		}
-		return errors.Join(stopLauncherApp(ctx, cfg, nil), closeAppPorts(ctx, docker.Client()))
+		return syncIngress(ctx, docker, cfg, boardAppPorts(cfg, bricksIndex))
 	})
 	return time.Since(started), err
 }

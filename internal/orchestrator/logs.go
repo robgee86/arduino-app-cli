@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/compose/v5/pkg/api"
@@ -25,6 +26,7 @@ import (
 	"github.com/arduino/arduino-app-cli/internal/helpers"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/app"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/bricksindex"
+	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/servicesindex"
 )
 
@@ -56,17 +58,21 @@ func AppLogs(
 	dockerCli command.Cli,
 	bricksIndex *bricksindex.BricksIndex,
 	servicesIndex *servicesindex.ServicesIndex,
+	cfg config.Configuration,
 ) (iter.Seq[LogMessage], error) {
 	if app.MainPythonFile == nil {
 		return helpers.EmptyIter[LogMessage](), nil
 	}
 
-	// The launcher writes the app output to a file, Docker holds the sidecar logs
 	var sources []logSource
 	if req.ShowAppLogs {
-		sources = append(sources, func(ctx context.Context, yield func(LogMessage) bool) {
-			readAppLogFile(ctx, app.FullPath, req.Tail, req.Follow, yield)
-		})
+		source, err := mainLogs(ctx, app, req, dockerCli, cfg)
+		if err != nil {
+			return nil, err
+		}
+		if source != nil {
+			sources = append(sources, source)
+		}
 	}
 	if req.ShowServicesLogs {
 		source, err := sidecarLogs(ctx, app, req, dockerCli, app.Bricks(bricksIndex), servicesIndex)
@@ -118,6 +124,40 @@ func mergeLogSources(ctx context.Context, sources ...logSource) iter.Seq[LogMess
 	}
 }
 
+// mainLogs yields the logs of the app container since the app was started, the whole container
+// log for an app that is not running, nil without container.
+func mainLogs(ctx context.Context, app app.ArduinoApp, req AppLogsRequest, dockerCli command.Cli, cfg config.Configuration) (logSource, error) {
+	c := appContainerOf(cfg, app.FullPath)
+	containers, err := getAppContainers(ctx, dockerCli.Client(), c.project)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := containers[mainServiceName]; !ok {
+		return nil, nil
+	}
+	opts := api.LogOptions{Follow: req.Follow, Services: []string{mainServiceName}}
+	if wanted := readWantedApp(cfg); wanted != nil && wanted.App.EqualsTo(app.FullPath) && !wanted.StartedAt.IsZero() {
+		opts.Since = wanted.StartedAt.Format(time.RFC3339Nano)
+	}
+	return composeLogs(dockerCli, c.project, opts, req.Tail, nil)
+}
+
+// composeLogs yields the logs of services of a compose project, attributing each to the brick of mapping.
+func composeLogs(dockerCli command.Cli, project string, opts api.LogOptions, tail *uint64, mapping map[string]string) (logSource, error) {
+	if tail != nil {
+		opts.Tail = fmt.Sprintf("%d", *tail)
+	}
+	backend, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context, yield func(LogMessage) bool) {
+		if err := backend.Logs(ctx, project, NewDockerLogConsumer(ctx, yield, mapping), opts); err != nil {
+			slog.Error("docker logs error", slog.String("project", project), slog.String("error", err.Error()))
+		}
+	}, nil
+}
+
 // sidecarLogs yields the logs of the zone services that are sidecars of the app, attributing each
 // to its brick when its index tells, nil when the zone runs none of them. The sidecars are the ones
 // the last start rendered: a release ships no brick compose file, only the copies it froze.
@@ -156,30 +196,7 @@ func sidecarLogs(
 		return nil, nil
 	}
 
-	backend, err := compose.NewComposeService(dockerCli)
-	if err != nil {
-		return nil, err
-	}
-	return func(ctx context.Context, yield func(LogMessage) bool) {
-		opts := api.LogOptions{
-			Follow:     req.Follow,
-			Services:   services,
-			Timestamps: false,
-		}
-		if req.Tail != nil {
-			opts.Tail = fmt.Sprintf("%d", *req.Tail)
-		}
-		err := backend.Logs(
-			ctx,
-			sidecarsProject,
-			NewDockerLogConsumer(ctx, yield, serviceToBrickMapping),
-			opts,
-		)
-		if err != nil {
-			slog.Error("docker logs error", slog.String("error", err.Error()))
-			return
-		}
-	}, nil
+	return composeLogs(dockerCli, sidecarsProject, api.LogOptions{Follow: req.Follow, Services: services}, req.Tail, serviceToBrickMapping)
 }
 
 // serviceBricks maps each compose service of the app to the brick that declares or requires it.

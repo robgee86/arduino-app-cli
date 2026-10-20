@@ -164,10 +164,10 @@ func checkApp(
 	return nil
 }
 
-// startApp runs the app Python code in the launcher, which replaces the app it ran, brings the
-// sidecars zone to the sidecars of the app and opens its public ports in the ingress. An app with
-// only a sketch stops the zone and closes the ports. bricksIndex and modelsIndex are the ones the
-// app is wired with.
+// startApp runs the app Python code in its warm container, in place of the app that ran, brings the
+// sidecars zone to the sidecars of the app and forwards its public ports in the ingress. An app with
+// only a sketch stops the zone and the ingress forwards nothing. bricksIndex and modelsIndex are the
+// ones the app is wired with.
 func startApp(
 	ctx context.Context,
 	docker command.Cli,
@@ -185,7 +185,7 @@ func startApp(
 	var ports []int
 	if appToStart.MainPythonFile != nil {
 		ports = appPorts(appToStart, bricksIndex)
-		if err := prepareLauncher(ctx, docker, appToStart, ports, cfg, platform, cb); err != nil {
+		if err := checkAppPorts(ports); err != nil {
 			return err
 		}
 	}
@@ -243,7 +243,7 @@ func startApp(
 	}
 
 	if appToStart.MainPythonFile == nil {
-		if err := errors.Join(stopLauncherApp(ctx, cfg, nil), closeAppPorts(ctx, docker.Client()), stopSidecars(ctx, docker.Client(), cb)); err != nil {
+		if err := errors.Join(stopWantedApp(ctx, cfg), silenceIngress(ctx, docker.Client(), cfg), stopSidecars(ctx, docker.Client(), cb)); err != nil {
 			return err
 		}
 		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
@@ -277,8 +277,8 @@ func startApp(
 	if err != nil {
 		return err
 	}
-	// The launcher runs the app with the environment of its main service, the zone the rest
-	launcherEnv := splitMainService(prj)
+	// The app container runs the app with the environment of its main service, the zone the rest
+	appEnvs := splitMainService(prj)
 	zone, err := generateSidecarsZone(prj, cfg)
 	if err != nil {
 		return err
@@ -297,7 +297,7 @@ func startApp(
 	if err := pullAppImages(ctx, docker, prj, cb); err != nil {
 		return err
 	}
-	return startWithLauncher(ctx, docker, appToStart, ports, cfg, launcherEnv, zone, cb)
+	return startInAppContainer(ctx, docker, appToStart, ports, bricksIndex, cfg, platform, appEnvs, zone, cb)
 }
 
 // splitMainService takes the main service out of the project, leaving the sidecars, and returns
@@ -329,32 +329,34 @@ func pullAppImages(ctx context.Context, docker command.Cli, prj *types.Project, 
 		})
 }
 
-// startWithLauncher brings the sidecars zone to running, when Docker resolves their names, then has
-// the launcher start the app on its ports, which the ingress then forwards; the bricks retry until
-// the sidecars accept connections. A previous, different app stops meanwhile; the app itself, when
-// it is the one running, is left to the launcher, which stops it right before the fork: no separate
-// round trip, and its /app alias stays in place.
-func startWithLauncher(
+// startInAppContainer brings the sidecars zone to running, when Docker resolves their names, while a
+// previous, different app stops; then has the app container start the app, while the ingress
+// forwards its ports to it; the bricks retry until the sidecars accept connections. The app itself,
+// when it is the one running, is left to its supervisor, which stops it right before the fork.
+func startInAppContainer(
 	ctx context.Context,
 	docker command.Cli,
 	appToStart app.ArduinoApp,
 	ports []int,
+	bricksIndex *bricksindex.BricksIndex,
 	cfg config.Configuration,
+	platform platform.Platform,
 	envs map[string]string,
 	zone sidecarsZone,
 	cb func(StreamMessage),
 ) error {
+	target := appContainerOf(cfg, appToStart.FullPath)
 	var (
 		wg              sync.WaitGroup
 		previousStopErr error
 	)
 	stopping := time.Now()
 	var stopped time.Duration
-	wanted := readLauncherWantedApp(cfg)
-	reload := wanted != nil && wanted.EqualsTo(appToStart.FullPath)
-	if !reload {
+	wanted := readWantedApp(cfg)
+	reload := wanted != nil && wanted.App.EqualsTo(appToStart.FullPath)
+	if wanted != nil && !reload {
 		wg.Go(func() {
-			previousStopErr = stopLauncherApp(ctx, cfg, nil)
+			previousStopErr = stopWantedApp(ctx, cfg)
 			stopped = time.Since(stopping)
 		})
 	}
@@ -377,46 +379,62 @@ func startWithLauncher(
 		}
 	}
 
+	var ready time.Duration
 	if err == nil {
-		err = launcher.WriteEnvironment(appToStart.FullPath.String(), envs)
+		ready, err = ensureAppContainer(ctx, docker, cfg, platform, target, appToStart.FullPath, cb)
 	}
-	var started launcher.StartResponse
+	var (
+		started   launcher.StartResponse
+		startedAt time.Time
+	)
 	if err == nil {
-		cb(StreamMessage{data: "Starting the app in the launcher, preparing its dependencies when they changed"})
-		started, err = newLauncherClient(cfg).WithTimeout(launcherStartTimeout).Start(ctx, appToStart.FullPath.String(), ports)
+		cb(StreamMessage{data: "Starting the app, preparing its dependencies when they changed"})
+		var (
+			ingress    sync.WaitGroup
+			ingressErr error
+		)
+		ingress.Go(func() { ingressErr = routeIngress(ctx, docker, cfg, bricksIndex, target, ports, cb) })
+		startedAt = time.Now()
+		started, err = target.client(cfg).WithTimeout(launcherStartTimeout).Start(ctx, appMountDir, envs)
+		ingress.Wait()
 		err = launcherStartError(err)
-	}
-	if err == nil {
-		if err = openAppPorts(ctx, docker, cfg, ports, cb); err != nil {
-			err = fmt.Errorf("failed to open the app ports: %w", err)
+		if ingressErr != nil {
+			err = errors.Join(err, fmt.Errorf("failed to forward the app ports: %w", ingressErr))
 		}
 	}
 	if err != nil {
 		waitOrphans()
-		// Half an app is of no use: stop what started, which closes the ports
+		// Half an app is of no use: stop what started, the ingress forwards nothing
 		if stopErr := stopAppProcesses(ctx, docker.Client(), appToStart, cfg, nil); stopErr != nil {
 			slog.Warn("failed to stop the app after a failed start", slog.String("error", stopErr.Error()))
 		}
 		return err
 	}
 
-	if err := setLauncherWantedApp(cfg, appToStart.FullPath); err != nil {
-		slog.Warn("failed to record the launcher app", slog.String("error", err.Error()))
+	if err := errors.Join(setWantedApp(cfg, appToStart.FullPath, startedAt), updateRecentApps(cfg, appToStart.FullPath, true)); err != nil {
+		slog.Warn("failed to record the started app", slog.String("error", err.Error()))
 	}
 	if reload {
 		stopped = time.Duration(started.Timings.StopMs * float64(time.Millisecond))
 	}
-	slog.Info("app started by the launcher", slog.String("app", appToStart.FullPath.String()), slog.Int("pid", started.PID), slog.Bool("reload", reload),
-		slog.Bool("warm", started.Warm), slog.Bool("confined", started.Confined), slog.Any("ports", ports), slog.Duration("previous_stop", stopped), slog.Bool("prepared", started.Prepared),
+	slog.Info("app started", slog.String("app", appToStart.FullPath.String()), slog.String("project", target.project), slog.Int("pid", started.PID), slog.Bool("reload", reload),
+		slog.Bool("warm", started.Warm), slog.Any("ports", ports), slog.Duration("container_ready", ready), slog.Duration("previous_stop", stopped), slog.Bool("prepared", started.Prepared),
 		slog.Float64("prepare_ms", started.Timings.PrepareMs), slog.Float64("fork_ms", started.Timings.ForkMs))
 	if started.Prepared {
 		cb(StreamMessage{data: fmt.Sprintf("Preparing dependencies took %d ms", int64(started.Timings.PrepareMs))})
 	}
-	cb(StreamMessage{data: fmt.Sprintf("App started by the launcher: %s runner, warm %t, previous app stopped in %d ms, forked in %.0f ms",
-		started.Runner, started.Warm, stopped.Milliseconds(), started.Timings.ForkMs)})
+	cb(StreamMessage{data: fmt.Sprintf("App started: %s runner, warm %t, container ready in %d ms, previous app stopped in %d ms, forked in %.0f ms",
+		started.Runner, started.Warm, ready.Milliseconds(), stopped.Milliseconds(), started.Timings.ForkMs)})
 	// The app runs: the start is over for the caller, the lock is held until the orphans are gone
 	cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
 	waitOrphans()
+	// After the reply, under the lock of its own: what it removes is read again once it holds it
+	go func() {
+		ctx := context.WithoutCancel(ctx)
+		if err := withAppsLock(ctx, cfg, func() error { return evictAppContainers(ctx, docker.Client(), cfg) }); err != nil {
+			slog.Warn("failed to remove the idle app containers, retried at the next start", slog.String("error", err.Error()))
+		}
+	}()
 	return nil
 }
 
@@ -481,8 +499,9 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 	return nil
 }
 
-// stopAppProcesses stops the app launcher child, then closes the app ports and stops the sidecars
-// zone unless they belong to another app. The zone stays: the next start of the same app is a plain start.
+// stopAppProcesses stops the app in its container, which stays warm, then has the ingress forward
+// nothing and stops the sidecars zone unless they belong to another app. The zone stays: the next
+// start of the same app is a plain start.
 func stopAppProcesses(ctx context.Context, docker dockerClient.APIClient, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
 	if cb == nil {
 		cb = func(StreamMessage) {}
@@ -491,37 +510,30 @@ func stopAppProcesses(ctx context.Context, docker dockerClient.APIClient, app ap
 		return nil
 	}
 	// Read before the stop, which forgets it
-	wanted := readLauncherWantedApp(cfg)
-	if err := stopLauncherApp(ctx, cfg, app.FullPath); err != nil {
+	wanted := readWantedApp(cfg)
+	if err := stopAppChild(ctx, cfg, appContainerOf(cfg, app.FullPath)); err != nil {
 		return err
 	}
-	if wanted != nil && !wanted.EqualsTo(app.FullPath) {
-		slog.Debug("the sidecars zone and the ports belong to another app, left open", slog.String("app", wanted.String()))
+	if err := clearWantedApp(cfg, app.FullPath); err != nil {
+		return err
+	}
+	if wanted != nil && !wanted.App.EqualsTo(app.FullPath) {
+		slog.Debug("the sidecars zone and the ports belong to another app, left as they are", slog.String("app", wanted.App.String()))
 		return nil
 	}
-	return errors.Join(closeAppPorts(ctx, docker), stopSidecars(ctx, docker, cb))
+	return errors.Join(silenceIngress(ctx, docker, cfg), stopSidecars(ctx, docker, cb))
 }
 
-// stopLauncherApp stops the app if the launcher runs it, every app when appPath is nil. An
-// unreachable launcher runs nothing.
-func stopLauncherApp(ctx context.Context, cfg config.Configuration, appPath *paths.Path) error {
-	var target string
-	if appPath != nil {
-		target = appPath.String()
+// stopWantedApp stops the app that should be running, and forgets it.
+func stopWantedApp(ctx context.Context, cfg config.Configuration) error {
+	wanted := readWantedApp(cfg)
+	if wanted == nil {
+		return nil
 	}
-	resp, err := newLauncherClient(cfg).WithTimeout(launcherStopTimeout).Stop(ctx, target)
-	var launcherErr *launcher.Error
-	switch {
-	case errors.As(err, &launcherErr):
-		return fmt.Errorf("failed to stop the app: %w", err)
-	case err != nil:
-		slog.Debug("app launcher unreachable, nothing to stop", slog.String("error", err.Error()))
-	default:
-		for _, s := range resp.Stopped {
-			slog.Debug("app stopped by the launcher", slog.String("app", s.App), slog.Int("pid", s.PID), slog.Any("exit_code", s.ExitCode), slog.Any("signal", s.Signal))
-		}
+	if err := stopAppChild(ctx, cfg, appContainerOf(cfg, wanted.App)); err != nil {
+		return err
 	}
-	return clearLauncherWantedApp(cfg, appPath)
+	return clearWantedApp(cfg, wanted.App)
 }
 
 func StopApp(ctx context.Context, dockerClient command.Cli, platform platform.Platform, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
@@ -538,6 +550,9 @@ func StopAndDestroyApp(ctx context.Context, dockerClient command.Cli, platform p
 
 func stopAndDestroyApp(ctx context.Context, dockerClient command.Cli, platform platform.Platform, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
 	if err := stopAppWithCmd(ctx, dockerClient, platform, app, cfg, "down", cb); err != nil {
+		return err
+	}
+	if err := destroyAppContainer(ctx, dockerClient.Client(), cfg, app.FullPath); err != nil {
 		return err
 	}
 	if err := cleanAppCacheFiles(app, cb); err != nil {
@@ -596,7 +611,7 @@ func RestartApp(
 		if err := checkApp(ctx, docker, appToStart, appBricks, appModels, servicesIndex, platform, prepare, cb); err != nil {
 			return err
 		}
-		// The launcher restarts the app in place, leaving its sidecars running
+		// The app container restarts the app in place, leaving its sidecars running
 		return startApp(ctx, docker, provisioner, appModels, appBricks, servicesIndex, appToStart, cfg, platform, verbose, prepare, cb)
 	})
 }
