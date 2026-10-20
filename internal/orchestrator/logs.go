@@ -75,7 +75,7 @@ func AppLogs(
 		}
 	}
 	if req.ShowServicesLogs {
-		source, err := sidecarLogs(ctx, app, req, dockerCli, app.Bricks(bricksIndex), servicesIndex)
+		source, err := sidecarLogs(ctx, app, req, dockerCli, cfg, app.Bricks(bricksIndex), servicesIndex)
 		if err != nil {
 			return nil, err
 		}
@@ -158,14 +158,15 @@ func composeLogs(dockerCli command.Cli, project string, opts api.LogOptions, tai
 	}, nil
 }
 
-// sidecarLogs yields the logs of the zone services that are sidecars of the app, attributing each
-// to its brick when its index tells, nil when the zone runs none of them. The sidecars are the ones
-// the last start rendered: a release ships no brick compose file, only the copies it froze.
+// sidecarLogs yields the logs of the sidecars of the app project, attributing each to its brick when
+// its index tells, nil without any. The sidecars are the ones the last start rendered: a release
+// ships no brick compose file, only the copies it froze.
 func sidecarLogs(
 	ctx context.Context,
 	app app.ArduinoApp,
 	req AppLogsRequest,
 	dockerCli command.Cli,
+	cfg config.Configuration,
 	bricksIndex *bricksindex.BricksIndex,
 	servicesIndex *servicesindex.ServicesIndex,
 ) (logSource, error) {
@@ -180,7 +181,8 @@ func sidecarLogs(
 	if err != nil {
 		return nil, err
 	}
-	containers, err := getAppContainers(ctx, dockerCli.Client(), sidecarsProject)
+	project := composeProjectName(app.FullPath, cfg.AppsDir())
+	containers, err := getAppContainers(ctx, dockerCli.Client(), project)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +198,7 @@ func sidecarLogs(
 		return nil, nil
 	}
 
-	return composeLogs(dockerCli, sidecarsProject, api.LogOptions{Follow: req.Follow, Services: services}, req.Tail, serviceToBrickMapping)
+	return composeLogs(dockerCli, project, api.LogOptions{Follow: req.Follow, Services: services}, req.Tail, serviceToBrickMapping)
 }
 
 // serviceBricks maps each compose service of the app to the brick that declares or requires it.

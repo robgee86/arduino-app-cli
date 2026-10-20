@@ -77,7 +77,8 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 				}
 
 				// Every app of the board starts warm, the ones whose ports the running app holds excepted
-				orchestrator.PrewarmApps(cmd.Context(), servicelocator.GetDockerClient(), cfg, servicelocator.GetPlatform(), servicelocator.GetBricksIndex())
+				orchestrator.PrewarmApps(cmd.Context(), servicelocator.GetDockerClient(), cfg, servicelocator.GetPlatform(),
+					servicelocator.GetProvisioner(), servicelocator.GetBricksIndex(), servicelocator.GetServicesIndex(), servicelocator.GetModelsIndex())
 			}()
 
 			httpHandler(cmd.Context(), cfg, daemonPort, version)

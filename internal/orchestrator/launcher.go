@@ -6,7 +6,6 @@
 package orchestrator
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -24,9 +23,7 @@ import (
 	"github.com/compose-spec/compose-go/v2/types"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/command"
-	yaml "github.com/goccy/go-yaml"
 	"github.com/moby/moby/api/types/container"
-	"github.com/moby/moby/api/types/network"
 	dockerClient "github.com/moby/moby/client"
 
 	"github.com/arduino/arduino-app-cli/internal/dockerhelper"
@@ -35,20 +32,20 @@ import (
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/bricksindex"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/launcher"
+	"github.com/arduino/arduino-app-cli/internal/orchestrator/modelsindex"
+	"github.com/arduino/arduino-app-cli/internal/orchestrator/servicesindex"
 	"github.com/arduino/arduino-app-cli/internal/platform"
 )
 
-// Each app runs in a warm container of its own, the compose project of the app with one service,
-// main, whose supervisor forks the app on request. The container stays once the app stops: the
-// next start of the app skips its warm-up. The container publishes the public ports of the app,
+// Each app runs in a warm container of its own, the main service of its compose project, whose
+// supervisor forks the app on request; the sidecars of the project run with the app. The main
+// container stays once the app stops: the next start of the app skips its warm-up. The container publishes the public ports of the app,
 // which Docker binds while it runs: two containers publishing one port cannot run together, so the
 // container of an app whose ports another app holds waits stopped, and a start stops the holder.
 const (
 	// launcherLabel marks the launcher shared by every app in the previous versions.
 	launcherLabel = "cc.arduino.app.launcher"
 
-	// appsNetwork is shared by the app containers and the sidecars, which reach each other by name.
-	appsNetwork = "arduino-apps"
 	// appSocketDir is where an app container sees its runtime folder, which holds the control socket.
 	appSocketDir = "/run/arduino-app-cli"
 	// appMountDir is where an app container sees the app folder.
@@ -76,13 +73,9 @@ func appContainerOf(cfg config.Configuration, appPath *paths.Path) appContainer 
 	return appContainer{project: composeProjectName(appPath, cfg.AppsDir())}
 }
 
-// dir holds the compose file of the container.
+// dir holds the record of the project the containers were created from.
 func (c appContainer) dir(cfg config.Configuration) *paths.Path {
 	return appsStateDir(cfg).Join(c.project)
-}
-
-func (c appContainer) composeFile(cfg config.Configuration) *paths.Path {
-	return c.dir(cfg).Join("compose.yaml")
 }
 
 // runtimeDir is mounted in the container at appSocketDir.
@@ -95,11 +88,6 @@ func (c appContainer) containerName() string {
 	return c.project + "-" + mainServiceName + "-1"
 }
 
-// host is the name of the container on the apps network, its compose name for a short project.
-func (c appContainer) host() string {
-	return c.key() + "-" + mainServiceName + "-1"
-}
-
 // key is the project, cut and told apart by a hash when longer than maxKeyLength.
 func (c appContainer) key() string {
 	if len(c.project) <= maxKeyLength {
@@ -110,7 +98,7 @@ func (c appContainer) key() string {
 	return strings.TrimRight(c.project[:maxKeyLength-len(suffix)-1], "-") + "-" + suffix
 }
 
-// appsStateDir holds the compose file of each app container and the records of the apps that run.
+// appsStateDir holds the record of each app project and of the app that runs.
 func appsStateDir(cfg config.Configuration) *paths.Path {
 	return cfg.DataDir().Join("apps")
 }
@@ -150,89 +138,6 @@ func checkAppPorts(ports []int) error {
 	return nil
 }
 
-// generateAppComposeFile writes the compose project of the app container, rendered on this board,
-// and tells whether it changed. It holds nothing an app edits but its public ports, which Docker
-// fixes at creation: the app environment goes with each start, new ports make a new container.
-func generateAppComposeFile(
-	c appContainer,
-	appPath *paths.Path,
-	ports []int,
-	pythonImage string,
-	cfg config.Configuration,
-	boardEnvs types.Mapping,
-	platform platform.Platform,
-) (bool, error) {
-	envs := boardEnvs.Clone()
-	envs["APP_LAUNCHER_PREPARE_TIMEOUT_S"] = strconv.Itoa(int(launcherPrepareTimeout.Seconds()))
-	if cfg.LauncherPreload != "" {
-		envs["APP_LAUNCHER_PRELOAD"] = cfg.LauncherPreload // Part of the compose file: changing it recreates the container
-	}
-
-	runtime, err := newPythonRuntime(cfg, platform)
-	if err != nil {
-		return false, err
-	}
-	svc := runtime.service(pythonImage,
-		volume{Type: "bind", Source: appPath.String(), Target: appMountDir},
-		volume{Type: "bind", Source: c.runtimeDir(cfg).String(), Target: appSocketDir},
-	)
-	svc.Entrypoint = "/run.sh serve"
-	svc.WorkingDir = appMountDir
-	svc.Restart = "no"
-	svc.StopGracePeriod = "10s"
-	svc.Labels = map[string]string{
-		DockerAppLabel:     "true",
-		DockerAppMainLabel: "true",
-		DockerAppPathLabel: appPath.String(),
-	}
-	svc.Environment = envs
-	svc.Networks = map[string]serviceNetwork{"default": {Aliases: []string{c.host()}}}
-	for _, p := range ports {
-		svc.Ports = append(svc.Ports, fmt.Sprintf("%d:%d", p, p))
-	}
-
-	compose := struct {
-		Name     string                    `yaml:"name"`
-		Services map[string]service        `yaml:"services"`
-		Networks map[string]composeNetwork `yaml:"networks"`
-	}{
-		Name:     c.project,
-		Services: map[string]service{mainServiceName: svc},
-		Networks: map[string]composeNetwork{"default": {Name: appsNetwork, External: true}},
-	}
-	template, err := yaml.Marshal(compose)
-	if err != nil {
-		return false, err
-	}
-	// The host devices and groups are answered here, the board the container runs on
-	data, err := renderComposeTemplate(template)
-	if err != nil {
-		return false, fmt.Errorf("failed to render the app container compose file: %w", err)
-	}
-	// compose interpolates the file: a $ of an app path or of the board environment is escaped
-	data = bytes.ReplaceAll(data, []byte("$"), []byte("$$"))
-
-	changed, err := writeFileIfChanged(c.composeFile(cfg), data)
-	if err != nil {
-		return false, fmt.Errorf("failed to write the app container compose file: %w", err)
-	}
-	return changed, nil
-}
-
-// writeFileIfChanged writes data atomically unless the file already holds it, and tells whether it wrote.
-func writeFileIfChanged(file *paths.Path, data []byte) (bool, error) {
-	if before, err := file.ReadFile(); err == nil && bytes.Equal(before, data) {
-		return false, nil
-	}
-	if err := file.Parent().MkdirAll(); err != nil {
-		return false, err
-	}
-	if err := fatomic.WriteFile(file.String(), data, 0o644); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
 // boardEnvironment is what every app container is given: the host facts that hold for every app.
 // The camera is a fact of the app start: a plugged camera must not recreate the container.
 func boardEnvironment(ctx context.Context, plat platform.Platform, cfg config.Configuration) types.Mapping {
@@ -243,18 +148,17 @@ func boardEnvironment(ctx context.Context, plat platform.Platform, cfg config.Co
 	return envs
 }
 
-// ensureAppContainer brings the container of the app up to date and running, and waits until its
-// supervisor answers. An unchanged compose file and an answer on the socket need no Docker round trip.
-// A start stops the containers holding the ports of the app; a warm-up, park, leaves them and keeps
-// the container stopped instead, which it tells by returning false.
+// ensureAppContainer brings the containers of the app project to date, the main one running with its
+// supervisor answering and, on a start, the sidecars running too. Containers created from the same
+// project and an answer on the socket need no compose round trip. A start stops the containers of
+// other apps holding the ports; a warm-up, park, creates the main container only and leaves it
+// stopped when its ports are held, which it tells by returning false.
 func ensureAppContainer(
 	ctx context.Context,
 	docker command.Cli,
 	cfg config.Configuration,
-	platform platform.Platform,
 	c appContainer,
-	appPath *paths.Path,
-	ports []int,
+	project appProject,
 	park bool,
 	cb func(StreamMessage),
 ) (time.Duration, bool, error) {
@@ -262,13 +166,15 @@ func ensureAppContainer(
 	if err := c.runtimeDir(cfg).MkdirAll(); err != nil {
 		return 0, false, fmt.Errorf("failed to create the app runtime folder: %w", err)
 	}
-	changed, err := generateAppComposeFile(c, appPath, ports, cfg.PythonImage, cfg, boardEnvironment(ctx, platform, cfg), platform)
-	if err != nil {
-		return 0, false, err
-	}
-	if !changed {
+	unchanged := c.recordedFingerprint(cfg) == project.fingerprint
+	if unchanged {
 		err := c.client(ctx, docker.Client(), cfg).WithTimeout(pingTimeout).Ping(ctx)
 		if err == nil {
+			if !park && len(project.services()) > 1 {
+				if err := startSidecars(ctx, docker.Client(), c, project); err != nil {
+					return 0, false, err
+				}
+			}
 			elapsed := time.Since(started)
 			slog.Debug("app container answers, up to date", slog.String("project", c.project), slog.Duration("elapsed", elapsed))
 			return elapsed, true, nil
@@ -281,21 +187,129 @@ func ensureAppContainer(
 		}
 	}
 
-	slog.Debug("bringing the app container up", slog.String("project", c.project), slog.Bool("changed", changed))
-	cb(StreamMessage{data: "Starting the app container"})
-	if err := ensureAppsNetwork(ctx, docker.Client()); err != nil {
+	containers, err := getAppContainers(ctx, docker.Client(), c.project)
+	if err != nil {
 		return 0, false, err
 	}
-	id, running, err := upAppContainer(ctx, docker.Client(), cfg, c, ports, park, cb)
-	if err != nil || !running {
-		return time.Since(started), false, err
+	main, hasMain := containers[mainServiceName]
+	holders, err := portHolders(ctx, docker.Client(), c, project.ports())
+	if err != nil {
+		return 0, false, err
 	}
-	if err := waitAppContainerReady(ctx, docker.Client(), c.client(ctx, docker.Client(), cfg), id); err != nil {
+	line := func(l string) { cb(StreamMessage{data: l}) }
+	// Compose recreates a changed container: the one listed above is gone
+	recreated := false
+	switch {
+	case park:
+		if !unchanged || !hasMain {
+			slog.Debug("creating the app container", slog.String("project", c.project), slog.Bool("changed", !unchanged))
+			if err := dockerhelper.ComposeCreate(ctx, docker, project.prj, []string{mainServiceName}, line); err != nil {
+				return 0, false, fmt.Errorf("failed to create the app container: %w", err)
+			}
+			if err := c.recordFingerprint(cfg, project.fingerprint); err != nil {
+				return 0, false, err
+			}
+			recreated = true
+		}
+		if len(holders) > 0 {
+			slog.Debug("the app container waits stopped, its ports are held", slog.String("container", c.containerName()), slog.Any("ports", project.ports()))
+			return time.Since(started), false, nil
+		}
+		if err := startStoppedContainers(ctx, docker.Client(), c, mainServiceName); err != nil {
+			return 0, false, err
+		}
+	case !unchanged || !containers.cover(project.services()):
+		slog.Debug("bringing the app project up", slog.String("project", c.project), slog.Bool("changed", !unchanged))
+		cb(StreamMessage{data: "Starting the app containers"})
+		if err := stopPortHolders(ctx, docker.Client(), holders, cb); err != nil {
+			return 0, false, err
+		}
+		if err := dockerhelper.ComposeUp(ctx, docker, project.prj, line); err != nil {
+			return 0, false, err
+		}
+		if err := c.recordFingerprint(cfg, project.fingerprint); err != nil {
+			return 0, false, err
+		}
+		recreated = true
+	default:
+		if err := stopPortHolders(ctx, docker.Client(), holders, cb); err != nil {
+			return 0, false, err
+		}
+		if err := startStoppedContainers(ctx, docker.Client(), c, project.services()...); err != nil {
+			return 0, false, err
+		}
+	}
+	if recreated || !hasMain {
+		if containers, err = getAppContainers(ctx, docker.Client(), c.project); err != nil {
+			return 0, false, err
+		}
+		if main, hasMain = containers[mainServiceName]; !hasMain {
+			return 0, false, errors.New("the app container was not created")
+		}
+	}
+	if err := waitAppContainerReady(ctx, docker.Client(), c.client(ctx, docker.Client(), cfg), main.ID); err != nil {
 		return 0, false, err
 	}
 	elapsed := time.Since(started)
-	slog.Info("app container ready", slog.String("project", c.project), slog.Duration("elapsed", elapsed), slog.Bool("changed", changed))
+	slog.Info("app container ready", slog.String("project", c.project), slog.Duration("elapsed", elapsed), slog.Bool("changed", !unchanged))
 	return elapsed, true, nil
+}
+
+// startSidecars starts the sidecars of the app that are not running: they stop with the app, the
+// main container does not.
+func startSidecars(ctx context.Context, docker dockerClient.APIClient, c appContainer, project appProject) error {
+	sidecars := slices.DeleteFunc(project.services(), func(s string) bool { return s == mainServiceName })
+	return startStoppedContainers(ctx, docker, c, sidecars...)
+}
+
+// startStoppedContainers starts the containers of the services that exist and do not run.
+func startStoppedContainers(ctx context.Context, docker dockerClient.APIClient, c appContainer, services ...string) error {
+	containers, err := getAppContainers(ctx, docker, c.project)
+	if err != nil {
+		return err
+	}
+	stopped := make(appContainers)
+	for _, service := range services {
+		if ctr, ok := containers[service]; ok && ctr.State != container.StateRunning {
+			stopped[service] = ctr
+		}
+	}
+	return startAppContainers(ctx, docker, stopped, func(StreamMessage) {})
+}
+
+// portHolders are the running containers of other apps publishing a port of the app: Docker refuses
+// to start a second container on a bound host port.
+func portHolders(ctx context.Context, docker dockerClient.APIClient, c appContainer, ports []int) ([]container.Summary, error) {
+	if len(ports) == 0 {
+		return nil, nil
+	}
+	containers, err := listAppMainContainers(ctx, docker)
+	if err != nil {
+		return nil, err
+	}
+	var holders []container.Summary
+	for _, other := range containers {
+		if other.State != container.StateRunning || containerName(other) == c.containerName() {
+			continue
+		}
+		if slices.ContainsFunc(other.Ports, func(p container.PortSummary) bool { return slices.Contains(ports, int(p.PublicPort)) }) {
+			holders = append(holders, other)
+		}
+	}
+	return holders, nil
+}
+
+// stopPortHolders stops the containers so that their ports are free. Their apps stopped already:
+// one app runs at a time and the start stops the previous one before the container of the next.
+func stopPortHolders(ctx context.Context, docker dockerClient.APIClient, holders []container.Summary, cb func(StreamMessage)) error {
+	for _, holder := range holders {
+		cb(StreamMessage{data: fmt.Sprintf("Stopping the container %s, which holds the app ports", containerName(holder))})
+		slog.Info("stopping an app container holding the ports", slog.String("container", containerName(holder)))
+		if _, err := docker.ContainerStop(ctx, holder.ID, dockerClient.ContainerStopOptions{}); err != nil {
+			return fmt.Errorf("failed to stop %s, which holds the app ports: %w", containerName(holder), err)
+		}
+	}
+	return nil
 }
 
 // pingTimeout bounds one ping of a supervisor, a local socket round trip.
@@ -333,23 +347,9 @@ func waitAppContainerReady(ctx context.Context, docker dockerClient.APIClient, c
 	}
 }
 
-// ensureAppsNetwork creates the network shared by the apps and the sidecars when missing.
-func ensureAppsNetwork(ctx context.Context, docker dockerClient.APIClient) error {
-	networks, err := docker.NetworkList(ctx, dockerClient.NetworkListOptions{
-		Filters: make(dockerClient.Filters).Add("name", appsNetwork),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to list the networks: %w", err)
-	}
-	// The name filter matches a part of the name
-	if slices.ContainsFunc(networks.Items, func(n network.Summary) bool { return n.Name == appsNetwork }) {
-		return nil
-	}
-	slog.Info("creating the apps network", slog.String("name", appsNetwork))
-	if _, err := docker.NetworkCreate(ctx, appsNetwork, dockerClient.NetworkCreateOptions{Driver: "bridge"}); err != nil {
-		return fmt.Errorf("failed to create the %s network: %w", appsNetwork, err)
-	}
-	return nil
+// isMainContainer tells the warm container of an app from its sidecars.
+func isMainContainer(c container.Summary) bool {
+	return c.Labels[DockerAppMainLabel] == "true"
 }
 
 // listAppMainContainers lists the app containers, running or not, the sidecars left out.
@@ -370,7 +370,33 @@ func StopAllApps(ctx context.Context, docker dockerClient.APIClient, cfg config.
 	err = forEachContainer(running, func(c container.Summary) error {
 		return stopAppChild(ctx, docker, cfg, appContainer{project: c.Labels[composeProjectLabel]})
 	})
-	return errors.Join(err, clearWantedApp(cfg, nil), stopSidecars(ctx, docker, func(StreamMessage) {}), removeSharedLauncher(ctx, docker))
+	return errors.Join(err, clearWantedApp(cfg, nil), stopAllSidecars(ctx, docker), removeSharedLauncher(ctx, docker))
+}
+
+// stopAllSidecars stops every running sidecar of every app: the sidecars run with their app only.
+func stopAllSidecars(ctx context.Context, docker dockerClient.APIClient) error {
+	containers, err := dockerhelper.Containers(ctx, docker, DockerAppLabel+"=true")
+	if err != nil {
+		return err
+	}
+	sidecars := slices.DeleteFunc(containers, isMainContainer)
+	return stopAppContainers(ctx, docker, byService(sidecars), DefaultDockerStopTimeoutSeconds, func(StreamMessage) {})
+}
+
+// removeSharedSidecars removes the sidecars project and the network the previous layout shared between the apps.
+func removeSharedSidecars(ctx context.Context, docker command.Cli) {
+	const sharedProject, sharedNetwork = "arduino-sidecars", "arduino-apps"
+	if containers, err := getAppContainers(ctx, docker.Client(), sharedProject); err == nil && len(containers) > 0 {
+		slog.Info("removing the sidecars project shared between the apps")
+		if err := dockerhelper.ComposeDown(ctx, docker, sharedProject, func(string) {}); err != nil {
+			slog.Warn("failed to remove the shared sidecars project", slog.String("error", err.Error()))
+		}
+	}
+	if _, err := docker.Client().NetworkInspect(ctx, sharedNetwork, dockerClient.NetworkInspectOptions{}); err == nil {
+		if _, err := docker.Client().NetworkRemove(ctx, sharedNetwork, dockerClient.NetworkRemoveOptions{}); err != nil {
+			slog.Debug("the shared apps network stays", slog.String("error", err.Error()))
+		}
+	}
 }
 
 // removeSharedLauncher removes the launcher of the previous versions, which would keep its socket and mounts.
@@ -422,17 +448,14 @@ func removeAppContainers(ctx context.Context, docker dockerClient.APIClient, cfg
 	})
 }
 
-// destroyAppContainer removes the container of the app with its runtime folder and its compose file.
-func destroyAppContainer(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration, appPath *paths.Path) error {
-	c := appContainerOf(cfg, appPath)
-	containers, err := getAppContainers(ctx, docker, c.project)
-	if err != nil {
-		return err
-	}
-	if main, ok := containers[mainServiceName]; ok {
-		if err := removeContainers(ctx, docker, []container.Summary{main}); err != nil {
-			return err
-		}
+// destroyAppContainer removes the project of the app, containers and network, with its runtime folder and its record.
+func destroyAppContainer(ctx context.Context, docker command.Cli, cfg config.Configuration, appPath *paths.Path) error {
+	return destroyAppProject(ctx, docker, cfg, appContainerOf(cfg, appPath))
+}
+
+func destroyAppProject(ctx context.Context, docker command.Cli, cfg config.Configuration, c appContainer) error {
+	if err := dockerhelper.ComposeDown(ctx, docker, c.project, func(string) {}); err != nil {
+		return fmt.Errorf("failed to remove the containers of %s: %w", c.project, err)
 	}
 	return errors.Join(c.runtimeDir(cfg).RemoveAll(), c.dir(cfg).RemoveAll())
 }
@@ -530,26 +553,37 @@ func orphanAppContainers(containers []container.Summary) []container.Summary {
 	})
 }
 
-// removeOrphanAppContainers removes the containers of the apps deleted outside the daemon.
-func removeOrphanAppContainers(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration) error {
-	containers, err := listAppMainContainers(ctx, docker)
+// removeOrphanAppContainers removes the projects of the apps deleted outside the daemon.
+func removeOrphanAppContainers(ctx context.Context, docker command.Cli, cfg config.Configuration) error {
+	containers, err := listAppMainContainers(ctx, docker.Client())
 	if err != nil {
 		return err
 	}
-	orphans := orphanAppContainers(containers)
-	for _, c := range orphans {
-		slog.Info("removing the container of a deleted app", slog.String("container", containerName(c)))
+	var errs []error
+	for _, c := range orphanAppContainers(containers) {
+		slog.Info("removing the containers of a deleted app", slog.String("container", containerName(c)))
+		errs = append(errs, destroyAppProject(ctx, docker, cfg, appContainer{project: c.Labels[composeProjectLabel]}))
 	}
-	return removeAppContainers(ctx, docker, cfg, orphans)
+	return errors.Join(errs...)
 }
 
 // prewarmPause separates two warm-ups: a start waiting for the apps lock takes it in between.
 const prewarmPause = 200 * time.Millisecond
 
-// PrewarmApps brings up the container of every app of the board, without starting them, one at a time
-// and never ahead of a start: a container the user asks for meanwhile comes up on the start path. An
-// app whose ports a running container holds gets its container created and left stopped.
-func PrewarmApps(ctx context.Context, docker command.Cli, cfg config.Configuration, platform platform.Platform, bricksIndex *bricksindex.BricksIndex) {
+// PrewarmApps creates the main container of every app of the board and starts it, without starting
+// the app, one at a time and never ahead of a start: a container the user asks for meanwhile comes
+// up on the start path. The sidecars are created by the first start. An app whose ports a running
+// container holds gets its container created and left stopped.
+func PrewarmApps(
+	ctx context.Context,
+	docker command.Cli,
+	cfg config.Configuration,
+	platform platform.Platform,
+	provisioner *Provision,
+	bricksIndex *bricksindex.BricksIndex,
+	servicesIndex *servicesindex.ServicesIndex,
+	modelsIndex *modelsindex.ModelsIndex,
+) {
 	var running *paths.Path
 	if wanted := readWantedApp(cfg); wanted != nil {
 		running = wanted.App
@@ -562,12 +596,23 @@ func PrewarmApps(ctx context.Context, docker command.Cli, cfg config.Configurati
 			time.Sleep(prewarmPause)
 		}
 		a, err := app.Load(appPath)
-		if err != nil {
-			slog.Debug("skipping the warm-up of an invalid app", slog.String("app", appPath.String()), slog.String("error", err.Error()))
+		if err != nil || a.MainPythonFile == nil {
+			slog.Debug("skipping the warm-up of an app without python or invalid", slog.String("app", appPath.String()))
 			continue
 		}
 		err = withAppsLock(ctx, cfg, func() error {
-			elapsed, warm, err := ensureAppContainer(ctx, docker, cfg, platform, appContainerOf(cfg, appPath), appPath, appPorts(a, bricksIndex), true, func(StreamMessage) {})
+			// Resolved as a start resolves it: a release holds its files already
+			appEnv := appEnvironment(ctx, a, bricksIndex, modelsIndex, platform)
+			if _, isRelease := a.GetRelease(); !isRelease {
+				if err := provisioner.Resolve(&a, a.ProvisioningStateDir(), bricksIndex, servicesIndex, cfg, appEnv, platform); err != nil {
+					return err
+				}
+			}
+			project, err := renderAppProject(ctx, provisioner, &a, cfg, platform, appEnv, bricksIndex)
+			if err != nil {
+				return err
+			}
+			elapsed, warm, err := ensureAppContainer(ctx, docker, cfg, appContainerOf(cfg, appPath), project, true, func(StreamMessage) {})
 			slog.Debug("app container warmed up", slog.String("app", appPath.String()), slog.Bool("warm", warm), slog.Duration("elapsed", elapsed))
 			return err
 		})
@@ -577,17 +622,19 @@ func PrewarmApps(ctx context.Context, docker command.Cli, cfg config.Configurati
 	}
 }
 
-// EnsureRuntime removes the app containers of an older image or of a deleted app and makes the apps network.
+// EnsureRuntime removes the app containers of an older image or of a deleted app, and what the
+// previous layout left: the shared sidecars project and the shared network.
 func EnsureRuntime(ctx context.Context, docker command.Cli, cfg config.Configuration) (time.Duration, error) {
 	started := time.Now()
 	err := withAppsLock(ctx, cfg, func() error {
 		if err := removeStaleAppContainers(ctx, docker.Client(), cfg); err != nil {
 			slog.Warn("failed to remove the app containers of an older image", slog.String("error", err.Error()))
 		}
-		if err := removeOrphanAppContainers(ctx, docker.Client(), cfg); err != nil {
+		if err := removeOrphanAppContainers(ctx, docker, cfg); err != nil {
 			slog.Warn("failed to remove the containers of deleted apps", slog.String("error", err.Error()))
 		}
-		return ensureAppsNetwork(ctx, docker.Client())
+		removeSharedSidecars(ctx, docker)
+		return nil
 	})
 	return time.Since(started), err
 }

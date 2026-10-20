@@ -32,22 +32,20 @@ type AppStatusInfo struct {
 	Status  Status
 }
 
-// sidecarsStatus is the overall status of the zone containers of the services, all of them when
-// services is nil, empty without containers or when it cannot tell:
+// sidecarsStatus is the overall status of the sidecars of the project, empty without any or when
+// it cannot tell:
 //
 //	running: all running
 //	stopped: all stopped
 //	failed: at least one failed
 //	stopping: at least one stopping
 //	starting: at least one starting
-func sidecarsStatus(containers []container.Summary, services []string) Status {
-	zone, _ := splitAppContainers(containers)
-	if services != nil {
-		zone = zone.only(services)
-	}
-	s := make([]Status, 0, len(zone))
-	for _, c := range zone {
-		s = append(s, StatusFromDockerState(c.State, c.Status))
+func sidecarsStatus(containers []container.Summary, project string) Status {
+	var s []Status
+	for _, c := range containers {
+		if c.Labels[composeProjectLabel] == project && !isMainContainer(c) {
+			s = append(s, StatusFromDockerState(c.State, c.Status))
+		}
 	}
 	switch {
 	case len(s) == 0:
@@ -67,25 +65,22 @@ func sidecarsStatus(containers []container.Summary, services []string) Status {
 	}
 }
 
-// appsView is the app that should be running with the child its container runs, and the zone
-// services that are its sidecars: nil without record, then every zone container counts.
+// appsView is the app that should be running, its compose project and the child its container runs.
 type appsView struct {
-	wanted   *paths.Path
-	child    *launcher.Child
-	sidecars []string
+	wanted  *paths.Path
+	project string
+	child   *launcher.Child
 }
 
 // readAppsView asks the container of the wanted app for its child. An unreachable container runs nothing.
 func readAppsView(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration) appsView {
 	var view appsView
-	if record := readSidecarsRecord(cfg); record != nil {
-		view.sidecars = slices.Collect(maps.Keys(record))
-	}
 	wanted := readWantedApp(cfg)
 	if wanted == nil {
 		return view
 	}
 	view.wanted = wanted.App
+	view.project = appContainerOf(cfg, wanted.App).project
 	status, err := appContainerOf(cfg, wanted.App).client(ctx, docker, cfg).Status(ctx)
 	if err != nil {
 		slog.Debug("app container status unavailable", slog.String("error", err.Error()))
@@ -95,12 +90,10 @@ func readAppsView(ctx context.Context, docker dockerClient.APIClient, cfg config
 	return view
 }
 
-// mergeAppStatus combines the sidecars zone with the child of the wanted app: the zone runs its
-// sidecars. Every other app with a container is idle: its sidecar exit codes come from the stop,
-// and a runner may exit 0 on SIGTERM.
+// mergeAppStatus combines the sidecars of the wanted app with its child. Every other app with a
+// container is idle: its sidecar exit codes come from the stop, and a runner may exit 0 on SIGTERM.
 func mergeAppStatus(containers []container.Summary, view appsView) []AppStatusInfo {
-	// The orphans being removed alongside a start are no sidecars of the app
-	zone := sidecarsStatus(containers, view.sidecars)
+	zone := sidecarsStatus(containers, view.project)
 	statuses := make(map[string]Status)
 	for _, c := range containers {
 		if appPath := c.Labels[DockerAppPathLabel]; c.Labels[DockerAppMainLabel] == "true" && appPath != "" {
@@ -142,8 +135,8 @@ func idleAppStatus(appPath *paths.Path) Status {
 	return StatusUninitialized
 }
 
-// listAppContainers lists the app containers, running or not: the containers of the apps, the
-// sidecars zone and the sidecars of the per-app projects of the older versions.
+// listAppContainers lists the app containers, running or not: the main container and the sidecars
+// of every app project.
 func listAppContainers(ctx context.Context, docker dockerClient.APIClient) ([]container.Summary, error) {
 	containers, err := dockerhelper.Containers(ctx, docker, DockerAppLabel+"=true")
 	if err != nil {

@@ -36,7 +36,7 @@ func TestMergeAppStatus(t *testing.T) {
 		return named(project, fmt.Sprintf("runner-%d", services), state, status)
 	}
 	zone := func(state container.ContainerState, status string) container.Summary {
-		return sidecar(sidecarsProject, state, status)
+		return sidecar("a", state, status)
 	}
 	main := func(appPath string, state container.ContainerState) container.Summary {
 		return container.Summary{State: state, Labels: map[string]string{
@@ -55,59 +55,53 @@ func TestMergeAppStatus(t *testing.T) {
 		{
 			name:       "a child without sidecars runs",
 			containers: []container.Summary{main(appA, container.StateRunning)},
-			view:       appsView{child: running, wanted: paths.New(appA)},
+			view:       appsView{child: running, wanted: paths.New(appA), project: "a"},
 			want:       map[string]Status{appA: StatusRunning},
 		},
 		{
 			name:       "a child with running sidecars runs",
 			containers: []container.Summary{zone(container.StateRunning, "Up")},
-			view:       appsView{child: running, wanted: paths.New(appA)},
+			view:       appsView{child: running, wanted: paths.New(appA), project: "a"},
 			want:       map[string]Status{appA: StatusRunning},
 		},
 		{
 			name:       "a child with restarting sidecars starts",
 			containers: []container.Summary{zone(container.StateRunning, "Up"), zone(container.StateRestarting, "Restarting")},
-			view:       appsView{child: running, wanted: paths.New(appA)},
+			view:       appsView{child: running, wanted: paths.New(appA), project: "a"},
 			want:       map[string]Status{appA: StatusStarting},
 		},
 		{
 			name:       "a failed sidecar fails the app",
 			containers: []container.Summary{zone(container.StateExited, "Exited (1) 3 seconds ago")},
-			view:       appsView{child: running, wanted: paths.New(appA)},
+			view:       appsView{child: running, wanted: paths.New(appA), project: "a"},
 			want:       map[string]Status{appA: StatusFailed},
 		},
 		{
 			name:       "a failed sidecar fails the wanted app whose child is gone",
 			containers: []container.Summary{zone(container.StateExited, "Exited (1) 3 seconds ago")},
-			view:       appsView{wanted: paths.New(appA)},
+			view:       appsView{wanted: paths.New(appA), project: "a"},
 			want:       map[string]Status{appA: StatusFailed},
 		},
 		{
 			name:       "the other app containers are idle, running or not",
-			containers: []container.Summary{main(appA, container.StateRunning), main(appB, container.StateExited), main(fresh, container.StateRunning), zone(container.StateExited, "Exited (1) 3 seconds ago")},
-			view:       appsView{child: running, wanted: paths.New(appB)},
+			containers: []container.Summary{main(appA, container.StateRunning), main(appB, container.StateExited), main(fresh, container.StateRunning), sidecar("b", container.StateExited, "Exited (1) 3 seconds ago")},
+			view:       appsView{child: running, wanted: paths.New(appB), project: "b"},
 			want:       map[string]Status{appA: StatusStopped, appB: StatusFailed, fresh: StatusUninitialized},
 		},
 		{
-			name:       "an orphan removed alongside the start is no sidecar of the app",
-			containers: []container.Summary{named(sidecarsProject, "kept", container.StateRestarting, "Restarting"), named(sidecarsProject, "orphan", container.StateExited, "Exited (0) 1 second ago")},
-			view:       appsView{child: running, wanted: paths.New(appA), sidecars: []string{"kept"}},
-			want:       map[string]Status{appA: StatusStarting},
-		},
-		{
-			name:       "the sidecars of the per-app projects are not sidecars",
-			containers: []container.Summary{sidecar("a", container.StateExited, "Exited (1) 3 seconds ago")},
-			view:       appsView{child: running, wanted: paths.New(appA)},
+			name:       "the sidecars of another app are not sidecars of the wanted one",
+			containers: []container.Summary{sidecar("b", container.StateExited, "Exited (1) 3 seconds ago")},
+			view:       appsView{child: running, wanted: paths.New(appA), project: "a"},
 			want:       map[string]Status{appA: StatusRunning},
 		},
 		{
-			name:       "a stopped zone whose runner exited 0 on SIGTERM tells nothing",
+			name:       "stopped sidecars whose runner exited 0 on SIGTERM tell nothing",
 			containers: []container.Summary{zone(container.StateExited, "Exited (0) 5 seconds ago")},
 			want:       map[string]Status{},
 		},
 		{
 			name: "a child being stopped stops",
-			view: appsView{child: stopping, wanted: paths.New(appA)},
+			view: appsView{child: stopping, wanted: paths.New(appA), project: "a"},
 			want: map[string]Status{appA: StatusStopping},
 		},
 		{

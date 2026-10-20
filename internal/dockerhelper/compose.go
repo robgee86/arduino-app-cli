@@ -36,6 +36,32 @@ func ComposeImages(prj *types.Project) []string {
 // ComposeUp starts the app the project states, reporting to line what it does. The
 // compose of the board takes no part: the sdk this binary links talks to the engine.
 func ComposeUp(ctx context.Context, docker command.Cli, prj *types.Project, line func(string)) error {
+	backend, reported, err := newComposeBackend(docker, prj, line)
+	if err != nil {
+		return err
+	}
+	return reported.explain(backend.Up(ctx, prj, api.UpOptions{
+		Create: createOptions(nil),
+		Start:  api.StartOptions{Project: prj},
+	}))
+}
+
+// ComposeCreate creates the containers of the services, every service when none is named, without
+// starting them, as compose create does: a container publishing ports takes them only once started.
+func ComposeCreate(ctx context.Context, docker command.Cli, prj *types.Project, services []string, line func(string)) error {
+	backend, reported, err := newComposeBackend(docker, prj, line)
+	if err != nil {
+		return err
+	}
+	return reported.explain(backend.Create(ctx, prj, createOptions(services)))
+}
+
+func createOptions(services []string) api.CreateOptions {
+	return api.CreateOptions{Services: services, RemoveOrphans: true, Inherit: true}
+}
+
+// newComposeBackend prepares the project and the sdk service that converges it, reporting to line.
+func newComposeBackend(docker command.Cli, prj *types.Project, line func(string)) (api.Compose, *composeProgress, error) {
 	// An image the board already has is not asked for again: `--pull missing`.
 	for name, service := range prj.Services {
 		if service.PullPolicy == "" {
@@ -49,20 +75,23 @@ func ComposeUp(ctx context.Context, docker command.Cli, prj *types.Project, line
 	reported := newProgress(line)
 	backend, err := compose.NewComposeService(docker, compose.WithEventProcessor(reported))
 	if err != nil {
+		return nil, nil, err
+	}
+	return backend, reported, nil
+}
+
+// explain replaces an sdk error, which says little, with what the events reported.
+func (p *composeProgress) explain(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case p.registryError != nil:
+		return p.registryError
+	case p.networkError != nil:
+		return fmt.Errorf("%w: %w", ErrNetwork, p.networkError)
+	default:
 		return err
 	}
-	err = backend.Up(ctx, prj, api.UpOptions{
-		Create: api.CreateOptions{RemoveOrphans: true, Inherit: true},
-		Start:  api.StartOptions{Project: prj},
-	})
-	// What went wrong is reported as an event, and the error itself says little.
-	if err != nil && reported.registryError != nil {
-		return reported.registryError
-	}
-	if err != nil && reported.networkError != nil {
-		return fmt.Errorf("%w: %w", ErrNetwork, reported.networkError)
-	}
-	return err
 }
 
 // ErrNetwork states that the network of the app was not created. A pool with no

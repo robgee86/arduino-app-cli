@@ -164,9 +164,10 @@ func checkApp(
 	return nil
 }
 
-// startApp runs the app Python code in its warm container, which publishes its public ports, in
-// place of the app that ran, and brings the sidecars zone to the sidecars of the app. An app with
-// only a sketch stops the zone. bricksIndex and modelsIndex are the ones the app is wired with.
+// startApp runs the app Python code in its warm container, the main service of its compose project,
+// which publishes its public ports, in place of the app that ran, with the sidecars of the project
+// running beside it. An app with only a sketch stops the running app. bricksIndex and modelsIndex
+// are the ones the app is wired with.
 func startApp(
 	ctx context.Context,
 	docker command.Cli,
@@ -242,7 +243,7 @@ func startApp(
 	}
 
 	if appToStart.MainPythonFile == nil {
-		if err := errors.Join(stopWantedApp(ctx, docker.Client(), cfg), stopSidecars(ctx, docker.Client(), cb)); err != nil {
+		if err := stopWantedApp(ctx, docker.Client(), cfg); err != nil {
 			return err
 		}
 		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
@@ -269,19 +270,11 @@ func startApp(
 		}
 	}
 
-	// What the template references, answered on this board. The app half is in
-	// the template already, frozen, when the app comes from a release.
-	env := hostEnvironment(ctx, appToStart.FullPath, cfg).Merge(appEnv)
-	prj, err := provisioner.Render(ctx, &appToStart, env, appToStart.Secrets(bricksIndex))
+	project, err := renderAppProject(ctx, provisioner, &appToStart, cfg, platform, appEnv, bricksIndex)
 	if err != nil {
 		return err
 	}
-	// The app container runs the app with the environment of its main service, the zone the rest
-	appEnvs := splitMainService(prj)
-	zone, err := generateSidecarsZone(prj, cfg)
-	if err != nil {
-		return err
-	}
+	prj := project.prj
 
 	// Without a prepare, a start never fetches a missing image: it fails and asks for
 	// one first.
@@ -296,22 +289,27 @@ func startApp(
 	if err := pullAppImages(ctx, docker, prj, cb); err != nil {
 		return err
 	}
-	return startInAppContainer(ctx, docker, appToStart, ports, cfg, platform, appEnvs, zone, cb)
+	return startInAppContainer(ctx, docker, appToStart, cfg, project, cb)
 }
 
-// splitMainService takes the main service out of the project, leaving the sidecars, and returns
-// the environment the main service would run the app with.
-func splitMainService(prj *types.Project) map[string]string {
-	envs := make(map[string]string)
-	if main, ok := prj.Services[mainServiceName]; ok {
-		for k, v := range main.Environment {
-			if v != nil {
-				envs[k] = *v
-			}
-		}
-		delete(prj.Services, mainServiceName)
+// renderAppProject renders the compose project of the app on this board and adapts its main service
+// to the warm container. What the template references is answered here; the app half is in the
+// template already, frozen, when the app comes from a release.
+func renderAppProject(
+	ctx context.Context,
+	provisioner *Provision,
+	a *app.ArduinoApp,
+	cfg config.Configuration,
+	platform platform.Platform,
+	appEnv types.Mapping,
+	bricksIndex *bricksindex.BricksIndex,
+) (appProject, error) {
+	env := hostEnvironment(ctx, a.FullPath, cfg).Merge(appEnv)
+	prj, err := provisioner.Render(ctx, a, env, a.Secrets(bricksIndex))
+	if err != nil {
+		return appProject{}, err
 	}
-	return envs
+	return adaptAppProject(prj, appContainerOf(cfg, a.FullPath), cfg, boardEnvironment(ctx, platform, cfg))
 }
 
 // pullAppImages downloads the images of the project the board does not have.
@@ -328,58 +326,34 @@ func pullAppImages(ctx context.Context, docker command.Cli, prj *types.Project, 
 		})
 }
 
-// startInAppContainer brings the sidecars zone to running, when Docker resolves their names, while a
-// previous, different app stops; then has the app container, up on the app ports, start the app;
-// the bricks retry until the sidecars accept connections. The app itself, when it is the one
-// running, is left to its supervisor, which stops it right before the fork.
+// startInAppContainer stops a previous, different app with its sidecars, brings the containers of
+// the app project up, the main one on the app ports and the sidecars with it, and has the app
+// container start the app; the bricks retry until the sidecars accept connections. The app itself,
+// when it is the one running, is left to its supervisor, which stops it right before the fork.
 func startInAppContainer(
 	ctx context.Context,
 	docker command.Cli,
 	appToStart app.ArduinoApp,
-	ports []int,
 	cfg config.Configuration,
-	platform platform.Platform,
-	envs map[string]string,
-	zone sidecarsZone,
+	project appProject,
 	cb func(StreamMessage),
 ) error {
 	target := appContainerOf(cfg, appToStart.FullPath)
-	var (
-		wg              sync.WaitGroup
-		previousStopErr error
-	)
 	stopping := time.Now()
 	var stopped time.Duration
 	wanted := readWantedApp(cfg)
 	reload := wanted != nil && wanted.App.EqualsTo(appToStart.FullPath)
+	var err error
 	if wanted != nil && !reload {
-		wg.Go(func() {
-			previousStopErr = stopWantedApp(ctx, docker.Client(), cfg)
-			stopped = time.Since(stopping)
-		})
+		err = stopWantedApp(ctx, docker.Client(), cfg)
+		stopped = time.Since(stopping)
 	}
-	removeOrphans, sidecarsErr := reconcileSidecars(ctx, docker, cfg, zone, cb)
-	wg.Wait()
-
-	err := errors.Join(previousStopErr, sidecarsErr)
-	// Nothing was created: the orphans go while the app starts, the previous app is already stopped
-	var (
-		orphans    sync.WaitGroup
-		orphansErr error
-	)
-	if err == nil && removeOrphans != nil {
-		orphans.Go(func() { orphansErr = removeOrphans() })
-	}
-	waitOrphans := func() {
-		orphans.Wait()
-		if orphansErr != nil {
-			slog.Warn("failed to remove the sidecars the app does not use, retried at the next start", slog.String("error", orphansErr.Error()))
-		}
-	}
+	waitOrphans := func() {}
+	envs := project.appEnvs
 
 	var ready time.Duration
 	if err == nil {
-		ready, _, err = ensureAppContainer(ctx, docker, cfg, platform, target, appToStart.FullPath, ports, false, cb)
+		ready, _, err = ensureAppContainer(ctx, docker, cfg, target, project, false, cb)
 	}
 	var (
 		started   launcher.StartResponse
@@ -407,7 +381,7 @@ func startInAppContainer(
 		stopped = time.Duration(started.Timings.StopMs * float64(time.Millisecond))
 	}
 	slog.Info("app started", slog.String("app", appToStart.FullPath.String()), slog.String("project", target.project), slog.Int("pid", started.PID), slog.Bool("reload", reload),
-		slog.Bool("warm", started.Warm), slog.Any("ports", ports), slog.Duration("container_ready", ready), slog.Duration("previous_stop", stopped), slog.Bool("prepared", started.Prepared),
+		slog.Bool("warm", started.Warm), slog.Any("ports", project.ports()), slog.Duration("container_ready", ready), slog.Duration("previous_stop", stopped), slog.Bool("prepared", started.Prepared),
 		slog.Float64("prepare_ms", started.Timings.PrepareMs), slog.Float64("fork_ms", started.Timings.ForkMs))
 	if started.Prepared {
 		cb(StreamMessage{data: fmt.Sprintf("Preparing dependencies took %d ms", int64(started.Timings.PrepareMs))})
@@ -482,8 +456,7 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 }
 
 // stopAppProcesses stops the app in its container, which stays warm and keeps its ports, then stops
-// the sidecars zone unless it belongs to another app. The zone stays: the next start of the same
-// app is a plain start.
+// its sidecars, which stay for the next start.
 func stopAppProcesses(ctx context.Context, docker dockerClient.APIClient, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
 	if cb == nil {
 		cb = func(StreamMessage) {}
@@ -491,19 +464,24 @@ func stopAppProcesses(ctx context.Context, docker dockerClient.APIClient, app ap
 	if app.MainPythonFile == nil {
 		return nil
 	}
-	// Read before the stop, which forgets it
-	wanted := readWantedApp(cfg)
-	if err := stopAppChild(ctx, docker, cfg, appContainerOf(cfg, app.FullPath)); err != nil {
+	c := appContainerOf(cfg, app.FullPath)
+	if err := stopAppChild(ctx, docker, cfg, c); err != nil {
 		return err
 	}
 	if err := clearWantedApp(cfg, app.FullPath); err != nil {
 		return err
 	}
-	if wanted != nil && !wanted.App.EqualsTo(app.FullPath) {
-		slog.Debug("the sidecars zone belongs to another app, left as it is", slog.String("app", wanted.App.String()))
-		return nil
+	return stopProjectSidecars(ctx, docker, c, cb)
+}
+
+// stopProjectSidecars stops the running sidecars of the app project, the main container left as it is.
+func stopProjectSidecars(ctx context.Context, docker dockerClient.APIClient, c appContainer, cb func(StreamMessage)) error {
+	containers, err := getAppContainers(ctx, docker, c.project)
+	if err != nil {
+		return err
 	}
-	return stopSidecars(ctx, docker, cb)
+	delete(containers, mainServiceName)
+	return stopAppContainers(ctx, docker, containers, DefaultDockerStopTimeoutSeconds, cb)
 }
 
 // stopWantedApp stops the app that should be running, and forgets it.
@@ -534,7 +512,7 @@ func stopAndDestroyApp(ctx context.Context, dockerClient command.Cli, platform p
 	if err := stopAppWithCmd(ctx, dockerClient, platform, app, cfg, "down", cb); err != nil {
 		return err
 	}
-	if err := destroyAppContainer(ctx, dockerClient.Client(), cfg, app.FullPath); err != nil {
+	if err := destroyAppContainer(ctx, dockerClient, cfg, app.FullPath); err != nil {
 		return err
 	}
 	if err := cleanAppCacheFiles(app, cb); err != nil {

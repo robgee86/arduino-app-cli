@@ -198,7 +198,7 @@ func generateComposeTemplate(
 		Target: "/app",
 	})
 	main.Ports = slices.Collect(maps.Keys(ports))
-	main.Entrypoint = "/run.sh"
+	main.Entrypoint = runScript
 	main.DependsOn = dependsOn
 	main.Labels = map[string]string{
 		DockerAppLabel:     "true",
