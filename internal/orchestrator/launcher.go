@@ -582,15 +582,22 @@ func removeOrphanAppContainers(ctx context.Context, docker dockerClient.APIClien
 	return removeAppContainers(ctx, docker, cfg, orphans)
 }
 
-// PrewarmApps brings up the container of every app of the board, without starting them, one at a time.
+// prewarmPause separates two warm-ups: a start waiting for the apps lock takes it in between.
+const prewarmPause = 200 * time.Millisecond
+
+// PrewarmApps brings up the container of every app of the board, without starting them, one at a time
+// and never ahead of a start: a container the user asks for meanwhile comes up on the start path.
 func PrewarmApps(ctx context.Context, docker command.Cli, cfg config.Configuration, platform platform.Platform) {
 	var running *paths.Path
 	if wanted := readWantedApp(cfg); wanted != nil {
 		running = wanted.App
 	}
-	for _, appPath := range warmApps(cfg) {
+	for i, appPath := range warmApps(cfg) {
 		if running != nil && running.EqualsTo(appPath) {
 			continue
+		}
+		if i > 0 {
+			time.Sleep(prewarmPause)
 		}
 		err := withAppsLock(ctx, cfg, func() error {
 			elapsed, err := ensureAppContainer(ctx, docker, cfg, platform, appContainerOf(cfg, appPath), appPath, func(StreamMessage) {})
