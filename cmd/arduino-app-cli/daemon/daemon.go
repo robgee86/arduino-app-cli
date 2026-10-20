@@ -50,18 +50,12 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 
 			// start the default app in the background
 			go func() {
-				// The app containers of an older image go, the ingress publishes the ports of every app and forwards none yet
-				elapsed, err := orchestrator.EnsureRuntime(
-					cmd.Context(),
-					servicelocator.GetDockerClient(),
-					cfg,
-					servicelocator.GetBricksIndex(),
-				)
+				// The app containers of an older image or of a deleted app go
+				elapsed, err := orchestrator.EnsureRuntime(cmd.Context(), servicelocator.GetDockerClient(), cfg)
 				if err != nil {
-					// An app without ports runs without the ingress
-					slog.Warn("Ingress unavailable, the apps with ports cannot start", slog.String("error", err.Error()))
+					slog.Warn("App runtime not ready, the apps may not start", slog.String("error", err.Error()))
 				} else {
-					slog.Info("Ingress ready", slog.Duration("elapsed", elapsed))
+					slog.Info("App runtime ready", slog.Duration("elapsed", elapsed))
 				}
 
 				slog.Info("Starting default app")
@@ -82,8 +76,8 @@ func NewDaemonCmd(cfg config.Configuration, version string) *cobra.Command {
 					slog.Info("Default app started")
 				}
 
-				// The apps opened last start warm after a reboot too
-				orchestrator.PrewarmApps(cmd.Context(), servicelocator.GetDockerClient(), cfg, servicelocator.GetPlatform())
+				// Every app of the board starts warm, the ones whose ports the running app holds excepted
+				orchestrator.PrewarmApps(cmd.Context(), servicelocator.GetDockerClient(), cfg, servicelocator.GetPlatform(), servicelocator.GetBricksIndex())
 			}()
 
 			httpHandler(cmd.Context(), cfg, daemonPort, version)

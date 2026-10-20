@@ -164,10 +164,9 @@ func checkApp(
 	return nil
 }
 
-// startApp runs the app Python code in its warm container, in place of the app that ran, brings the
-// sidecars zone to the sidecars of the app and forwards its public ports in the ingress. An app with
-// only a sketch stops the zone and the ingress forwards nothing. bricksIndex and modelsIndex are the
-// ones the app is wired with.
+// startApp runs the app Python code in its warm container, which publishes its public ports, in
+// place of the app that ran, and brings the sidecars zone to the sidecars of the app. An app with
+// only a sketch stops the zone. bricksIndex and modelsIndex are the ones the app is wired with.
 func startApp(
 	ctx context.Context,
 	docker command.Cli,
@@ -243,7 +242,7 @@ func startApp(
 	}
 
 	if appToStart.MainPythonFile == nil {
-		if err := errors.Join(stopWantedApp(ctx, docker.Client(), cfg), silenceIngress(ctx, docker.Client(), cfg), stopSidecars(ctx, docker.Client(), cb)); err != nil {
+		if err := errors.Join(stopWantedApp(ctx, docker.Client(), cfg), stopSidecars(ctx, docker.Client(), cb)); err != nil {
 			return err
 		}
 		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
@@ -297,7 +296,7 @@ func startApp(
 	if err := pullAppImages(ctx, docker, prj, cb); err != nil {
 		return err
 	}
-	return startInAppContainer(ctx, docker, appToStart, ports, bricksIndex, cfg, platform, appEnvs, zone, cb)
+	return startInAppContainer(ctx, docker, appToStart, ports, cfg, platform, appEnvs, zone, cb)
 }
 
 // splitMainService takes the main service out of the project, leaving the sidecars, and returns
@@ -330,15 +329,14 @@ func pullAppImages(ctx context.Context, docker command.Cli, prj *types.Project, 
 }
 
 // startInAppContainer brings the sidecars zone to running, when Docker resolves their names, while a
-// previous, different app stops; then has the app container start the app, while the ingress
-// forwards its ports to it; the bricks retry until the sidecars accept connections. The app itself,
-// when it is the one running, is left to its supervisor, which stops it right before the fork.
+// previous, different app stops; then has the app container, up on the app ports, start the app;
+// the bricks retry until the sidecars accept connections. The app itself, when it is the one
+// running, is left to its supervisor, which stops it right before the fork.
 func startInAppContainer(
 	ctx context.Context,
 	docker command.Cli,
 	appToStart app.ArduinoApp,
 	ports []int,
-	bricksIndex *bricksindex.BricksIndex,
 	cfg config.Configuration,
 	platform platform.Platform,
 	envs map[string]string,
@@ -381,7 +379,7 @@ func startInAppContainer(
 
 	var ready time.Duration
 	if err == nil {
-		ready, err = ensureAppContainer(ctx, docker, cfg, platform, target, appToStart.FullPath, cb)
+		ready, _, err = ensureAppContainer(ctx, docker, cfg, platform, target, appToStart.FullPath, ports, false, cb)
 	}
 	var (
 		started   launcher.StartResponse
@@ -389,22 +387,13 @@ func startInAppContainer(
 	)
 	if err == nil {
 		cb(StreamMessage{data: "Starting the app, preparing its dependencies when they changed"})
-		var (
-			ingress    sync.WaitGroup
-			ingressErr error
-		)
-		ingress.Go(func() { ingressErr = routeIngress(ctx, docker, cfg, bricksIndex, target, ports, cb) })
 		startedAt = time.Now()
 		started, err = target.client(ctx, docker.Client(), cfg).WithTimeout(launcherStartTimeout).Start(ctx, appMountDir, envs)
-		ingress.Wait()
 		err = launcherStartError(err)
-		if ingressErr != nil {
-			err = errors.Join(err, fmt.Errorf("failed to forward the app ports: %w", ingressErr))
-		}
 	}
 	if err != nil {
 		waitOrphans()
-		// Half an app is of no use: stop what started, the ingress forwards nothing
+		// Half an app is of no use: stop what started
 		if stopErr := stopAppProcesses(ctx, docker.Client(), appToStart, cfg, nil); stopErr != nil {
 			slog.Warn("failed to stop the app after a failed start", slog.String("error", stopErr.Error()))
 		}
@@ -492,9 +481,9 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 	return nil
 }
 
-// stopAppProcesses stops the app in its container, which stays warm, then has the ingress forward
-// nothing and stops the sidecars zone unless they belong to another app. The zone stays: the next
-// start of the same app is a plain start.
+// stopAppProcesses stops the app in its container, which stays warm and keeps its ports, then stops
+// the sidecars zone unless it belongs to another app. The zone stays: the next start of the same
+// app is a plain start.
 func stopAppProcesses(ctx context.Context, docker dockerClient.APIClient, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
 	if cb == nil {
 		cb = func(StreamMessage) {}
@@ -511,10 +500,10 @@ func stopAppProcesses(ctx context.Context, docker dockerClient.APIClient, app ap
 		return err
 	}
 	if wanted != nil && !wanted.App.EqualsTo(app.FullPath) {
-		slog.Debug("the sidecars zone and the ports belong to another app, left as they are", slog.String("app", wanted.App.String()))
+		slog.Debug("the sidecars zone belongs to another app, left as it is", slog.String("app", wanted.App.String()))
 		return nil
 	}
-	return errors.Join(silenceIngress(ctx, docker, cfg), stopSidecars(ctx, docker, cb))
+	return stopSidecars(ctx, docker, cb)
 }
 
 // stopWantedApp stops the app that should be running, and forgets it.

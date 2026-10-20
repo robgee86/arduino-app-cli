@@ -11,6 +11,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/compose-spec/compose-go/v2/loader"
@@ -38,43 +40,97 @@ type appContainerSpec struct {
 
 // upAppContainer brings the app container to its compose file through the Docker API, without the
 // compose engine: an unchanged container is started when stopped, a changed one is created again.
-// It returns the container ID.
-func upAppContainer(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration, c appContainer, cb func(StreamMessage)) (string, error) {
+// Docker binds the published ports while a container runs, so the containers of other apps holding
+// the ports are stopped first; with park they are left alone and the container stays stopped. It
+// returns the container ID and whether the container runs.
+func upAppContainer(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration, c appContainer, ports []int, park bool, cb func(StreamMessage)) (string, bool, error) {
 	data, err := c.composeFile(cfg).ReadFile()
 	if err != nil {
-		return "", fmt.Errorf("failed to read the app container compose file: %w", err)
+		return "", false, fmt.Errorf("failed to read the app container compose file: %w", err)
 	}
 	sum := sha256.Sum256(data)
 	definition := hex.EncodeToString(sum[:])
 
 	containers, err := getAppContainers(ctx, docker, c.project)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
+	id := ""
 	if current, ok := containers[mainServiceName]; ok {
 		switch {
 		case current.Labels[appDefinitionLabel] != definition:
 			slog.Debug("the app container definition changed, creating it again", slog.String("container", containerName(current)))
+			if err := removeContainers(ctx, docker, []container.Summary{current}); err != nil {
+				return "", false, err
+			}
 		case current.State == container.StateRunning:
-			return current.ID, nil
+			return current.ID, true, nil
 		case current.State == container.StateCreated || current.State == container.StateExited:
-			slog.Debug("starting the stopped app container", slog.String("container", containerName(current)))
-			return current.ID, startAppContainer(ctx, docker, current.ID)
+			id = current.ID
+		default:
+			if err := removeContainers(ctx, docker, []container.Summary{current}); err != nil {
+				return "", false, err
+			}
 		}
-		if err := removeContainers(ctx, docker, []container.Summary{current}); err != nil {
-			return "", err
+	}
+	if id == "" {
+		spec, err := loadAppContainerSpec(ctx, cfg, c, definition)
+		if err != nil {
+			return "", false, err
+		}
+		if id, err = createAppContainer(ctx, docker, c, spec, cb); err != nil {
+			return "", false, err
 		}
 	}
 
-	spec, err := loadAppContainerSpec(ctx, cfg, c, definition)
+	holders, err := portHolders(ctx, docker, c, ports)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	id, err := createAppContainer(ctx, docker, c, spec, cb)
+	if park && len(holders) > 0 {
+		slog.Debug("the app container waits stopped, its ports are held", slog.String("container", c.containerName()), slog.Any("ports", ports))
+		return id, false, nil
+	}
+	if err := stopPortHolders(ctx, docker, holders, cb); err != nil {
+		return "", false, err
+	}
+	slog.Debug("starting the app container", slog.String("container", c.containerName()))
+	return id, true, startAppContainer(ctx, docker, id)
+}
+
+// portHolders are the running containers of other apps publishing a port of the app: Docker refuses
+// to start a second container on a bound host port.
+func portHolders(ctx context.Context, docker dockerClient.APIClient, c appContainer, ports []int) ([]container.Summary, error) {
+	if len(ports) == 0 {
+		return nil, nil
+	}
+	containers, err := listAppMainContainers(ctx, docker)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return id, startAppContainer(ctx, docker, id)
+	var holders []container.Summary
+	for _, other := range containers {
+		if other.State != container.StateRunning || containerName(other) == c.containerName() {
+			continue
+		}
+		if slices.ContainsFunc(other.Ports, func(p container.PortSummary) bool { return slices.Contains(ports, int(p.PublicPort)) }) {
+			holders = append(holders, other)
+		}
+	}
+	return holders, nil
+}
+
+// stopPortHolders stops the containers so that their ports are free. Their apps stopped already:
+// one app runs at a time and the start stops the previous one before the container of the next.
+func stopPortHolders(ctx context.Context, docker dockerClient.APIClient, holders []container.Summary, cb func(StreamMessage)) error {
+	for _, holder := range holders {
+		cb(StreamMessage{data: fmt.Sprintf("Stopping the container %s, which holds the app ports", containerName(holder))})
+		slog.Info("stopping an app container holding the ports", slog.String("container", containerName(holder)))
+		if _, err := docker.ContainerStop(ctx, holder.ID, dockerClient.ContainerStopOptions{}); err != nil {
+			return fmt.Errorf("failed to stop %s, which holds the app ports: %w", containerName(holder), err)
+		}
+	}
+	return nil
 }
 
 // createAppContainer creates the container, pulling its image when the board does not have it.
@@ -159,12 +215,17 @@ func loadAppContainerSpec(ctx context.Context, cfg config.Configuration, c appCo
 		seconds := int(time.Duration(*svc.StopGracePeriod).Seconds())
 		stopTimeout = &seconds
 	}
+	exposed, bindings, err := publishedPorts(svc.Ports)
+	if err != nil {
+		return appContainerSpec{}, fmt.Errorf("%s publishes an invalid port: %w", file, err)
+	}
 	host := &container.HostConfig{
 		Init:          svc.Init,
 		Mounts:        mounts,
 		GroupAdd:      svc.GroupAdd,
 		ExtraHosts:    svc.ExtraHosts.AsList(":"),
 		NetworkMode:   container.NetworkMode(appsNetwork),
+		PortBindings:  bindings,
 		RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyDisabled},
 		Resources:     container.Resources{DeviceCgroupRules: svc.DeviceCgroupRules},
 	}
@@ -177,15 +238,37 @@ func loadAppContainerSpec(ctx context.Context, cfg config.Configuration, c appCo
 	}
 	return appContainerSpec{
 		config: &container.Config{
-			Image:       svc.Image,
-			User:        svc.User,
-			Entrypoint:  svc.Entrypoint,
-			WorkingDir:  svc.WorkingDir,
-			Env:         env,
-			Labels:      labels,
-			StopTimeout: stopTimeout,
+			Image:        svc.Image,
+			User:         svc.User,
+			Entrypoint:   svc.Entrypoint,
+			WorkingDir:   svc.WorkingDir,
+			Env:          env,
+			Labels:       labels,
+			ExposedPorts: exposed,
+			StopTimeout:  stopTimeout,
 		},
 		host:       host,
 		networking: &network.NetworkingConfig{EndpointsConfig: map[string]*network.EndpointSettings{appsNetwork: {Aliases: aliases}}},
 	}, nil
+}
+
+// publishedPorts turns the ports of a compose service into what the Docker API takes, as compose does.
+func publishedPorts(ports []types.ServicePortConfig) (network.PortSet, network.PortMap, error) {
+	exposed := network.PortSet{}
+	bindings := network.PortMap{}
+	for _, p := range ports {
+		port, err := network.ParsePort(fmt.Sprintf("%d/%s", p.Target, p.Protocol))
+		if err != nil {
+			return nil, nil, err
+		}
+		var hostIP netip.Addr
+		if p.HostIP != "" {
+			if hostIP, err = netip.ParseAddr(p.HostIP); err != nil {
+				return nil, nil, err
+			}
+		}
+		exposed[port] = struct{}{}
+		bindings[port] = append(bindings[port], network.PortBinding{HostIP: hostIP, HostPort: p.Published})
+	}
+	return exposed, bindings, nil
 }
