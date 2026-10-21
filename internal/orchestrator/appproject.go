@@ -13,13 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/arduino/go-paths-helper"
 	"github.com/compose-spec/compose-go/v2/types"
-	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/command"
 	"github.com/moby/moby/api/types/container"
 	dockerClient "github.com/moby/moby/client"
@@ -30,8 +28,9 @@ import (
 )
 
 // appProject is the compose project of an app as rendered on this board, its main service taken
-// out: the launcher runs the app, the sidecars run beside it in the project of the app, on its
-// network, as on main. The project files stay as they are generated, and frozen in a release.
+// out: the launcher runs the app, the sidecars run beside it in the project of the app, as on main,
+// on the network of the launcher instead of one of their own, so that the launcher reaches them by
+// name. The project files stay as they are generated, and frozen in a release.
 type appProject struct {
 	name string
 	prj  *types.Project
@@ -43,6 +42,7 @@ type appProject struct {
 
 func newAppProject(prj *types.Project) (appProject, error) {
 	appEnvs := splitMainService(prj)
+	prj.Networks = types.Networks{"default": types.NetworkConfig{Name: launcherNetwork, External: true}}
 	data, err := json.Marshal(prj.Services)
 	if err != nil {
 		return appProject{}, err
@@ -54,18 +54,6 @@ func newAppProject(prj *types.Project) (appProject, error) {
 // sidecars are the services of the project, the main one gone.
 func (p appProject) sidecars() []string {
 	return p.prj.ServiceNames()
-}
-
-// network is the default network of the project, where its sidecars answer to their service names.
-func (p appProject) network() string {
-	if n, ok := p.prj.Networks["default"]; ok && n.Name != "" {
-		return n.Name
-	}
-	return projectNetwork(p.name)
-}
-
-func projectNetwork(project string) string {
-	return project + "_default"
 }
 
 // projectRecordFile holds the fingerprint of the project the sidecars of the app were created from.
@@ -102,11 +90,10 @@ func (p appProject) recordFingerprint(cfg config.Configuration) error {
 }
 
 // ensureSidecars brings the sidecars of the app up as the project states them, with compose when the
-// project changed or a container is missing, by starting the stopped ones otherwise, has the launcher
-// join the network of the project to reach them by name, and waits until they are ready the way
-// compose waited for the dependencies of the main service: healthy when they have a healthcheck,
-// running otherwise. The app is forked only then, as it was started only then.
-func ensureSidecars(ctx context.Context, docker command.Cli, cfg config.Configuration, p appProject, launcherID string, cb func(StreamMessage)) error {
+// project changed or a container is missing, by starting the stopped ones otherwise, and waits until
+// they are ready the way compose waited for the dependencies of the main service: healthy when they
+// have a healthcheck, running otherwise. The app is forked only then, as it was started only then.
+func ensureSidecars(ctx context.Context, docker command.Cli, cfg config.Configuration, p appProject, cb func(StreamMessage)) error {
 	if len(p.sidecars()) == 0 {
 		return nil
 	}
@@ -124,9 +111,6 @@ func ensureSidecars(ctx context.Context, docker command.Cli, cfg config.Configur
 			return err
 		}
 	} else if err := startAppContainers(ctx, docker.Client(), containers.notRunning(), cb); err != nil {
-		return err
-	}
-	if err := joinNetwork(ctx, docker.Client(), launcherID, p.network()); err != nil {
 		return err
 	}
 	return waitSidecarsReady(ctx, docker.Client(), p)
@@ -169,65 +153,24 @@ func waitSidecarsReady(ctx context.Context, docker dockerClient.APIClient, p app
 	return errors.Join(errs...)
 }
 
-// stopProjectSidecars stops the sidecars of the app project, which stay for the next start, and has the
-// launcher leave the network of the project.
-func stopProjectSidecars(ctx context.Context, docker dockerClient.APIClient, project, launcherID string, cb func(StreamMessage)) error {
+// stopProjectSidecars stops the sidecars of the app project, which stay for the next start.
+func stopProjectSidecars(ctx context.Context, docker dockerClient.APIClient, project string, cb func(StreamMessage)) error {
 	containers, err := getAppContainers(ctx, docker, project)
-	if err != nil || len(containers) == 0 {
-		// Without sidecars the project has no network the launcher joined
+	if err != nil {
 		return err
 	}
-	if err := stopAppContainers(ctx, docker, containers, DefaultDockerStopTimeoutSeconds, cb); err != nil {
-		return err
-	}
-	return leaveNetwork(ctx, docker, launcherID, projectNetwork(project))
+	return stopAppContainers(ctx, docker, containers, DefaultDockerStopTimeoutSeconds, cb)
 }
 
-// joinNetwork connects the launcher to the network of the app, once.
-func joinNetwork(ctx context.Context, docker dockerClient.APIClient, launcherID, network string) error {
-	if launcherID == "" {
-		return errors.New("the app launcher container is missing")
-	}
-	_, err := docker.NetworkConnect(ctx, network, dockerClient.NetworkConnectOptions{Container: launcherID})
-	if err != nil && !strings.Contains(err.Error(), "already exists") {
-		return fmt.Errorf("the app launcher cannot join the network %s: %w", network, err)
-	}
-	return nil
-}
-
-// leaveNetwork disconnects the launcher from the network of an app; a network gone or never joined is nothing to leave.
-func leaveNetwork(ctx context.Context, docker dockerClient.APIClient, launcherID, network string) error {
-	if launcherID == "" {
-		return nil
-	}
-	_, err := docker.NetworkDisconnect(ctx, network, dockerClient.NetworkDisconnectOptions{Container: launcherID, Force: true})
-	if err != nil && !cerrdefs.IsNotFound(err) && !strings.Contains(err.Error(), "is not connected") {
-		return fmt.Errorf("the app launcher cannot leave the network %s: %w", network, err)
-	}
-	return nil
-}
-
-// launcherContainerID is the id of the launcher container, empty without one.
-func launcherContainerID(ctx context.Context, docker dockerClient.APIClient) string {
-	current, err := getContainerWithLabel(ctx, docker, DockerLauncherLabel)
-	if err != nil || current == nil {
-		return ""
-	}
-	return current.ID
-}
-
-// destroyAppProject removes the project of the app, sidecars and network, with its record.
+// destroyAppProject removes the project of the app, its sidecars and their volumes, with its record.
 func destroyAppProject(ctx context.Context, docker command.Cli, cfg config.Configuration, project string) error {
-	if err := leaveNetwork(ctx, docker.Client(), launcherContainerID(ctx, docker.Client()), projectNetwork(project)); err != nil {
-		return err
-	}
 	if err := dockerhelper.ComposeDown(ctx, docker, project, func(string) {}); err != nil {
 		return fmt.Errorf("failed to remove the containers of %s: %w", project, err)
 	}
 	return projectRecordFile(cfg, project).Parent().RemoveAll()
 }
 
-// removeSharedSidecars removes the sidecars project and the network the previous layout shared between the apps.
+// removeSharedSidecars removes the sidecars project of the previous layout and its network.
 func removeSharedSidecars(ctx context.Context, docker command.Cli) {
 	const sharedProject, sharedNetwork = "arduino-sidecars", "arduino-apps"
 	if containers, err := getAppContainers(ctx, docker.Client(), sharedProject); err == nil && len(containers) > 0 {

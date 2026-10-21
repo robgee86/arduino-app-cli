@@ -329,7 +329,7 @@ func pullAppImages(ctx context.Context, docker command.Cli, prj *types.Project, 
 }
 
 // startWithLauncher stops a previous, different app with its sidecars, brings the sidecars of the
-// app project up and ready with the launcher on their network, then has the launcher start the app
+// app project up and ready on the launcher network, then has the launcher start the app
 // on its ports, which the launcher publishes. The app itself, when it is the one running, is left
 // to the launcher, which stops it right before the fork: no separate round trip, and its /app
 // alias stays in place.
@@ -354,7 +354,7 @@ func startWithLauncher(
 	waitOrphans := func() {}
 	envs := project.appEnvs
 	if err == nil {
-		err = ensureSidecars(ctx, docker, cfg, project, launcherContainerID(ctx, docker.Client()), cb)
+		err = ensureSidecars(ctx, docker, cfg, project, cb)
 	}
 
 	if err == nil {
@@ -468,7 +468,7 @@ func stopAppProcesses(ctx context.Context, docker dockerClient.APIClient, app ap
 	if err := stopLauncherApp(ctx, cfg, app.FullPath); err != nil {
 		return err
 	}
-	return stopProjectSidecars(ctx, docker, composeProjectName(app.FullPath, cfg.AppsDir()), launcherContainerID(ctx, docker), cb)
+	return stopProjectSidecars(ctx, docker, composeProjectName(app.FullPath, cfg.AppsDir()), cb)
 }
 
 // stopRunningApp stops the app the launcher should be running, with its sidecars, and forgets it.
@@ -480,7 +480,7 @@ func stopRunningApp(ctx context.Context, docker dockerClient.APIClient, cfg conf
 	if wanted == nil {
 		return nil
 	}
-	return stopProjectSidecars(ctx, docker, composeProjectName(wanted, cfg.AppsDir()), launcherContainerID(ctx, docker), func(StreamMessage) {})
+	return stopProjectSidecars(ctx, docker, composeProjectName(wanted, cfg.AppsDir()), func(StreamMessage) {})
 }
 
 // stopLauncherApp stops the app if the launcher runs it, every app when appPath is nil. An

@@ -37,8 +37,12 @@ import (
 const (
 	DockerLauncherLabel = "cc.arduino.app.launcher"
 
-	launcherProject      = "arduino-app-launcher"
-	launcherServiceName  = "launcher"
+	launcherProject     = "arduino-app-launcher"
+	launcherServiceName = "launcher"
+	// launcherNetwork is the network of the launcher project, created with the launcher at boot: the sidecars of
+	// every app join it, so that the app reaches them by name. A container is addressed by its name,
+	// <project>-<service>-1, unique across apps; the service name alone names the running app's.
+	launcherNetwork      = launcherProject + "_default"
 	launcherSocketDir    = "/run/arduino-app-cli"
 	launcherReadyTimeout = 90 * time.Second
 
@@ -224,9 +228,8 @@ func generateLauncherComposeFile(
 	}{
 		Name:     launcherProject,
 		Services: map[string]service{launcherServiceName: svc},
-		// A network of its own, named here since the compose loader is given no project name: the
-		// launcher joins the network of the app it runs, to reach its sidecars by name
-		Networks: map[string]composeNetwork{"default": {Name: launcherProject + "_default"}},
+		// Named here, since the compose loader is given no project name: the sidecars of the apps join it
+		Networks: map[string]composeNetwork{"default": {Name: launcherNetwork}},
 	}
 	template, err := yaml.Marshal(compose)
 	if err != nil {
