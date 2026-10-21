@@ -484,16 +484,20 @@ func stopProjectSidecars(ctx context.Context, docker dockerClient.APIClient, c a
 	return stopAppContainers(ctx, docker, containers, DefaultDockerStopTimeoutSeconds, cb)
 }
 
-// stopWantedApp stops the app that should be running, and forgets it.
+// stopWantedApp stops the app that should be running, with its sidecars, and forgets it.
 func stopWantedApp(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration) error {
 	wanted := readWantedApp(cfg)
 	if wanted == nil {
 		return nil
 	}
-	if err := stopAppChild(ctx, docker, cfg, appContainerOf(cfg, wanted.App)); err != nil {
+	c := appContainerOf(cfg, wanted.App)
+	if err := stopAppChild(ctx, docker, cfg, c); err != nil {
 		return err
 	}
-	return clearWantedApp(cfg, wanted.App)
+	if err := clearWantedApp(cfg, wanted.App); err != nil {
+		return err
+	}
+	return stopProjectSidecars(ctx, docker, c, func(StreamMessage) {})
 }
 
 func StopApp(ctx context.Context, dockerClient command.Cli, platform platform.Platform, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
