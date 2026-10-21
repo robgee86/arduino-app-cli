@@ -31,15 +31,19 @@ func Init(cfg config.Configuration) {
 }
 
 var (
+	// The indexes read the asset folder, which the provisioner writes: whoever asks first at boot waits for it
 	GetBricksIndex = sync.OnceValue(func() *bricksindex.BricksIndex {
+		GetProvisioner()
 		return f.Must(bricksindex.Load(GetPlatform(), globalConfig.AssetDir()))
 	})
 
 	GetModelsIndex = sync.OnceValue(func() *modelsindex.ModelsIndex {
+		GetProvisioner()
 		return f.Must(modelsindex.Load(GetPlatform(), globalConfig.AssetDir(), globalConfig.ModelsDir(), globalConfig.CustomModelsDir(), GetDockerClient().Client(), globalConfig))
 	})
 
 	GetServicesIndex = sync.OnceValue(func() *servicesindex.ServicesIndex {
+		GetProvisioner()
 		return f.Must(servicesindex.Load(GetPlatform(), globalConfig.AssetDir().Join("services")))
 	})
 

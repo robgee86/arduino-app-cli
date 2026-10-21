@@ -6,10 +6,10 @@
 package orchestrator
 
 import (
+	"context"
 	"fmt"
-	"maps"
 	"os"
-	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +17,7 @@ import (
 	"github.com/compose-spec/compose-go/v2/loader"
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/moby/moby/api/types/container"
+	dockerClient "github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -155,133 +156,100 @@ func TestSplitMainService(t *testing.T) {
 	assert.Equal(t, a.FullPath.String(), envs["APP_HOME"])
 }
 
-func TestGenerateSidecarsZone(t *testing.T) {
+func TestNewAppProject(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
 	bricksIndex, servicesIndex := setTestBricks(t, cfg)
-	zoneFor := func(a app.ArduinoApp) sidecarsZone {
-		prj := renderTestApp(t, cfg, &a, bricksIndex, servicesIndex, types.Mapping{"FOO": "bar"})
-		splitMainService(prj)
-		zone, err := generateSidecarsZone(prj, cfg)
+	a := newTestApp(t, cfg, "with-sidecar", "arduino:web_ui", "arduino:object_detection")
+
+	project, err := newAppProject(renderTestApp(t, cfg, &a, bricksIndex, servicesIndex, types.Mapping{"FOO": "bar"}))
+	require.NoError(t, err)
+	assert.Equal(t, "with-sidecar", project.name)
+	assert.Equal(t, []string{"ei-obj-detection-runner"}, project.sidecars(), "the main service is the launcher's")
+	assert.Equal(t, "with-sidecar_default", project.network())
+	assert.Equal(t, "bar", project.appEnvs["FOO"])
+
+	t.Run("the same app renders the same fingerprint", func(t *testing.T) {
+		again, err := newAppProject(renderTestApp(t, cfg, &a, bricksIndex, servicesIndex, types.Mapping{"FOO": "bar"}))
 		require.NoError(t, err)
-		return zone
-	}
-	zoneFile := func() string {
-		compose, err := sidecarsComposeFile(cfg).ReadFile()
+		assert.Equal(t, project.fingerprint, again.fingerprint)
+	})
+
+	t.Run("another app environment changes the sidecars, as on main", func(t *testing.T) {
+		again, err := newAppProject(renderTestApp(t, cfg, &a, bricksIndex, servicesIndex, types.Mapping{"FOO": "baz"}))
 		require.NoError(t, err)
-		return string(compose)
-	}
-
-	first := newTestApp(t, cfg, "first", "arduino:web_ui", "arduino:object_detection")
-	zone := zoneFor(first)
-	assert.Equal(t, []string{"ei-obj-detection-runner"}, zone.services)
-	assert.Equal(t, []string{"ei-obj-detection-runner"}, slices.Sorted(maps.Keys(zone.fingerprints)))
-
-	t.Run("sidecars only, on the shared network", func(t *testing.T) {
-		project := loadCompose(t, sidecarsComposeFile(cfg))
-		assert.Equal(t, sidecarsProject, project.Name)
-		assert.Equal(t, []string{"ei-obj-detection-runner"}, project.ServiceNames())
-		sidecar := project.Services["ei-obj-detection-runner"]
-		assert.Empty(t, sidecar.DependsOn)
-		assert.Equal(t, map[string]string{DockerAppLabel: "true"}, map[string]string(sidecar.Labels), "nothing names the app")
-		assert.Equal(t, "bar", *sidecar.Environment["FOO"])
-		assert.NotContains(t, sidecar.Environment, "APP_HOME")
-
-		network := project.Networks["default"]
-		assert.Equal(t, launcherNetwork, network.Name)
-		assert.True(t, bool(network.External))
+		assert.NotEqual(t, project.fingerprint, again.fingerprint)
 	})
 
-	t.Run("another app with the same sidecars generates the same zone", func(t *testing.T) {
-		before := zoneFile()
-		second := newTestApp(t, cfg, "second", "arduino:object_detection", "arduino:custom_ui")
-		again := zoneFor(second)
-		assert.Equal(t, before, zoneFile())
-		assert.Equal(t, zone.services, again.services)
-		assert.Equal(t, zone.fingerprints, again.fingerprints)
-	})
-
-	t.Run("a sidecar mounting the app folder tells two apps apart", func(t *testing.T) {
-		one := newTestApp(t, cfg, "one", "arduino:storage")
-		oneZone := zoneFor(one)
-
-		other := newTestApp(t, cfg, "other", "arduino:storage")
-		otherZone := zoneFor(other)
-		assert.NotEqual(t, oneZone.fingerprints["storage-db"], otherZone.fingerprints["storage-db"], "the resolved volumes differ")
-		assert.Contains(t, zoneFile(), other.FullPath.Join("data", "db").String())
-		assert.True(t, other.FullPath.Join("data", "db").IsDir(), "the volume folder is pre-provisioned")
-	})
-
-	t.Run("a named volume is the zone's, whatever the app", func(t *testing.T) {
-		a := newTestApp(t, cfg, "cached", "arduino:cache")
-		cached := zoneFor(a)
-		assert.Equal(t, sidecarsProject+"_cache-data", cached.project.Volumes["cache-data"].Name)
-		assert.NotContains(t, zoneFile(), "cached_cache-data")
-	})
-
-	t.Run("no sidecars, no zone files", func(t *testing.T) {
-		a := newTestApp(t, cfg, "ui-only", "arduino:web_ui")
-		empty := zoneFor(a)
-		assert.Empty(t, empty.services)
-		assert.Equal(t, map[string]string{}, empty.fingerprints, "an empty zone, not an unresolved one")
-		assert.True(t, sidecarsComposeFile(cfg).NotExist())
-		assert.Nil(t, readSidecarsRecord(cfg), "the record is left to the reconcile")
+	t.Run("the record remembers the fingerprint", func(t *testing.T) {
+		assert.Empty(t, project.recordedFingerprint(cfg))
+		require.NoError(t, project.recordFingerprint(cfg))
+		assert.Equal(t, project.fingerprint, project.recordedFingerprint(cfg))
+		assert.True(t, cfg.DataDir().Join("apps", "with-sidecar", "project.json").Exist())
 	})
 }
 
-func TestSidecarsRecord(t *testing.T) {
+// inspectingDocker answers the container list of one project and an inspect per container id, the
+// health of a container improving at each inspect.
+type inspectingDocker struct {
+	*fakeDocker
+	containers []container.Summary
+	health     map[string][]container.HealthStatus
+	mu         sync.Mutex
+}
+
+func (f *inspectingDocker) ContainerList(context.Context, dockerClient.ContainerListOptions) (dockerClient.ContainerListResult, error) {
+	return dockerClient.ContainerListResult{Items: f.containers}, nil
+}
+
+func (f *inspectingDocker) ContainerInspect(_ context.Context, id string, _ dockerClient.ContainerInspectOptions) (dockerClient.ContainerInspectResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	state := &container.State{Running: true, Status: container.StateRunning}
+	if steps := f.health[id]; len(steps) > 0 {
+		state.Health = &container.Health{Status: steps[0]}
+		if len(steps) > 1 {
+			f.health[id] = steps[1:]
+		}
+	}
+	return dockerClient.ContainerInspectResult{Container: container.InspectResponse{State: state}}, nil
+}
+
+func TestWaitSidecarsReady(t *testing.T) {
 	cfg := setTestOrchestratorConfig(t)
-	assert.Nil(t, readSidecarsRecord(cfg))
-	require.NoError(t, writeSidecarsRecord(cfg, map[string]string{"runner": "abc"}))
-	assert.Equal(t, map[string]string{"runner": "abc"}, readSidecarsRecord(cfg))
-	require.NoError(t, writeSidecarsRecord(cfg, map[string]string{}))
-	assert.Equal(t, map[string]string{}, readSidecarsRecord(cfg), "an empty zone is recorded")
-	require.NoError(t, writeSidecarsRecord(cfg, nil))
-	assert.Nil(t, readSidecarsRecord(cfg))
-	require.NoError(t, writeSidecarsRecord(cfg, nil), "forgetting twice is fine")
-}
-
-func TestPlanSidecars(t *testing.T) {
-	running := container.Summary{State: container.StateRunning}
-	exited := container.Summary{State: container.StateExited}
-	recorded := map[string]string{"runner": "r1", "db": "d1"}
-	both := appContainers{"runner": running, "db": running}
-
-	for _, tc := range []struct {
-		name       string
-		zone       sidecarsZone
-		recorded   map[string]string
-		containers appContainers
-		want       sidecarsPlan
-	}{
-		{name: "unchanged and running", zone: sidecarsZone{services: []string{"db", "runner"}, fingerprints: recorded}, recorded: recorded, containers: both, want: sidecarsKeep},
-		{name: "a subset of what runs", zone: sidecarsZone{services: []string{"runner"}, fingerprints: map[string]string{"runner": "r1"}}, recorded: recorded, containers: both, want: sidecarsKeep},
-		{name: "no sidecars", zone: sidecarsZone{fingerprints: map[string]string{}}, recorded: recorded, containers: both, want: sidecarsKeep},
-		{name: "unchanged and stopped", zone: sidecarsZone{services: []string{"runner"}, fingerprints: map[string]string{"runner": "r1"}}, recorded: recorded, containers: appContainers{"runner": exited}, want: sidecarsStart},
-		{name: "a changed service", zone: sidecarsZone{services: []string{"runner"}, fingerprints: map[string]string{"runner": "r2"}}, recorded: recorded, containers: both, want: sidecarsUp},
-		{name: "a new service", zone: sidecarsZone{services: []string{"runner", "web"}, fingerprints: map[string]string{"runner": "r1", "web": "w1"}}, recorded: recorded, containers: both, want: sidecarsUp},
-		{name: "a removed container", zone: sidecarsZone{services: []string{"db"}, fingerprints: map[string]string{"db": "d1"}}, recorded: recorded, containers: appContainers{"runner": running}, want: sidecarsUp},
-		{name: "no record", zone: sidecarsZone{services: []string{"runner"}, fingerprints: map[string]string{"runner": "r1"}}, containers: both, want: sidecarsUp},
-		{name: "an unresolved zone", zone: sidecarsZone{services: []string{"runner"}}, recorded: recorded, containers: both, want: sidecarsUp},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, planSidecars(tc.zone, tc.recorded, tc.containers))
-		})
+	bricksIndex, servicesIndex := setTestBricks(t, cfg)
+	a := newTestApp(t, cfg, "with-sidecar", "arduino:web_ui", "arduino:object_detection")
+	project, err := newAppProject(renderTestApp(t, cfg, &a, bricksIndex, servicesIndex, types.Mapping{}))
+	require.NoError(t, err)
+	const runner = "ei-obj-detection-runner"
+	require.NotNil(t, project.prj.Services[runner].HealthCheck, "the test sidecar declares a healthcheck")
+	ctr := func(service, id string) container.Summary {
+		return container.Summary{ID: id, Names: []string{"/" + project.name + "-" + service + "-1"}, State: container.StateRunning, Labels: map[string]string{composeProjectLabel: project.name, composeServiceLabel: service}}
 	}
-}
 
-func TestAppContainers(t *testing.T) {
-	zoneContainer := func(service string, state container.ContainerState) container.Summary {
-		return container.Summary{ID: service, State: state, Labels: map[string]string{DockerAppLabel: "true", composeProjectLabel: sidecarsProject, composeServiceLabel: service}}
-	}
-	legacyContainer := container.Summary{ID: "old", State: container.StateRunning, Labels: map[string]string{DockerAppLabel: "true", composeProjectLabel: "my-app", composeServiceLabel: "runner"}}
+	t.Run("a healthy sidecar is waited for until its healthcheck passes", func(t *testing.T) {
+		docker := &inspectingDocker{fakeDocker: newFakeDocker(t), containers: []container.Summary{ctr(runner, "runner")},
+			health: map[string][]container.HealthStatus{"runner": {container.Starting, container.Starting, container.Healthy}}}
+		require.NoError(t, waitSidecarsReady(t.Context(), docker, project))
+		assert.Equal(t, []container.HealthStatus{container.Healthy}, docker.health["runner"], "polled until healthy")
+	})
 
-	zone, legacy := splitAppContainers([]container.Summary{zoneContainer("runner", container.StateRunning), zoneContainer("db", container.StateExited), legacyContainer})
-	assert.Equal(t, []container.Summary{legacyContainer}, legacy)
-	assert.True(t, zone.cover([]string{"runner", "db"}))
-	assert.False(t, zone.cover([]string{"runner", "other"}))
-	assert.Equal(t, []string{"db"}, slices.Collect(maps.Keys(zone.notRunning())))
-	assert.Equal(t, []string{"runner"}, slices.Collect(maps.Keys(zone.only([]string{"runner", "other"}))))
-	assert.Equal(t, []container.Summary{zone["db"]}, zone.orphans([]string{"runner"}))
+	t.Run("an unhealthy sidecar fails the start", func(t *testing.T) {
+		docker := &inspectingDocker{fakeDocker: newFakeDocker(t), containers: []container.Summary{ctr(runner, "runner")},
+			health: map[string][]container.HealthStatus{"runner": {container.Unhealthy}}}
+		require.ErrorContains(t, waitSidecarsReady(t.Context(), docker, project), "ei-obj-detection-runner-1 is not ready: the container is unhealthy")
+	})
+
+	t.Run("a missing sidecar container fails the start", func(t *testing.T) {
+		docker := &inspectingDocker{fakeDocker: newFakeDocker(t)}
+		require.ErrorContains(t, waitSidecarsReady(t.Context(), docker, project), "has no container")
+	})
+
+	t.Run("an app without sidecars waits for nothing", func(t *testing.T) {
+		plain := newTestApp(t, cfg, "plain", "arduino:web_ui")
+		project, err := newAppProject(renderTestApp(t, cfg, &plain, bricksIndex, servicesIndex, types.Mapping{}))
+		require.NoError(t, err)
+		require.NoError(t, waitSidecarsReady(t.Context(), newFakeDocker(t), project))
+	})
 }
 
 func TestGenerateLauncherComposeFile(t *testing.T) {
@@ -342,7 +310,7 @@ func TestGenerateLauncherComposeFile(t *testing.T) {
 	assert.NotContains(t, targets, "/app")
 
 	network := project.Networks["default"]
-	assert.Equal(t, launcherNetwork, network.Name)
+	assert.Equal(t, "arduino-app-launcher_default", network.Name, "a network of its own, the launcher joins the network of the app it runs")
 	assert.False(t, bool(network.External))
 
 	t.Run("a second generation changes nothing", func(t *testing.T) {

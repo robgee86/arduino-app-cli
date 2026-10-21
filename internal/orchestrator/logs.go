@@ -25,6 +25,7 @@ import (
 	"github.com/arduino/arduino-app-cli/internal/helpers"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/app"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/bricksindex"
+	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/servicesindex"
 )
 
@@ -54,6 +55,7 @@ func AppLogs(
 	app app.ArduinoApp,
 	req AppLogsRequest,
 	dockerCli command.Cli,
+	cfg config.Configuration,
 	bricksIndex *bricksindex.BricksIndex,
 	servicesIndex *servicesindex.ServicesIndex,
 ) (iter.Seq[LogMessage], error) {
@@ -69,7 +71,7 @@ func AppLogs(
 		})
 	}
 	if req.ShowServicesLogs {
-		source, err := sidecarLogs(ctx, app, req, dockerCli, app.Bricks(bricksIndex), servicesIndex)
+		source, err := sidecarLogs(ctx, app, req, dockerCli, cfg, app.Bricks(bricksIndex), servicesIndex)
 		if err != nil {
 			return nil, err
 		}
@@ -118,17 +120,19 @@ func mergeLogSources(ctx context.Context, sources ...logSource) iter.Seq[LogMess
 	}
 }
 
-// sidecarLogs yields the logs of the zone services that are sidecars of the app, attributing each
-// to its brick when its index tells, nil when the zone runs none of them. The sidecars are the ones
+// sidecarLogs yields the logs of the sidecars of the app project, attributing each to its brick when
+// its index tells, nil without any. The sidecars are the ones
 // the last start rendered: a release ships no brick compose file, only the copies it froze.
 func sidecarLogs(
 	ctx context.Context,
 	app app.ArduinoApp,
 	req AppLogsRequest,
 	dockerCli command.Cli,
+	cfg config.Configuration,
 	bricksIndex *bricksindex.BricksIndex,
 	servicesIndex *servicesindex.ServicesIndex,
 ) (logSource, error) {
+	project := composeProjectName(app.FullPath, cfg.AppsDir())
 	serviceToBrickMapping, err := serviceBricks(app, bricksIndex, servicesIndex)
 	if err != nil {
 		return nil, err
@@ -140,7 +144,7 @@ func sidecarLogs(
 	if err != nil {
 		return nil, err
 	}
-	containers, err := getAppContainers(ctx, dockerCli.Client(), sidecarsProject)
+	containers, err := getAppContainers(ctx, dockerCli.Client(), project)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +175,7 @@ func sidecarLogs(
 		}
 		err := backend.Logs(
 			ctx,
-			sidecarsProject,
+			project,
 			NewDockerLogConsumer(ctx, yield, serviceToBrickMapping),
 			opts,
 		)

@@ -165,8 +165,9 @@ func checkApp(
 }
 
 // startApp runs the app Python code in the launcher, which replaces the app it ran and publishes
-// its public ports, and brings the sidecars zone to the sidecars of the app. An app with only a
-// sketch stops the zone. bricksIndex and modelsIndex are the ones the app is wired with.
+// its public ports, with the sidecars of the app project running beside it on their own network.
+// An app with only a sketch stops the running app. bricksIndex and modelsIndex are the ones the app
+// is wired with.
 func startApp(
 	ctx context.Context,
 	docker command.Cli,
@@ -242,7 +243,7 @@ func startApp(
 	}
 
 	if appToStart.MainPythonFile == nil {
-		if err := errors.Join(stopLauncherApp(ctx, cfg, nil), stopSidecars(ctx, docker.Client(), cb)); err != nil {
+		if err := stopRunningApp(ctx, docker.Client(), cfg); err != nil {
 			return err
 		}
 		cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
@@ -276,9 +277,8 @@ func startApp(
 	if err != nil {
 		return err
 	}
-	// The launcher runs the app with the environment of its main service, the zone the rest
-	launcherEnv := splitMainService(prj)
-	zone, err := generateSidecarsZone(prj, cfg)
+	// The launcher runs the app with the environment of its main service, the sidecars stay in the project
+	project, err := newAppProject(prj)
 	if err != nil {
 		return err
 	}
@@ -296,7 +296,7 @@ func startApp(
 	if err := pullAppImages(ctx, docker, prj, cb); err != nil {
 		return err
 	}
-	return startWithLauncher(ctx, docker, appToStart, ports, cfg, launcherEnv, zone, cb)
+	return startWithLauncher(ctx, docker, appToStart, ports, cfg, project, cb)
 }
 
 // splitMainService takes the main service out of the project, leaving the sidecars, and returns
@@ -328,52 +328,33 @@ func pullAppImages(ctx context.Context, docker command.Cli, prj *types.Project, 
 		})
 }
 
-// startWithLauncher brings the sidecars zone to running, when Docker resolves their names, then has
-// the launcher start the app on its ports, which the launcher publishes; the bricks retry until
-// the sidecars accept connections. A previous, different app stops meanwhile; the app itself, when
-// it is the one running, is left to the launcher, which stops it right before the fork: no separate
-// round trip, and its /app alias stays in place.
+// startWithLauncher stops a previous, different app with its sidecars, brings the sidecars of the
+// app project up and ready with the launcher on their network, then has the launcher start the app
+// on its ports, which the launcher publishes. The app itself, when it is the one running, is left
+// to the launcher, which stops it right before the fork: no separate round trip, and its /app
+// alias stays in place.
 func startWithLauncher(
 	ctx context.Context,
 	docker command.Cli,
 	appToStart app.ArduinoApp,
 	ports []int,
 	cfg config.Configuration,
-	envs map[string]string,
-	zone sidecarsZone,
+	project appProject,
 	cb func(StreamMessage),
 ) error {
-	var (
-		wg              sync.WaitGroup
-		previousStopErr error
-	)
 	stopping := time.Now()
 	var stopped time.Duration
 	wanted := readLauncherWantedApp(cfg)
 	reload := wanted != nil && wanted.EqualsTo(appToStart.FullPath)
+	var err error
 	if !reload {
-		wg.Go(func() {
-			previousStopErr = stopLauncherApp(ctx, cfg, nil)
-			stopped = time.Since(stopping)
-		})
+		err = stopRunningApp(ctx, docker.Client(), cfg)
+		stopped = time.Since(stopping)
 	}
-	removeOrphans, sidecarsErr := reconcileSidecars(ctx, docker, cfg, zone, cb)
-	wg.Wait()
-
-	err := errors.Join(previousStopErr, sidecarsErr)
-	// Nothing was created: the orphans go while the app starts, the previous app is already stopped
-	var (
-		orphans    sync.WaitGroup
-		orphansErr error
-	)
-	if err == nil && removeOrphans != nil {
-		orphans.Go(func() { orphansErr = removeOrphans() })
-	}
-	waitOrphans := func() {
-		orphans.Wait()
-		if orphansErr != nil {
-			slog.Warn("failed to remove the sidecars the app does not use, retried at the next start", slog.String("error", orphansErr.Error()))
-		}
+	waitOrphans := func() {}
+	envs := project.appEnvs
+	if err == nil {
+		err = ensureSidecars(ctx, docker, cfg, project, launcherContainerID(ctx, docker.Client()), cb)
 	}
 
 	if err == nil {
@@ -475,8 +456,8 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 	return nil
 }
 
-// stopAppProcesses stops the app launcher child, then the sidecars zone unless it runs the
-// sidecars of another app. The zone stays: the next start of the same app is a plain start.
+// stopAppProcesses stops the app launcher child, then the sidecars of the app project, which stay
+// for the next start.
 func stopAppProcesses(ctx context.Context, docker dockerClient.APIClient, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
 	if cb == nil {
 		cb = func(StreamMessage) {}
@@ -484,16 +465,22 @@ func stopAppProcesses(ctx context.Context, docker dockerClient.APIClient, app ap
 	if app.MainPythonFile == nil {
 		return nil
 	}
-	// Read before the stop, which forgets it
-	wanted := readLauncherWantedApp(cfg)
 	if err := stopLauncherApp(ctx, cfg, app.FullPath); err != nil {
 		return err
 	}
-	if wanted != nil && !wanted.EqualsTo(app.FullPath) {
-		slog.Debug("the sidecars zone runs another app, left running", slog.String("app", wanted.String()))
+	return stopProjectSidecars(ctx, docker, composeProjectName(app.FullPath, cfg.AppsDir()), launcherContainerID(ctx, docker), cb)
+}
+
+// stopRunningApp stops the app the launcher should be running, with its sidecars, and forgets it.
+func stopRunningApp(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration) error {
+	wanted := readLauncherWantedApp(cfg)
+	if err := stopLauncherApp(ctx, cfg, nil); err != nil {
+		return err
+	}
+	if wanted == nil {
 		return nil
 	}
-	return stopSidecars(ctx, docker, cb)
+	return stopProjectSidecars(ctx, docker, composeProjectName(wanted, cfg.AppsDir()), launcherContainerID(ctx, docker), func(StreamMessage) {})
 }
 
 // stopLauncherApp stops the app if the launcher runs it, every app when appPath is nil. An
@@ -533,6 +520,11 @@ func StopAndDestroyApp(ctx context.Context, dockerClient command.Cli, platform p
 func stopAndDestroyApp(ctx context.Context, dockerClient command.Cli, platform platform.Platform, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
 	if err := stopAppWithCmd(ctx, dockerClient, platform, app, cfg, "down", cb); err != nil {
 		return err
+	}
+	if app.MainPythonFile != nil {
+		if err := destroyAppProject(ctx, dockerClient, cfg, composeProjectName(app.FullPath, cfg.AppsDir())); err != nil {
+			return err
+		}
 	}
 	if err := cleanAppCacheFiles(app, cb); err != nil {
 		return err

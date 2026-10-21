@@ -37,10 +37,8 @@ import (
 const (
 	DockerLauncherLabel = "cc.arduino.app.launcher"
 
-	launcherProject     = "arduino-app-launcher"
-	launcherServiceName = "launcher"
-	// launcherNetwork is shared by the launcher and the app sidecars, which reach each other by service name.
-	launcherNetwork      = "arduino-apps"
+	launcherProject      = "arduino-app-launcher"
+	launcherServiceName  = "launcher"
 	launcherSocketDir    = "/run/arduino-app-cli"
 	launcherReadyTimeout = 90 * time.Second
 
@@ -226,7 +224,9 @@ func generateLauncherComposeFile(
 	}{
 		Name:     launcherProject,
 		Services: map[string]service{launcherServiceName: svc},
-		Networks: map[string]composeNetwork{"default": {Name: launcherNetwork}},
+		// A network of its own, named here since the compose loader is given no project name: the
+		// launcher joins the network of the app it runs, to reach its sidecars by name
+		Networks: map[string]composeNetwork{"default": {Name: launcherProject + "_default"}},
 	}
 	template, err := yaml.Marshal(compose)
 	if err != nil {
@@ -451,7 +451,8 @@ func clearLauncherWantedApp(cfg config.Configuration, appPath *paths.Path) error
 }
 
 // EnsureLauncher brings the launcher up on the ports of the apps on the board, recreating it on a
-// new image or port. When stopApps, as the daemon does at boot, it stops what the launcher runs.
+// new image or port, and removes what the previous layout shared between the apps. When stopApps,
+// as the daemon does at boot, it stops what the launcher runs.
 func EnsureLauncher(
 	ctx context.Context,
 	docker command.Cli,
@@ -465,10 +466,11 @@ func EnsureLauncher(
 		if _, err := ensureLauncher(ctx, docker, launcherPorts(cfg, bricksIndex), cfg, platform, true, func(StreamMessage) {}); err != nil {
 			return err
 		}
+		removeSharedSidecars(ctx, docker)
 		if !stopApps {
 			return nil
 		}
-		return stopLauncherApp(ctx, cfg, nil)
+		return stopRunningApp(ctx, docker.Client(), cfg)
 	})
 	return time.Since(started), err
 }

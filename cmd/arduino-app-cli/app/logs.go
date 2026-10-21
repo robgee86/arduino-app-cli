@@ -37,7 +37,7 @@ func newLogsCmd(cfg config.Configuration) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return logsHandler(cmd.Context(), app, &tail, follow, all)
+			return logsHandler(cmd.Context(), cfg, app, &tail, follow, all)
 		},
 		ValidArgsFunction: completion.ApplicationNames(cfg),
 	}
@@ -47,7 +47,7 @@ func newLogsCmd(cfg config.Configuration) *cobra.Command {
 	return cmd
 }
 
-func logsHandler(ctx context.Context, app app.ArduinoApp, tail *uint64, follow, all bool) error {
+func logsHandler(ctx context.Context, cfg config.Configuration, app app.ArduinoApp, tail *uint64, follow, all bool) error {
 	stdout, _, err := feedback.DirectStreams()
 	if err != nil {
 		feedback.Fatal(err.Error(), feedback.ErrBadArgument)
@@ -67,6 +67,7 @@ func logsHandler(ctx context.Context, app app.ArduinoApp, tail *uint64, follow, 
 		app,
 		req,
 		servicelocator.GetDockerClient(),
+		cfg,
 		servicelocator.GetBricksIndex(),
 		servicelocator.GetServicesIndex(),
 	)

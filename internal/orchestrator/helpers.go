@@ -32,22 +32,20 @@ type AppStatusInfo struct {
 	Status  Status
 }
 
-// sidecarsStatus is the overall status of the zone containers of the services, all of them when
-// services is nil, empty without containers or when it cannot tell:
+// sidecarsStatus is the overall status of the sidecars of the project, empty without any or when
+// it cannot tell:
 //
 //	running: all running
 //	stopped: all stopped
 //	failed: at least one failed
 //	stopping: at least one stopping
 //	starting: at least one starting
-func sidecarsStatus(containers []container.Summary, services []string) Status {
-	zone, _ := splitAppContainers(containers)
-	if services != nil {
-		zone = zone.only(services)
-	}
-	s := make([]Status, 0, len(zone))
-	for _, c := range zone {
-		s = append(s, StatusFromDockerState(c.State, c.Status))
+func sidecarsStatus(containers []container.Summary, project string) Status {
+	var s []Status
+	for _, c := range containers {
+		if c.Labels[composeProjectLabel] == project && c.Labels[DockerLauncherLabel] != "true" {
+			s = append(s, StatusFromDockerState(c.State, c.Status))
+		}
 	}
 	switch {
 	case len(s) == 0:
@@ -67,19 +65,18 @@ func sidecarsStatus(containers []container.Summary, services []string) Status {
 	}
 }
 
-// launcherView is what the launcher runs, the app it should be running, and the zone services
-// that are its sidecars: nil without record, then every zone container counts.
+// launcherView is what the launcher runs, the app it should be running and its compose project.
 type launcherView struct {
 	children []launcher.Child
 	wanted   *paths.Path
-	sidecars []string
+	project  string
 }
 
 // readLauncherView asks the launcher for its children. An unreachable launcher runs nothing.
 func readLauncherView(ctx context.Context, cfg config.Configuration) launcherView {
 	view := launcherView{wanted: readLauncherWantedApp(cfg)}
-	if record := readSidecarsRecord(cfg); record != nil {
-		view.sidecars = slices.Collect(maps.Keys(record))
+	if view.wanted != nil {
+		view.project = composeProjectName(view.wanted, cfg.AppsDir())
 	}
 	status, err := newLauncherClient(cfg).Status(ctx)
 	if err != nil {
@@ -90,12 +87,10 @@ func readLauncherView(ctx context.Context, cfg config.Configuration) launcherVie
 	return view
 }
 
-// mergeAppStatus combines the sidecars zone with the launcher children: the zone runs the sidecars
-// of the wanted app. An app neither run nor wanted is idle: its sidecar exit codes come from the
-// stop, and a runner may exit 0 on SIGTERM.
+// mergeAppStatus combines the sidecars of the wanted app with the launcher children. An app neither
+// run nor wanted is idle: its sidecar exit codes come from the stop, and a runner may exit 0 on SIGTERM.
 func mergeAppStatus(containers []container.Summary, view launcherView) []AppStatusInfo {
-	// The orphans being removed alongside a start are no sidecars of the app
-	zone := sidecarsStatus(containers, view.sidecars)
+	zone := sidecarsStatus(containers, view.project)
 	children := make(map[string]launcher.Child, len(view.children))
 	for _, c := range view.children {
 		children[filepath.Clean(c.App)] = c
@@ -149,7 +144,7 @@ func idleAppStatus(appPath *paths.Path) Status {
 	return StatusUninitialized
 }
 
-// listAppContainers lists the app containers, running or not: the sidecars zone and the per-app projects of the older versions.
+// listAppContainers lists the app containers, running or not: the sidecars of every app project.
 func listAppContainers(ctx context.Context, docker dockerClient.APIClient) ([]container.Summary, error) {
 	containers, err := dockerhelper.Containers(ctx, docker, DockerAppLabel+"=true")
 	if err != nil {

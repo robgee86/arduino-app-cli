@@ -36,7 +36,7 @@ func TestMergeAppStatus(t *testing.T) {
 		return named(project, fmt.Sprintf("runner-%d", services), state, status)
 	}
 	zone := func(state container.ContainerState, status string) container.Summary {
-		return sidecar(sidecarsProject, state, status)
+		return sidecar("a", state, status)
 	}
 	child := func(appPath, state string) launcher.Child {
 		return launcher.Child{App: appPath, State: state}
@@ -50,49 +50,43 @@ func TestMergeAppStatus(t *testing.T) {
 	}{
 		{
 			name: "a child without sidecars runs",
-			view: launcherView{children: []launcher.Child{child(appA, launcher.StateRunning)}, wanted: paths.New(appA)},
+			view: launcherView{children: []launcher.Child{child(appA, launcher.StateRunning)}, wanted: paths.New(appA), project: "a"},
 			want: map[string]Status{appA: StatusRunning},
 		},
 		{
 			name:       "a child with running sidecars runs",
 			containers: []container.Summary{zone(container.StateRunning, "Up")},
-			view:       launcherView{children: []launcher.Child{child(appA, launcher.StateRunning)}, wanted: paths.New(appA)},
+			view:       launcherView{children: []launcher.Child{child(appA, launcher.StateRunning)}, wanted: paths.New(appA), project: "a"},
 			want:       map[string]Status{appA: StatusRunning},
 		},
 		{
 			name:       "a child with restarting sidecars starts",
 			containers: []container.Summary{zone(container.StateRunning, "Up"), zone(container.StateRestarting, "Restarting")},
-			view:       launcherView{children: []launcher.Child{child(appA, launcher.StateRunning)}, wanted: paths.New(appA)},
+			view:       launcherView{children: []launcher.Child{child(appA, launcher.StateRunning)}, wanted: paths.New(appA), project: "a"},
 			want:       map[string]Status{appA: StatusStarting},
 		},
 		{
 			name:       "a failed sidecar fails the app",
 			containers: []container.Summary{zone(container.StateExited, "Exited (1) 3 seconds ago")},
-			view:       launcherView{children: []launcher.Child{child(appA, launcher.StateRunning)}, wanted: paths.New(appA)},
+			view:       launcherView{children: []launcher.Child{child(appA, launcher.StateRunning)}, wanted: paths.New(appA), project: "a"},
 			want:       map[string]Status{appA: StatusFailed},
 		},
 		{
 			name:       "a failed sidecar fails the wanted app whose child is gone",
 			containers: []container.Summary{zone(container.StateExited, "Exited (1) 3 seconds ago")},
-			view:       launcherView{wanted: paths.New(appA)},
+			view:       launcherView{wanted: paths.New(appA), project: "a"},
 			want:       map[string]Status{appA: StatusFailed},
 		},
 		{
-			name:       "the zone runs the sidecars of the wanted app only",
-			containers: []container.Summary{zone(container.StateRunning, "Up"), zone(container.StateExited, "Exited (1) 3 seconds ago")},
-			view:       launcherView{children: []launcher.Child{child(appA, launcher.StateRunning), child(appB, launcher.StateRunning)}, wanted: paths.New(appB)},
+			name:       "the sidecars of the wanted app count for it only",
+			containers: []container.Summary{sidecar("b", container.StateRunning, "Up"), sidecar("b", container.StateExited, "Exited (1) 3 seconds ago")},
+			view:       launcherView{children: []launcher.Child{child(appA, launcher.StateRunning), child(appB, launcher.StateRunning)}, wanted: paths.New(appB), project: "b"},
 			want:       map[string]Status{appA: StatusRunning, appB: StatusFailed},
 		},
 		{
-			name:       "an orphan removed alongside the start is no sidecar of the app",
-			containers: []container.Summary{named(sidecarsProject, "kept", container.StateRestarting, "Restarting"), named(sidecarsProject, "orphan", container.StateExited, "Exited (0) 1 second ago")},
-			view:       launcherView{children: []launcher.Child{child(appA, launcher.StateRunning)}, wanted: paths.New(appA), sidecars: []string{"kept"}},
-			want:       map[string]Status{appA: StatusStarting},
-		},
-		{
-			name:       "the containers of the per-app projects are not sidecars",
-			containers: []container.Summary{sidecar("a", container.StateExited, "Exited (1) 3 seconds ago")},
-			view:       launcherView{children: []launcher.Child{child(appA, launcher.StateRunning)}, wanted: paths.New(appA)},
+			name:       "the sidecars of another app are not sidecars of the wanted one",
+			containers: []container.Summary{sidecar("b", container.StateExited, "Exited (1) 3 seconds ago")},
+			view:       launcherView{children: []launcher.Child{child(appA, launcher.StateRunning)}, wanted: paths.New(appA), project: "a"},
 			want:       map[string]Status{appA: StatusRunning},
 		},
 		{
@@ -112,7 +106,7 @@ func TestMergeAppStatus(t *testing.T) {
 		},
 		{
 			name: "a wanted app without child failed",
-			view: launcherView{wanted: paths.New(fresh)},
+			view: launcherView{wanted: paths.New(fresh), project: "fresh"},
 			want: map[string]Status{fresh: StatusFailed},
 		},
 		{

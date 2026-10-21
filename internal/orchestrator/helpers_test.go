@@ -72,15 +72,19 @@ func TestSidecarsStatus(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var input []container.Summary
+			// The launcher and the sidecars of another app do not count
+			input := []container.Summary{
+				{Labels: map[string]string{composeProjectLabel: "my-app", DockerLauncherLabel: "true"}, State: container.StateDead},
+				{Labels: map[string]string{composeProjectLabel: "other", composeServiceLabel: "svc"}, State: container.StateDead},
+			}
 			for i, c := range tc.containerState {
 				input = append(input, container.Summary{
-					Labels: map[string]string{composeProjectLabel: sidecarsProject, composeServiceLabel: fmt.Sprintf("svc%d", i)},
+					Labels: map[string]string{composeProjectLabel: "my-app", composeServiceLabel: fmt.Sprintf("svc%d", i)},
 					State:  c,
 					Status: tc.statusMessage[i],
 				})
 			}
-			require.Equal(t, tc.want, sidecarsStatus(input, nil))
+			require.Equal(t, tc.want, sidecarsStatus(input, "my-app"))
 		})
 	}
 }
