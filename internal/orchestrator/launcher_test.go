@@ -167,6 +167,8 @@ func TestNewAppProject(t *testing.T) {
 	assert.Equal(t, []string{"ei-obj-detection-runner"}, project.sidecars(), "the main service is the launcher's")
 	assert.Equal(t, types.NetworkConfig{Name: launcherNetwork, External: true}, project.prj.Networks["default"], "the sidecars join the launcher network")
 	assert.Equal(t, "bar", project.appEnvs["FOO"])
+	assert.Equal(t, "with-sidecar-ei-obj-detection-runner-1", project.appEnvs["ARDUINO_SERVICE_HOST_EI_OBJ_DETECTION_RUNNER"], "the brick is told its own sidecar")
+	assert.Equal(t, "ARDUINO_SERVICE_HOST_DBSTORAGE_INFLUX", serviceHostVariable("dbstorage-influx"))
 
 	t.Run("the same app renders the same fingerprint", func(t *testing.T) {
 		again, err := newAppProject(renderTestApp(t, cfg, &a, bricksIndex, servicesIndex, types.Mapping{"FOO": "bar"}))

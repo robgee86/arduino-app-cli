@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,6 +43,11 @@ type appProject struct {
 
 func newAppProject(prj *types.Project) (appProject, error) {
 	appEnvs := splitMainService(prj)
+	// The sidecars of every app share the launcher network, where a service name is ambiguous once two
+	// apps run: each brick is told the container of its own sidecar, unique across apps
+	for name := range prj.Services {
+		appEnvs[serviceHostVariable(name)] = sidecarContainerName(prj.Name, name)
+	}
 	prj.Networks = types.Networks{"default": types.NetworkConfig{Name: launcherNetwork, External: true}}
 	data, err := json.Marshal(prj.Services)
 	if err != nil {
@@ -49,6 +55,26 @@ func newAppProject(prj *types.Project) (appProject, error) {
 	}
 	sum := sha256.Sum256(data)
 	return appProject{name: prj.Name, prj: prj, fingerprint: hex.EncodeToString(sum[:]), appEnvs: appEnvs}, nil
+}
+
+// serviceHostVariable names the variable that tells a brick the host of a sidecar service: the
+// service name uppercased, with every character other than a letter or a digit as an underscore.
+func serviceHostVariable(service string) string {
+	var b strings.Builder
+	b.WriteString("ARDUINO_SERVICE_HOST_")
+	for _, r := range strings.ToUpper(service) {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
+// sidecarContainerName is the name compose gives the container of a service of the project.
+func sidecarContainerName(project, service string) string {
+	return project + "-" + service + "-1"
 }
 
 // sidecars are the services of the project, the main one gone.
