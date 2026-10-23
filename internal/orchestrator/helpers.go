@@ -39,16 +39,27 @@ type AppStatusInfo struct {
 //	failed: at least one failed
 //	stopping: at least one stopping
 //	starting: at least one starting
-func parseAppStatus(containers []container.Summary) []AppStatusInfo {
+//
+// The status of a main container driven through the app launcher comes from the launcher,
+// by container ID in appStatuses: the container stays up when the app ends on its own, and
+// an app that is not running is not running whatever its sidecars do.
+func parseAppStatus(containers []container.Summary, appStatuses map[string]Status) []AppStatusInfo {
 	apps := make([]AppStatusInfo, 0, len(containers))
 	appsStatusMap := make(map[string][]Status)
+	decided := make(map[string]Status)
 	for _, c := range containers {
 		appPath, ok := c.Labels[DockerAppPathLabel]
 		if !ok {
 			continue
 		}
+		if status, ok := appStatuses[c.ID]; ok {
+			if status != StatusRunning {
+				decided[appPath] = status
+			}
+			appsStatusMap[appPath] = append(appsStatusMap[appPath], status)
+			continue
+		}
 		appsStatusMap[appPath] = append(appsStatusMap[appPath], StatusFromDockerState(c.State, c.Status))
-
 	}
 
 	appendResult := func(appPath *paths.Path, status Status) {
@@ -60,6 +71,11 @@ func parseAppStatus(containers []container.Summary) []AppStatusInfo {
 
 	for appPath, s := range appsStatusMap {
 		f.Assert(len(s) != 0, "status slice is zero")
+
+		if status, ok := decided[appPath]; ok {
+			appendResult(paths.New(appPath), status)
+			continue
+		}
 
 		appPath := paths.New(appPath)
 
@@ -104,7 +120,7 @@ func getAppsStatus(
 	if len(containers) == 0 {
 		return nil, nil
 	}
-	return parseAppStatus(containers), nil
+	return parseAppStatus(containers, launcherStatuses(ctx, docker, containers)), nil
 }
 
 func getAppStatus(
@@ -124,7 +140,7 @@ func getAppStatus(
 		}, nil
 	}
 
-	appInfo := parseAppStatus(containers)
+	appInfo := parseAppStatus(containers, launcherStatuses(ctx, docker, containers))
 	if len(appInfo) == 0 {
 		return AppStatusInfo{}, fmt.Errorf("no app status found for app at path %s", app.FullPath)
 	}
