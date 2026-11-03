@@ -1346,7 +1346,7 @@ func compileSketch(
 		Fqbn:       fqbn,
 		SketchPath: sketchPath.String(),
 		BuildPath:  buildPath.String(),
-		Jobs:       platform.CompileJobs,
+		Jobs:       platform.CompileJobs(),
 		Verbose:    verbose,
 	}
 	if err := srv.Compile(&compileReq, server); err != nil {
