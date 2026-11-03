@@ -103,7 +103,7 @@ func StartApp(
 	prepare bool,
 	cb func(StreamMessage),
 ) error {
-	return withAppsLock(ctx, cfg, func() error {
+	return runExclusive(ctx, cfg, appToStart, "start", func() error {
 		return startApp(ctx, docker, provisioner, modelsIndex, bricksIndex, servicesIndex, appToStart, cfg, platform, verbose, prepare, cb)
 	})
 }
@@ -380,7 +380,7 @@ func stopAppWithCmd(ctx context.Context, docker command.Cli, platform platform.P
 }
 
 func StopApp(ctx context.Context, dockerClient command.Cli, platform platform.Platform, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
-	return withAppsLock(ctx, cfg, func() error {
+	return runExclusive(ctx, cfg, app, "stop", func() error {
 		return stopApp(ctx, dockerClient, platform, app, cfg, cb)
 	})
 }
@@ -390,7 +390,7 @@ func stopApp(ctx context.Context, dockerClient command.Cli, platform platform.Pl
 }
 
 func StopAndDestroyApp(ctx context.Context, dockerClient command.Cli, platform platform.Platform, app app.ArduinoApp, cfg config.Configuration, cb func(StreamMessage)) error {
-	return withAppsLock(ctx, cfg, func() error {
+	return runExclusive(ctx, cfg, app, "destroy", func() error {
 		return stopAndDestroyApp(ctx, dockerClient, platform, app, cfg, cb)
 	})
 }
@@ -445,7 +445,7 @@ func RestartApp(
 	verbose bool,
 	cb func(StreamMessage),
 ) error {
-	return withAppsLock(ctx, cfg, func() error {
+	return runExclusive(ctx, cfg, appToStart, "restart", func() error {
 		runningApp, err := getRunningApp(ctx, docker.Client())
 		if err != nil {
 			return err
@@ -971,7 +971,7 @@ func CloneApp(
 }
 
 func DeleteApp(ctx context.Context, dockerClient command.Cli, platform platform.Platform, app app.ArduinoApp, cfg config.Configuration) error {
-	return withAppsLock(ctx, cfg, func() error {
+	return runExclusive(ctx, cfg, app, "delete", func() error {
 		// We try to remove docker related resources at best effort
 		_ = stopAndDestroyApp(ctx, dockerClient, platform, app, cfg, func(StreamMessage) {})
 		// TODO: Shall we report stop error?
