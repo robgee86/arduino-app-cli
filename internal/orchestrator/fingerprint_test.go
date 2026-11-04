@@ -15,17 +15,23 @@ import (
 
 func TestFingerprint(t *testing.T) {
 	cache := paths.New(t.TempDir())
-	python := partFingerprint(cache, "python")
-	hash := hashOf([]byte("services: {}"))
+	sketch := partFingerprint(cache, "sketch")
+	hash := hashOf([]byte("void setup() {}"))
 
-	assert.False(t, python.matches(hash), "nothing was built yet")
+	assert.False(t, sketch.matches(hash), "nothing was built yet")
 
-	require.NoError(t, python.save(hash))
-	assert.True(t, python.matches(hash))
-	assert.False(t, python.matches(hashOf([]byte("services: {main: {}}"))), "a changed input needs a build")
-	assert.FileExists(t, cache.Join("python", "fingerprint.json").String())
+	binary := cache.Join("sketch", "sketch.ino.bin")
+	require.NoError(t, binary.Parent().MkdirAll())
+	require.NoError(t, binary.WriteFile([]byte("firmware")))
+	require.NoError(t, sketch.save(hash, binary.String()))
+	assert.True(t, sketch.matches(hash))
+	assert.False(t, sketch.matches(hashOf([]byte("void setup() { }"))), "a changed input needs a build")
+	assert.FileExists(t, cache.Join("sketch", "fingerprint.json").String())
 
-	require.NoError(t, cache.Join("sketch").MkdirAll())
-	require.NoError(t, cache.Join("sketch", "fingerprint.json").WriteFile([]byte("not json")))
-	assert.False(t, partFingerprint(cache, "sketch").matches(hash), "an unreadable record matches nothing")
+	require.NoError(t, binary.Remove())
+	assert.False(t, sketch.matches(hash), "a missing output needs a build")
+
+	require.NoError(t, cache.Join("python").MkdirAll())
+	require.NoError(t, cache.Join("python", "fingerprint.json").WriteFile([]byte("not json")))
+	assert.False(t, partFingerprint(cache, "python").matches(hash), "an unreadable record matches nothing")
 }
