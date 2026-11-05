@@ -54,9 +54,6 @@ tasks:
     deps: [test:internal, test:pkg]
 
   test:internal:
-    env:
-      # The apps run on the dev release of the launcher branch until a python-apps-base release ships it
-      DOCKER_PYTHON_BASE_IMAGE: app-bricks/python-apps-base:dev-python-fast-reload-main
     deps:
       - task: download-runner-assets
         vars:
