@@ -25,13 +25,11 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/goccy/go-yaml"
 	"github.com/gosimple/slug"
-	"github.com/sirupsen/logrus"
 	"go.bug.st/f"
 	semver "go.bug.st/relaxed-semver"
 
 	"github.com/arduino/arduino-app-cli/internal/dockerhelper"
 	"github.com/arduino/arduino-app-cli/internal/fatomic"
-	"github.com/arduino/arduino-app-cli/internal/helpers"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/app"
 	appgenerator "github.com/arduino/arduino-app-cli/internal/orchestrator/app/generator"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/appid"
@@ -1246,45 +1244,65 @@ func compileUploadSketch(
 		return fmt.Errorf("failed to create build directory: %w", err)
 	}
 
-	srv, inst, err := initializeArduinoCli(ctx, sketchPath, w)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_, _ = srv.Destroy(ctx, &rpc.DestroyRequest{Instance: inst})
-	}()
-
-	menuOptions, err := GetPlatformMenuOptions(ctx, platform)
+	board, err := boardDetails(ctx, platform)
 	if err != nil {
 		slog.Warn("failed to get platform menu options", slog.String("error", err.Error()))
 	}
+	menuOptions := menuOptionsOf(board)
 	fqbn := platform.FQBN
 	if menuOptions.Has(WaitForApp) {
 		fqbn += ":" + WaitForApp.String()
 	}
 	useLegacyFlashToRam := !menuOptions.Has(WaitForApp) && platform.SupportFlashToRam()
 
-	// Compile the sketch
-	if err := compileSketch(
-		ctx, srv, inst,
-		sketchPath, buildPath,
-		platform, fqbn,
-		verbose, w,
-	); err != nil {
+	// The build folder holds the binary of the last build: when the inputs of the build
+	// are the ones of that build, the start only uploads it. The flash script still
+	// verifies the flash and writes on a mismatch, so the fingerprint says nothing about
+	// what the MCU holds, only what the build folder holds.
+	platforms, err := cli.platforms(ctx)
+	if err != nil {
 		return err
 	}
-
-	// Upload the sketch
-	if err := uploadSketch(
-		ctx, srv, inst,
-		sketchPath, buildPath,
-		useLegacyFlashToRam,
-		fqbn, w,
-	); err != nil {
+	inputs, err := sketchInputs(sketchPath, fqbn, useLegacyFlashToRam, platforms)
+	if err != nil {
 		return err
 	}
+	sketch, hash := partFingerprint(arduinoApp.ProvisioningStateDir(), "sketch"), hashOf(inputs)
+	if sketch.matches(hash) {
+		_, _ = w.Write([]byte("Sketch unchanged since the last build: uploading it\n"))
+		return cli.forPlatform(ctx, func(srv rpc.ArduinoCoreServiceServer, inst *rpc.Instance) error {
+			return uploadSketch(ctx, srv, inst, sketchPath, buildPath, useLegacyFlashToRam, fqbn, w)
+		})
+	}
 
-	return nil
+	return cli.forSketch(ctx, sketchPath, w, func(srv rpc.ArduinoCoreServiceServer, inst *rpc.Instance) error {
+		result, err := compileSketch(
+			ctx, srv, inst,
+			sketchPath, buildPath,
+			platform, fqbn,
+			verbose, w,
+		)
+		if err != nil {
+			return err
+		}
+
+		// The record of this build, for the next start: the inputs hashed before the
+		// compile, so that an edit made during it is seen then, and the files the upload needs.
+		files := buildArtifacts(buildPath, sketchPath)
+		for _, lib := range result.GetUsedLibraries() {
+			files = append(files, lib.GetInstallDir())
+		}
+		if err := sketch.save(hash, files...); err != nil {
+			return err
+		}
+
+		return uploadSketch(
+			ctx, srv, inst,
+			sketchPath, buildPath,
+			useLegacyFlashToRam,
+			fqbn, w,
+		)
+	})
 }
 
 func uploadFirmwareFile(
@@ -1293,94 +1311,14 @@ func uploadFirmwareFile(
 	fwFile *paths.Path,
 	w io.Writer,
 ) error {
-	srv, inst, err := initializeArduinoCli(ctx, nil, w)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_, _ = srv.Destroy(ctx, &rpc.DestroyRequest{Instance: inst})
-	}()
-
-	// Upload the sketch
-	uploadServ, _ := commands.UploadFirmwareFileToServerStreams(ctx, w, w)
-	if err := srv.UploadFirmwareFile(&rpc.UploadFirmwareFileRequest{
-		Instance:     inst,
-		FirmwareFile: fwFile.String(),
-		Verbose:      verbose,
-	}, uploadServ); err != nil {
-		return err
-	}
-	return nil
-}
-
-func initializeArduinoCli(ctx context.Context, sketchPath *paths.Path, w io.Writer) (_ rpc.ArduinoCoreServiceServer, _ *rpc.Instance, _err error) {
-	logrus.SetLevel(logrus.ErrorLevel) // Reduce the log level of arduino-cli
-	srv := commands.NewArduinoCoreServer()
-	if err := SetArduinoCliConfig(ctx, srv); err != nil {
-		return nil, nil, err
-	}
-
-	var inst *rpc.Instance
-	if resp, err := srv.Create(ctx, &rpc.CreateRequest{}); err != nil {
-		return nil, nil, err
-	} else {
-		inst = resp.GetInstance()
-	}
-	defer func() {
-		if _err != nil {
-			_, _ = srv.Destroy(ctx, &rpc.DestroyRequest{Instance: inst})
-		}
-	}()
-
-	initReq := &rpc.InitRequest{
-		Instance: inst,
-	}
-	if sketchPath != nil {
-		sketchResp, err := srv.LoadSketch(ctx, &rpc.LoadSketchRequest{SketchPath: sketchPath.String()})
-		if err != nil {
-			return nil, nil, err
-		}
-		sketch := sketchResp.GetSketch()
-		profile := sketch.GetDefaultProfile().GetName()
-		if profile == "" {
-			return nil, nil, fmt.Errorf("sketch %q has no default profile", sketchPath)
-		}
-
-		initReq.Profile = profile
-		initReq.SketchPath = sketchPath.String()
-	}
-
-	if err := srv.Init(
-		initReq,
-		commands.InitStreamResponseToCallbackFunction(ctx, func(r *rpc.InitResponse) error {
-			var response string
-			switch msg := r.GetMessage().(type) {
-			case *rpc.InitResponse_InitProgress:
-				if progress := msg.InitProgress.GetTaskProgress(); progress != nil {
-					response = helpers.ArduinoCLITaskProgressToString(progress)
-				}
-				if progress := msg.InitProgress.GetDownloadProgress(); progress != nil {
-					response = helpers.ArduinoCLIDownloadProgressToString(progress)
-				}
-			case *rpc.InitResponse_Error:
-				response = "Error: " + msg.Error.String()
-			case *rpc.InitResponse_Profile:
-				response = fmt.Sprintf(
-					"Sketch profile configured: Name=%q, Port=%q",
-					msg.Profile.GetName(),
-					msg.Profile.GetPort(),
-				)
-			}
-			if _, err := w.Write([]byte(response + "\n")); err != nil {
-				return err
-			}
-
-			return nil
-		}),
-	); err != nil {
-		return nil, nil, err
-	}
-	return srv, inst, nil
+	return cli.forPlatform(ctx, func(srv rpc.ArduinoCoreServiceServer, inst *rpc.Instance) error {
+		uploadServ, _ := commands.UploadFirmwareFileToServerStreams(ctx, w, w)
+		return srv.UploadFirmwareFile(&rpc.UploadFirmwareFileRequest{
+			Instance:     inst,
+			FirmwareFile: fwFile.String(),
+			Verbose:      verbose,
+		}, uploadServ)
+	})
 }
 
 func compileSketch(
@@ -1392,7 +1330,7 @@ func compileSketch(
 	fqbn string,
 	verbose bool,
 	w io.Writer,
-) error {
+) (*rpc.BuilderResult, error) {
 	// build the sketch
 	slog.Debug("compile sketch", slog.String("fqbn", fqbn))
 
@@ -1402,11 +1340,11 @@ func compileSketch(
 		Fqbn:       fqbn,
 		SketchPath: sketchPath.String(),
 		BuildPath:  buildPath.String(),
-		Jobs:       platform.CompileJobs,
+		Jobs:       platform.CompileJobs(),
 		Verbose:    verbose,
 	}
 	if err := srv.Compile(&compileReq, server); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Output compilations details
@@ -1425,7 +1363,7 @@ func compileSketch(
 	for _, lib := range result.GetUsedLibraries() {
 		_, _ = w.Write([]byte("Used library " + lib.GetName() + " (" + lib.GetVersion() + ") in " + lib.GetInstallDir() + "\n"))
 	}
-	return nil
+	return result, nil
 }
 
 // uploadSketch flashes what buildPath holds, whether a compile has just written it or
@@ -1464,32 +1402,19 @@ func uploadSketch(
 // This is needed by the platform 0.55 will need a new Arduino_RouterBridge library to allow Serial output redirection to Monitor.
 // The migration is applied only if the platform in the profile doesn't specify a version.
 func migrateRemoveRouterBridgeIfNeeded(ctx context.Context, platform platform.Platform, app app.Editable) (bool, error) {
-	logrus.SetLevel(logrus.ErrorLevel) // Reduce the log level of arduino-cli
-	srv := commands.NewArduinoCoreServer()
-	if err := SetArduinoCliConfig(ctx, srv); err != nil {
-		return false, err
-	}
-
-	var inst *rpc.Instance
-	if resp, err := srv.Create(ctx, &rpc.CreateRequest{}); err != nil {
-		return false, err
-	} else {
-		inst = resp.GetInstance()
-	}
-	defer func() {
-		_, _ = srv.Destroy(ctx, &rpc.DestroyRequest{Instance: inst})
-	}()
-
 	sketchPath, ok := app.GetSketchPath()
 	if !ok {
 		return false, fmt.Errorf("no sketch path found in the Arduino app")
 	}
-	sketchResp, err := srv.LoadSketch(ctx, &rpc.LoadSketchRequest{SketchPath: sketchPath.String()})
-	if err != nil {
+	var sketch *rpc.Sketch
+	if err := cli.forPlatform(ctx, func(srv rpc.ArduinoCoreServiceServer, _ *rpc.Instance) error {
+		sketchResp, err := srv.LoadSketch(ctx, &rpc.LoadSketchRequest{SketchPath: sketchPath.String()})
+		sketch = sketchResp.GetSketch()
+		return err
+	}); err != nil {
 		return false, err
 	}
 
-	sketch := sketchResp.GetSketch()
 	platforms := sketch.GetDefaultProfile().GetPlatforms()
 	if slices.ContainsFunc(platforms, func(p *rpc.ProfilePlatformReference) bool {
 		return p.GetId() == platform.PlatformID && p.GetVersion() != ""
@@ -1498,19 +1423,7 @@ func migrateRemoveRouterBridgeIfNeeded(ctx context.Context, platform platform.Pl
 		return false, nil
 	}
 
-	if err := srv.Init(
-		&rpc.InitRequest{Instance: inst},
-		commands.InitStreamResponseToCallbackFunction(ctx, func(r *rpc.InitResponse) error {
-			return nil
-		}),
-	); err != nil {
-		return false, err
-	}
-
-	boardInfo, err := srv.BoardDetails(ctx, &rpc.BoardDetailsRequest{
-		Instance: inst,
-		Fqbn:     platform.FQBN,
-	})
+	boardInfo, err := boardDetails(ctx, platform)
 	if err != nil {
 		return false, err
 	}
