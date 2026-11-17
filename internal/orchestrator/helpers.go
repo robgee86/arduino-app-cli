@@ -65,28 +65,41 @@ func sidecarsStatus(containers []container.Summary, project string) Status {
 	}
 }
 
-// appsView is the app that should be running, its compose project and the child its container runs.
+// appsView is the app that should be running, its compose project, the child its container
+// runs and how the previous one ended.
 type appsView struct {
 	wanted  *paths.Path
 	project string
 	child   *launcher.Child
+	last    *launcher.Ended
+}
+
+// wantedView is the app that should be running and its compose project, its container not asked.
+func wantedView(cfg config.Configuration) appsView {
+	var view appsView
+	if wanted := readWantedApp(cfg); wanted != nil {
+		view.wanted = wanted.App
+		view.project = appContainerOf(cfg, wanted.App).project
+	}
+	return view
 }
 
 // readAppsView asks the container of the wanted app for its child. An unreachable container runs nothing.
 func readAppsView(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration) appsView {
-	var view appsView
-	wanted := readWantedApp(cfg)
-	if wanted == nil {
+	return askWantedApp(ctx, docker, cfg, wantedView(cfg))
+}
+
+// askWantedApp fills the view with what the container of its wanted app answers about its child.
+func askWantedApp(ctx context.Context, docker dockerClient.APIClient, cfg config.Configuration, view appsView) appsView {
+	if view.wanted == nil {
 		return view
 	}
-	view.wanted = wanted.App
-	view.project = appContainerOf(cfg, wanted.App).project
-	status, err := appContainerOf(cfg, wanted.App).client(ctx, docker, cfg).Status(ctx)
+	status, err := appContainerOf(cfg, view.wanted).client(ctx, docker, cfg).Status(ctx)
 	if err != nil {
 		slog.Debug("app container status unavailable", slog.String("error", err.Error()))
 		return view
 	}
-	view.child = status.Child
+	view.child, view.last = status.Child, status.Last
 	return view
 }
 
@@ -101,7 +114,7 @@ func mergeAppStatus(containers []container.Summary, view appsView) []AppStatusIn
 		}
 	}
 	if view.wanted != nil {
-		statuses[view.wanted.String()] = wantedAppStatus(zone, view.child)
+		statuses[view.wanted.String()] = wantedAppStatus(zone, view.child, view.last)
 	}
 
 	result := make([]AppStatusInfo, 0, len(statuses))
@@ -111,11 +124,17 @@ func mergeAppStatus(containers []container.Summary, view appsView) []AppStatusIn
 	return result
 }
 
-// wantedAppStatus is the status of the app that should be running; sidecars is empty without sidecars.
-func wantedAppStatus(sidecars Status, child *launcher.Child) Status {
+// wantedAppStatus is the status of the app that should be running; sidecars is empty without
+// sidecars, last is how its previous child ended, when its supervisor tells.
+func wantedAppStatus(sidecars Status, child *launcher.Child, last *launcher.Ended) Status {
 	switch {
-	// A failed sidecar, or a wanted app whose child is gone
-	case sidecars == StatusFailed, child == nil:
+	case sidecars == StatusFailed:
+		return StatusFailed
+	// The supervisor ended the child on request, by a stop or by the start that replaces it
+	case child == nil && last != nil && last.Stopped:
+		return StatusStopped
+	// A wanted app whose child is gone on its own
+	case child == nil:
 		return StatusFailed
 	case child.Stopping:
 		return StatusStopping

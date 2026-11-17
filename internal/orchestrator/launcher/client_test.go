@@ -75,7 +75,7 @@ func TestClientRequests(t *testing.T) {
 		case cmdStop:
 			return `{"ok":true,"stopped":[{"app":"/app","pid":42,"exit_code":null,"signal":15}]}`
 		case cmdStatus:
-			return `{"ok":true,"child":{"app":"/app","pid":42,"started_at":"2026-10-13T10:00:00+00:00","runner":"python","warm":true,"stopping":false},"preload":{"modules":["numpy"]},"version":"1.0","uptime_s":3.5}`
+			return `{"ok":true,"child":{"app":"/app","pid":42,"started_at":"2026-10-13T10:00:00+00:00","runner":"python","warm":true,"stopping":false},"last":{"app":"/app","pid":41,"exit_code":null,"signal":15,"stopped":true},"preload":{"modules":["numpy"]},"version":"1.0","uptime_s":3.5}`
 		default:
 			return `{"ok":true}`
 		}
@@ -121,6 +121,9 @@ func TestClientRequests(t *testing.T) {
 		<-fake.requests
 		require.NotNil(t, resp.Child)
 		assert.Equal(t, Child{App: testApp, PID: 42, StartedAt: resp.Child.StartedAt, Runner: "python", Warm: true}, *resp.Child)
+		require.NotNil(t, resp.Last)
+		assert.Equal(t, 41, resp.Last.PID)
+		assert.True(t, resp.Last.Stopped)
 		assert.Equal(t, "1.0", resp.Version)
 		assert.InDelta(t, 3.5, resp.UptimeS, 0)
 	})
@@ -196,4 +199,88 @@ func TestClientAcceptsOnlyTheApprovedPeer(t *testing.T) {
 	err := New(fake.socket, time.Second).WithPeer(refuse).WithTimeout(time.Second).Ping(context.Background())
 	require.ErrorIs(t, err, ErrPeer)
 	assert.Equal(t, 0, len(fake.requests), "a refused peer is sent nothing")
+}
+
+// eventsLauncher answers an events request with what serve writes on the connection, which
+// stays open until serve returns.
+func eventsLauncher(t *testing.T, serve func(conn net.Conn)) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "l")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, SocketName)
+	listener, err := net.Listen("unix", socket)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				if line, err := bufio.NewReader(conn).ReadString('\n'); err == nil && line == `{"cmd":"events"}`+"\n" {
+					serve(conn)
+				}
+			}()
+		}
+	}()
+	return socket
+}
+
+const (
+	idleState    = `{"ok":true,"child":null,"last":null}` + "\n"
+	runningState = `{"ok":true,"child":{"app":"/app","pid":42,"started_at":"2026-10-13T10:00:00+00:00","runner":"python","warm":true,"stopping":false},"last":null}` + "\n"
+	endedState   = `{"ok":true,"child":null,"last":{"app":"/app","pid":42,"exit_code":3,"signal":null,"stopped":false}}` + "\n"
+)
+
+func TestClientEventsTellTheStateOfTheAppNowAndAtEachChange(t *testing.T) {
+	socket := eventsLauncher(t, func(conn net.Conn) {
+		_, _ = conn.Write([]byte(idleState))
+		// Later than the timeout of the client, which bounds the first state only
+		time.Sleep(150 * time.Millisecond)
+		_, _ = conn.Write([]byte(runningState + endedState))
+	})
+
+	var states []AppState
+	err := New(socket, 100*time.Millisecond).Events(context.Background(), func(state AppState) { states = append(states, state) })
+	require.ErrorContains(t, err, "connection closed", "the events end when the supervisor goes")
+	require.Len(t, states, 3)
+	assert.Equal(t, AppState{}, states[0])
+	require.NotNil(t, states[1].Child)
+	assert.Equal(t, 42, states[1].Child.PID)
+	assert.Nil(t, states[1].Last)
+	assert.Nil(t, states[2].Child)
+	require.NotNil(t, states[2].Last)
+	assert.Equal(t, 3, *states[2].Last.ExitCode)
+	assert.False(t, states[2].Last.Stopped)
+}
+
+func TestClientEventsEndWithTheContext(t *testing.T) {
+	gone := make(chan struct{})
+	socket := eventsLauncher(t, func(conn net.Conn) {
+		_, _ = conn.Write([]byte(runningState))
+		// The supervisor sees its subscriber leave
+		_, _ = conn.Read(make([]byte, 1))
+		close(gone)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	err := New(socket, time.Second).Events(ctx, func(AppState) { cancel() })
+	require.ErrorIs(t, err, context.Canceled)
+	select {
+	case <-gone:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "the connection stayed open")
+	}
+}
+
+func TestClientEventsRefusedByASupervisorWithoutThem(t *testing.T) {
+	fake := newFakeLauncher(t, func(string) string {
+		return `{"ok":false,"error":{"code":"bad_request","message":"unknown cmd: 'events'"}}`
+	})
+	err := New(fake.socket, time.Second).Events(context.Background(), func(AppState) { require.FailNow(t, "no state was told") })
+	assert.True(t, IsCode(err, CodeBadRequest))
+	assert.Equal(t, request{Cmd: cmdEvents}, <-fake.requests)
 }

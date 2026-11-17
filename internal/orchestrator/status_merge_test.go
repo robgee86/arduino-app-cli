@@ -45,6 +45,7 @@ func TestMergeAppStatus(t *testing.T) {
 	}
 	running := &launcher.Child{App: appMountDir, PID: 42}
 	stopping := &launcher.Child{App: appMountDir, PID: 42, Stopping: true}
+	sigterm, crashed := 15, 1
 
 	tests := []struct {
 		name       string
@@ -114,6 +115,27 @@ func TestMergeAppStatus(t *testing.T) {
 			containers: []container.Summary{main(fresh, container.StateExited)},
 			view:       appsView{wanted: paths.New(fresh)},
 			want:       map[string]Status{fresh: StatusFailed},
+		},
+		{
+			name: "a wanted app whose child its supervisor stopped on request is stopped",
+			view: appsView{last: &launcher.Ended{PID: 42, Signal: &sigterm, Stopped: true}, wanted: paths.New(appA), project: "a"},
+			want: map[string]Status{appA: StatusStopped},
+		},
+		{
+			name: "a wanted app whose child ended on its own failed",
+			view: appsView{last: &launcher.Ended{PID: 42, ExitCode: &crashed}, wanted: paths.New(appA), project: "a"},
+			want: map[string]Status{appA: StatusFailed},
+		},
+		{
+			name: "a wanted app runs its new child, however the previous one ended",
+			view: appsView{child: running, last: &launcher.Ended{PID: 41, ExitCode: &crashed}, wanted: paths.New(appA), project: "a"},
+			want: map[string]Status{appA: StatusRunning},
+		},
+		{
+			name:       "a failed sidecar fails the wanted app whose child was stopped on request",
+			containers: []container.Summary{zone(container.StateExited, "Exited (1) 3 seconds ago")},
+			view:       appsView{last: &launcher.Ended{PID: 42, Signal: &sigterm, Stopped: true}, wanted: paths.New(appA), project: "a"},
+			want:       map[string]Status{appA: StatusFailed},
 		},
 		{
 			name: "nothing runs",

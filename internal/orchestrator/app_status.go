@@ -23,11 +23,13 @@ import (
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
 )
 
-// The supervisor of an app container has no events: its child is polled while someone listens.
-const launcherPollInterval = time.Second
+// The wanted app changes with no event, in this process or in the CLI: its record is read
+// again at each tick. Its supervisor is asked at a tick only while it tells nothing.
+const wantedPollInterval = time.Second
 
 // AppStatusEvents yields an app each time its status changes. Container events refresh the
-// containers, a ticker refreshes the child of the wanted app.
+// containers, the supervisor of the wanted app tells when its child starts, is being stopped
+// or ends, and a ticker refreshes which app is wanted.
 func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker command.Cli, idProvider *appid.Provider) iter.Seq2[AppInfo, error] {
 	chanMsg, chanError := dockerhelper.ContainerEvents(ctx, docker.Client(), DockerAppLabel+"=true",
 		"create", "start", "stop", "die", "restart", "destroy", "delete")
@@ -38,9 +40,13 @@ func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker comma
 			_ = yield(AppInfo{}, err)
 			return
 		}
-		last := statusByPath(mergeAppStatus(containers, readAppsView(ctx, docker.Client(), cfg)))
+		// The supervisor of the wanted app is followed as long as the events are read
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		watch := newWantedWatch(docker.Client(), cfg)
+		last := statusByPath(mergeAppStatus(containers, followedAppsView(ctx, docker.Client(), cfg, watch)))
 
-		ticker := time.NewTicker(launcherPollInterval)
+		ticker := time.NewTicker(wantedPollInterval)
 		defer ticker.Stop()
 
 		for {
@@ -63,9 +69,13 @@ func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker comma
 					continue
 				}
 			case <-ticker.C:
+			case update := <-watch.updates:
+				if !watch.apply(update) {
+					continue
+				}
 			}
 
-			current := statusByPath(mergeAppStatus(containers, readAppsView(ctx, docker.Client(), cfg)))
+			current := statusByPath(mergeAppStatus(containers, followedAppsView(ctx, docker.Client(), cfg, watch)))
 			for _, change := range statusChanges(last, current) {
 				info, err := appInfoFromStatus(cfg, idProvider, change)
 				if err != nil {
