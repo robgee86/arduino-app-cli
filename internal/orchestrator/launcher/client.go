@@ -4,7 +4,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // Package launcher is the client of the app launcher control socket: one JSON request per
-// connection, answered by one JSON line.
+// connection, answered by one JSON line or, for the events, by one line each time the apps
+// the launcher runs change.
 package launcher
 
 import (
@@ -122,6 +123,7 @@ const (
 	cmdStart  = "start"
 	cmdStop   = "stop"
 	cmdStatus = "status"
+	cmdEvents = "events"
 )
 
 type request struct {
@@ -160,34 +162,101 @@ func (c *Client) Status(ctx context.Context) (StatusResponse, error) {
 	return resp, err
 }
 
+// Events calls onChildren with the apps the launcher runs now, then each time one starts, is
+// being stopped or ends, on one connection kept open. It returns when the launcher refuses the
+// request or goes, or with the error of the context once it is done. The timeout bounds the
+// exchange up to the first answer only.
+func (c *Client) Events(ctx context.Context, onChildren func([]Child)) error {
+	openCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	conn, err := c.send(openCtx, request{Cmd: cmdEvents})
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	// A done context closes the connection, which ends the read
+	defer context.AfterFunc(ctx, func() { _ = conn.Close() })()
+
+	answers := newAnswers(conn)
+	for first := true; ; first = false {
+		var event struct {
+			Children []Child `json:"children"`
+		}
+		if err := answers.read(cmdEvents, &event); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+		if first {
+			// The next events come when the apps change, whenever that is
+			if err := conn.SetDeadline(time.Time{}); err != nil {
+				return err
+			}
+		}
+		onChildren(event.Children)
+	}
+}
+
 func (c *Client) do(ctx context.Context, req request, resp any) error {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
+	conn, err := c.send(ctx, req)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return newAnswers(conn).read(req.Cmd, resp)
+}
 
+// send opens a connection to the launcher and sends the request, all within the deadline of
+// the context, which the connection keeps for its answers.
+func (c *Client) send(ctx context.Context, req request) (net.Conn, error) {
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "unix", c.socket)
 	if err != nil {
-		return fmt.Errorf("cannot reach the app launcher: %w", err)
+		return nil, fmt.Errorf("cannot reach the app launcher: %w", err)
 	}
-	defer conn.Close()
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
-			return err
+			_ = conn.Close()
+			return nil, err
 		}
 	}
 
 	line, err := json.Marshal(req)
 	if err != nil {
-		return err
+		_ = conn.Close()
+		return nil, err
 	}
 	if _, err := conn.Write(append(line, '\n')); err != nil {
-		return fmt.Errorf("cannot send %s to the app launcher: %w", req.Cmd, err)
+		_ = conn.Close()
+		return nil, fmt.Errorf("cannot send %s to the app launcher: %w", req.Cmd, err)
 	}
+	return conn, nil
+}
 
-	reply, err := readLine(conn)
-	if err != nil {
-		return fmt.Errorf("no answer from the app launcher to %s: %w", req.Cmd, err)
+// answers reads the lines the launcher answers on one connection.
+type answers struct {
+	lines *bufio.Scanner
+}
+
+func newAnswers(conn net.Conn) answers {
+	lines := bufio.NewScanner(conn)
+	lines.Buffer(make([]byte, 0, 4096), maxResponseBytes)
+	return answers{lines: lines}
+}
+
+// read decodes the next answer to cmd into resp, or returns the refusal it carries.
+func (a answers) read(cmd string, resp any) error {
+	if !a.lines.Scan() {
+		err := a.lines.Err()
+		if err == nil {
+			err = errors.New("connection closed")
+		}
+		return fmt.Errorf("no answer from the app launcher to %s: %w", cmd, err)
 	}
+	reply := a.lines.Bytes()
 	var envelope struct {
 		OK    bool   `json:"ok"`
 		Error *Error `json:"error"`
@@ -208,18 +277,6 @@ func (c *Client) do(ctx context.Context, req request, resp any) error {
 		return fmt.Errorf("invalid answer from the app launcher: %w", err)
 	}
 	return nil
-}
-
-func readLine(conn net.Conn) ([]byte, error) {
-	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 0, 4096), maxResponseBytes)
-	if scanner.Scan() {
-		return scanner.Bytes(), nil
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return nil, errors.New("connection closed")
 }
 
 // IsCode tells whether err is a launcher error with that code.

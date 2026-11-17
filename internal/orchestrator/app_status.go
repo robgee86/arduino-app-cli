@@ -21,13 +21,57 @@ import (
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/app"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/appid"
 	"github.com/arduino/arduino-app-cli/internal/orchestrator/config"
+	"github.com/arduino/arduino-app-cli/internal/orchestrator/launcher"
 )
 
-// The launcher has no events: its children are polled while someone listens.
+// A launcher that gives no events, down or without them, is asked for its children this often
+// while someone listens.
 const launcherPollInterval = time.Second
 
+// launcherChildren is what the launcher last told of the apps it runs. Not followed, the
+// launcher gives no events and is asked instead.
+type launcherChildren struct {
+	children []launcher.Child
+	followed bool
+}
+
+// followLauncher sends the children of the launcher as they are now, then at each change, as
+// its events tell, until the context is done. While the launcher gives no events it sends an
+// update that is not followed every retry: the launcher is then asked, as before the events.
+func followLauncher(ctx context.Context, client *launcher.Client, retry time.Duration) <-chan launcherChildren {
+	updates := make(chan launcherChildren)
+	send := func(update launcherChildren) bool {
+		select {
+		case updates <- update:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	go func() {
+		for {
+			err := client.Events(ctx, func(children []launcher.Child) {
+				send(launcherChildren{children: children, followed: true})
+			})
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Debug("app launcher events unavailable, the launcher is asked instead", slog.String("error", err.Error()))
+			if !send(launcherChildren{}) {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retry):
+			}
+		}
+	}()
+	return updates
+}
+
 // AppStatusEvents yields an app each time its status changes. Container events refresh the
-// sidecars, a ticker refreshes the launcher children.
+// sidecars, the events of the launcher refresh its children.
 func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker command.Cli, idProvider *appid.Provider) iter.Seq2[AppInfo, error] {
 	chanMsg, chanError := dockerhelper.ContainerEvents(ctx, docker.Client(), DockerAppLabel+"=true",
 		"create", "start", "stop", "die", "restart", "destroy", "delete")
@@ -38,10 +82,18 @@ func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker comma
 			_ = yield(AppInfo{}, err)
 			return
 		}
-		last := statusByPath(mergeAppStatus(containers, readLauncherView(ctx, cfg)))
-
-		ticker := time.NewTicker(launcherPollInterval)
-		defer ticker.Stop()
+		// The launcher is followed as long as the events are read
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		updates := followLauncher(ctx, newLauncherClient(cfg), launcherPollInterval)
+		var told launcherChildren
+		view := func() launcherView {
+			if told.followed {
+				return launcherViewOf(cfg, told.children)
+			}
+			return readLauncherView(ctx, cfg)
+		}
+		last := statusByPath(mergeAppStatus(containers, view()))
 
 		for {
 			select {
@@ -62,10 +114,10 @@ func AppStatusEvents(ctx context.Context, cfg config.Configuration, docker comma
 					}
 					continue
 				}
-			case <-ticker.C:
+			case told = <-updates:
 			}
 
-			current := statusByPath(mergeAppStatus(containers, readLauncherView(ctx, cfg)))
+			current := statusByPath(mergeAppStatus(containers, view()))
 			for _, change := range statusChanges(last, current) {
 				info, err := appInfoFromStatus(cfg, idProvider, change)
 				if err != nil {

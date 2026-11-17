@@ -72,19 +72,23 @@ type launcherView struct {
 	project  string
 }
 
-// readLauncherView asks the launcher for its children. An unreachable launcher runs nothing.
-func readLauncherView(ctx context.Context, cfg config.Configuration) launcherView {
-	view := launcherView{wanted: readLauncherWantedApp(cfg)}
+// launcherViewOf is the view of a launcher that runs these children.
+func launcherViewOf(cfg config.Configuration, children []launcher.Child) launcherView {
+	view := launcherView{children: children, wanted: readLauncherWantedApp(cfg)}
 	if view.wanted != nil {
 		view.project = composeProjectName(view.wanted, cfg.AppsDir())
 	}
+	return view
+}
+
+// readLauncherView asks the launcher for its children. An unreachable launcher runs nothing.
+func readLauncherView(ctx context.Context, cfg config.Configuration) launcherView {
 	status, err := newLauncherClient(cfg).Status(ctx)
 	if err != nil {
 		slog.Debug("app launcher status unavailable", slog.String("error", err.Error()))
-		return view
+		return launcherViewOf(cfg, nil)
 	}
-	view.children = status.Children
-	return view
+	return launcherViewOf(cfg, status.Children)
 }
 
 // mergeAppStatus combines the sidecars of the wanted app with the launcher children. An app neither

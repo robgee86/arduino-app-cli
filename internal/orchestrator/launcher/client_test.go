@@ -173,3 +173,83 @@ func TestClientErrors(t *testing.T) {
 		require.ErrorContains(t, New(fake.socket, time.Second).Ping(context.Background()), "invalid answer")
 	})
 }
+
+// newStreamingLauncher hands every connection to serve once its request line is read, and
+// closes it when serve returns.
+func newStreamingLauncher(t *testing.T, serve func(conn net.Conn)) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "l")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, SocketName)
+
+	listener, err := net.Listen("unix", socket)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				if _, err := bufio.NewReader(conn).ReadBytes('\n'); err == nil {
+					serve(conn)
+				}
+			}()
+		}
+	}()
+	return socket
+}
+
+func TestClientEvents(t *testing.T) {
+	const running = `{"ok":true,"children":[{"app":"/apps/a","pid":42,"state":"running","started_at":"2026-10-13T10:00:00+00:00","runner":"python","warm":true}]}`
+	const none = `{"ok":true,"children":[]}`
+
+	t.Run("the apps that run now and at each change, until the launcher goes", func(t *testing.T) {
+		socket := newStreamingLauncher(t, func(conn net.Conn) {
+			_, _ = conn.Write([]byte(none + "\n" + running + "\n" + none + "\n"))
+		})
+		var told [][]string
+		err := New(socket, time.Second).Events(context.Background(), func(children []Child) {
+			apps := make([]string, 0, len(children))
+			for _, child := range children {
+				apps = append(apps, child.App+" "+child.State)
+			}
+			told = append(told, apps)
+		})
+		require.ErrorContains(t, err, "connection closed")
+		assert.Equal(t, [][]string{{}, {testApp + " " + StateRunning}, {}}, told)
+	})
+
+	t.Run("a launcher without events refuses them", func(t *testing.T) {
+		fake := newFakeLauncher(t, func(string) string {
+			return `{"ok":false,"error":{"code":"bad_request","message":"unknown cmd: 'events'"}}`
+		})
+		err := New(fake.socket, time.Second).Events(context.Background(), func([]Child) { t.Error("nothing to tell") })
+		assert.True(t, IsCode(err, CodeBadRequest))
+		assert.Equal(t, request{Cmd: cmdEvents}, <-fake.requests)
+	})
+
+	t.Run("they last past the timeout, until the context is done", func(t *testing.T) {
+		done := make(chan struct{})
+		t.Cleanup(func() { close(done) })
+		socket := newStreamingLauncher(t, func(conn net.Conn) {
+			_, _ = conn.Write([]byte(running + "\n"))
+			time.Sleep(200 * time.Millisecond)
+			_, _ = conn.Write([]byte(none + "\n"))
+			<-done
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		told := 0
+		err := New(socket, 50*time.Millisecond).Events(ctx, func([]Child) {
+			if told++; told == 2 {
+				cancel()
+			}
+		})
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Equal(t, 2, told, "the timeout bounds the first answer only")
+	})
+}
