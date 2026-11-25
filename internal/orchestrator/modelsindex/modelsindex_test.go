@@ -269,6 +269,30 @@ func TestModelsIndex(t *testing.T) {
 
 // TestNeedsNoDownload pins the one predicate a lookup and the install route share.
 // Every pre-loaded entry in models-list.yaml names a handler, so the two must agree.
+func TestALookupListsOnceUntilItIsRefreshed(t *testing.T) {
+	index := &ModelsIndex{InternalModels: []AIModel{{
+		ID:         "a-model",
+		Status:     NotInstalledStatus,
+		Deployment: &ModelDeployment{Handler: "a-handler"},
+	}}}
+	status := func(models *Lookup) ModelStatus {
+		model, err := models.ByID(t.Context(), "a-model")
+		require.NoError(t, err)
+		require.NotNil(t, model)
+		return model.Status
+	}
+
+	models := index.NewLookup()
+	assert.Equal(t, NotInstalledStatus, status(models))
+
+	// What a download leaves on the board
+	index.InternalModels[0].Status = InstalledStatus
+	assert.Equal(t, NotInstalledStatus, status(models), "a lookup answers from its one listing")
+
+	models.Refresh()
+	assert.Equal(t, InstalledStatus, status(models))
+}
+
 func TestNeedsNoDownload(t *testing.T) {
 	tests := []struct {
 		name  string
