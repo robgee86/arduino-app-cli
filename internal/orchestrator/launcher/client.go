@@ -48,6 +48,11 @@ type Timings struct {
 	ForkMs float64 `json:"fork_ms"`
 }
 
+// StopResponse is the answer to a stop: how long the app took to end.
+type StopResponse struct {
+	Timings Timings `json:"timings"`
+}
+
 type StartResponse struct {
 	PID       int       `json:"pid"`
 	StartedAt time.Time `json:"started_at"`
@@ -119,6 +124,7 @@ func (c *Client) Socket() string {
 const (
 	cmdStart  = "start"
 	cmdStatus = "status"
+	cmdStop   = "stop"
 )
 
 type request struct {
@@ -131,6 +137,13 @@ type request struct {
 func (c *Client) Start(ctx context.Context, env map[string]string) (StartResponse, error) {
 	var resp StartResponse
 	err := c.do(ctx, request{Cmd: cmdStart, Env: env}, &resp)
+	return resp, err
+}
+
+// Stop ends the app and leaves the launcher up, so its container stays ready for a start.
+func (c *Client) Stop(ctx context.Context) (StopResponse, error) {
+	var resp StopResponse
+	err := c.do(ctx, request{Cmd: cmdStop}, &resp)
 	return resp, err
 }
 
