@@ -76,12 +76,21 @@ func TestClientRequests(t *testing.T) {
 			return `{"ok":true,"child":{"app":"/app","pid":42,"started_at":"2026-10-13T10:00:00+00:00","runner":"python","stopping":false},` +
 				`"last":{"app":"/app","pid":41,"exit_code":1,"signal":null,"ended_at":"2026-10-13T09:59:00+00:00"},"stale":false,` +
 				`"preload":{"modules":["numpy"]},"version":"1.0","uptime_s":3.5}`
+		case cmdStop:
+			return `{"ok":true,"timings":{"stop_ms":30.5,"fork_ms":0}}`
 		default:
 			return `{"ok":true,"stale":true}`
 		}
 	})
 	client := New(fake.socket, time.Second)
 	ctx := context.Background()
+
+	t.Run("stop", func(t *testing.T) {
+		resp, err := client.Stop(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, request{Cmd: cmdStop}, <-fake.requests)
+		assert.Equal(t, Timings{StopMs: 30.5}, resp.Timings)
+	})
 
 	t.Run("start with the app environment", func(t *testing.T) {
 		resp, err := client.Start(ctx, map[string]string{"FOO": "bar"})
