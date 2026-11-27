@@ -287,6 +287,23 @@ func StartApp(
 				return fmt.Errorf("failed to read the app compose file: %w", err)
 			}
 			pythonHash = pythonHashOf(rendered, appToStart.Descriptor.Bricks, bricksIndex)
+
+			// The project is the one compose brought up last: the containers the stop
+			// left behind are started as they are when they still fit it, and compose
+			// has nothing to do. The fingerprint stays, the project is unchanged.
+			if python.matches(pythonHash) {
+				started, err := startKeptContainers(ctx, docker.Client(), prj, appToStart.FullPath)
+				if err != nil {
+					return err
+				}
+				if started {
+					cb(StreamMessage{progress: &Progress{Name: "", Progress: 100.0}})
+					return nil
+				}
+			} else {
+				slog.Info("the app is started by compose", slog.String("app", appToStart.FullPath.String()),
+					slog.String("reason", "its project is not the one compose brought up last"))
+			}
 			if err := python.forget(); err != nil {
 				return err
 			}
